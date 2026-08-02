@@ -26,15 +26,24 @@ function fixedOrder(L, seed) {
 
 const cases = [];
 for (const spec of structures) {
-  const [name, path, checkpoint, modelType] = spec.split("=");
+  const [name, path, checkpoint, modelType, flag] = spec.split("=");
   const text = readFileSync(path, "utf8");
   const s = structureFromText(text);
+  // `...=sc` turns on LigandMPNN's side-chain context, which needs the all-atom
+  // coordinates and a chain mask -- only the fixed residues contribute. A
+  // deterministic half-and-half split exercises both branches in one case.
+  const sideChains = flag === "sc";
+  const chainMask = Array.from({ length: s.L }, (_, i) => (i % 2 === 0 ? 1 : 0));
   cases.push({
     name,
     checkpoint,
     modelType,
     order: fixedOrder(s.L, 12345),
+    useSideChains: sideChains,
     inputs: {
+      ...(sideChains
+        ? { xyz37: [...s.xyz37], xyz37Mask: [...s.xyz37Mask], chainMask }
+        : {}),
       L: s.L,
       X: [...s.X],
       mask: [...s.mask],
@@ -51,6 +60,7 @@ for (const spec of structures) {
   });
   console.log(
     `${name}: L=${s.L} chains=${s.chainList.join(",")} ligandAtoms=${s.ligandType.length} `
+    + `${sideChains ? "side-chain context " : ""}`
     + `seq=${s.sequence.slice(0, 40)}${s.sequence.length > 40 ? "..." : ""}`,
   );
 }

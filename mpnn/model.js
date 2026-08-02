@@ -22,6 +22,7 @@ import {
   nearestLigandAtoms,
   neighborGraph,
   pairRbf,
+  sideChainContext,
 } from "./features.js";
 import { makeDecoderLayer, makeEncoderLayer } from "./layers.js";
 import { gatherNodes, layerNorm, linear, logSoftmax, softmax } from "./ops.js";
@@ -132,6 +133,12 @@ export class Model {
    * @param {Float32Array} [inputs.ligandMask] [A]
    * @param {Int32Array}   [inputs.membraneLabels] [L] 0/1/2, membrane models only
    * @param {boolean}      [inputs.useAtomContext=true]
+   * @param {boolean}      [inputs.useSideChains=false] LigandMPNN only: add the
+   *   side chains of nearby fixed residues to the atom context. Needs `xyz37`,
+   *   `xyz37Mask` and `chainMask`, and makes the encoding depend on `chainMask`.
+   * @param {Float32Array} [inputs.xyz37]     [L, 37, 3] all-atom coordinates
+   * @param {Float32Array} [inputs.xyz37Mask] [L, 37]
+   * @param {Float32Array} [inputs.chainMask] [L] 1 = designed, 0 = fixed
    * @returns {Encoded}
    */
   encode(inputs) {
@@ -169,7 +176,7 @@ export class Model {
 
     let ligand = null;
     if (this.isLigand) {
-      ligand = this._prepareLigand(inputs, bb, mask, L);
+      ligand = this._prepareLigand(inputs, bb, mask, L, EIdx, K);
     }
 
     for (const layer of this.encoderLayers) layer(hV, hE, EIdx, mask, maskAttend, L);
@@ -182,19 +189,30 @@ export class Model {
     });
   }
 
-  /** Nearest ligand atoms per residue plus their node features. */
-  _prepareLigand(inputs, bb, mask, L) {
+  /** Nearest context atoms per residue plus their node features. */
+  _prepareLigand(inputs, bb, mask, L, EIdx, K) {
     const M = this.M;
     const xyz = inputs.ligandXyz ?? new Float32Array(0);
     const types = inputs.ligandType ?? new Int32Array(0);
     const ligMask = inputs.ligandMask ?? new Float32Array(types.length).fill(1);
 
-    const { Y, Yt, Ym, Yg, Dclosest } = nearestLigandAtoms(
+    const sideChains = inputs.useSideChains === true && inputs.xyz37 !== undefined;
+    let { Y, Yt, Ym, Yg, Dclosest } = nearestLigandAtoms(
       bb.CB, mask, xyz, types, ligMask, L, M);
+    let poolSize = types.length;
+    if (sideChains) {
+      // Fixed residues only, so the pool depends on the design selection --
+      // see `sideChainContext`. Positions the caller has not marked are treated
+      // as designed, which is the conservative reading.
+      const chainMask = inputs.chainMask ?? new Float32Array(L).fill(1);
+      ({ Y, Yt, Ym, Yg, Dclosest, poolSize } = sideChainContext(
+        bb.CB, mask, EIdx, K, inputs.xyz37, inputs.xyz37Mask, chainMask,
+        { Y, Yt, Ym, Yg }, L, M));
+    }
     if (inputs.useAtomContext === false) Ym.fill(0);
     const { V } = ligandNodeFeatures(this.w, bb, Y, Yt, L, M);
 
-    const pairs = ligandPairTable(Yg, Y, L, M, types.length);
+    const pairs = ligandPairTable(Yg, Y, L, M, poolSize);
     // The first atom of each distinct pair, so its type embedding can be added
     // to the cached message without another lookup table.
     const pairTypeA = new Int32Array(pairs.count);
@@ -205,7 +223,10 @@ export class Model {
         }
       }
     }
-    return { Y, Yt, Ym, Yg, Dclosest, V, M, pairs, pairTypeA, nAtoms: types.length };
+    return {
+      Y, Yt, Ym, Yg, Dclosest, V, M, pairs, pairTypeA,
+      nAtoms: types.length, sideChains,
+    };
   }
 
   /**

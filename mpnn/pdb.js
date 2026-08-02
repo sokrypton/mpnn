@@ -4,7 +4,7 @@
 // zero-occupancy atoms dropped, and everything that is neither protein nor water
 // (ligands, cofactors, ions, nucleic acids) collected as ligand context.
 
-import { ELEMENT_TO_INT, THREE_TO_ONE } from "./constants.js";
+import { ATOM37, ELEMENT_TO_INT, THREE_TO_ONE } from "./constants.js";
 
 /** Residues treated as protein even though they carry a non-standard name. */
 const EXTRA_PROTEIN = new Set([
@@ -146,6 +146,7 @@ export function parseAtoms(text) {
  * @param {boolean}  [opts.ligands=true] collect heteroatoms as ligand context
  * @returns {{
  *   X: Float32Array, mask: Float32Array, S: Int32Array,
+ *   xyz37: Float32Array, xyz37Mask: Float32Array,
  *   residueIdx: Int32Array, chainLabels: Int32Array, L: number,
  *   chainIds: string[], resSeq: Int32Array, iCodes: string[], resNames: string[],
  *   ligandXyz: Float32Array, ligandType: Int32Array, ligandMask: Float32Array,
@@ -189,6 +190,10 @@ export function structureFromText(text, opts = {}) {
   const L = kept.length;
 
   const X = new Float32Array(L * 12);
+  // Every atom the reference knows about, for LigandMPNN's side-chain context.
+  // Missing atoms stay at the origin with mask 0, as `parse_PDB` leaves them.
+  const xyz37 = new Float32Array(L * 37 * 3);
+  const xyz37Mask = new Float32Array(L * 37);
   const mask = new Float32Array(L);
   const S = new Int32Array(L);
   const resSeq = new Int32Array(L);
@@ -221,6 +226,15 @@ export function structureFromText(text, opts = {}) {
       X[i * 12 + slot * 3 + 2] = atom.z;
     });
     mask[i] = complete;
+    ATOM37.forEach((name, slot) => {
+      const atom = res.atoms.get(name);
+      if (atom === undefined) return;
+      const off = (i * 37 + slot) * 3;
+      xyz37[off] = atom.x;
+      xyz37[off + 1] = atom.y;
+      xyz37[off + 2] = atom.z;
+      xyz37Mask[i * 37 + slot] = 1;
+    });
     const letter = THREE_TO_ONE[res.meta.resName] ?? "X";
     S[i] = "ACDEFGHIKLMNPQRSTVWYX".indexOf(letter);
     resSeq[i] = res.meta.resSeq;
@@ -241,7 +255,7 @@ export function structureFromText(text, opts = {}) {
   });
 
   return {
-    X, mask, S, L,
+    X, mask, S, L, xyz37, xyz37Mask,
     residueIdx: renumber(resSeq),
     chainLabels, chainIds, resSeq, iCodes, resNames, chainList,
     ligandXyz, ligandType, ligandMask,

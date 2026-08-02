@@ -13,6 +13,8 @@ import {
   CB_COEFF,
   MAX_RELATIVE_FEATURE,
   RBF,
+  SIDE_CHAIN_ATOM_TYPES,
+  SIDE_CHAIN_START,
 } from "./constants.js";
 import { argTopKSmallest, layerNorm, linear, tryEdgeFeatures } from "./ops.js";
 
@@ -423,6 +425,121 @@ export function nearestLigandAtoms(CB, mask, ligXyz, ligType, ligMask, L, M) {
     }
   }
   return { Y, Yt, Ym, Yg, Dclosest };
+}
+
+/** How many backbone neighbours contribute their side chains. */
+export const SIDE_CHAIN_NEIGHBORS = 16;
+/** Side-chain slots per residue: everything in the 37-atom set past C-beta. */
+const SC_SLOTS = SIDE_CHAIN_ATOM_TYPES.length;
+
+/**
+ * The same selection as `nearestLigandAtoms`, but with the side chains of
+ * nearby *fixed* residues thrown into the candidate pool first.
+ *
+ * This is LigandMPNN's `--ligand_mpnn_use_side_chain_context`. Each residue
+ * looks at its 16 nearest backbone neighbours, takes their 32 side-chain slots,
+ * masks out any belonging to a residue that is being designed -- its side chain
+ * is about to change, so showing it would be cheating -- and appends the ligand
+ * slots this residue already selected. The M nearest of that pool to C-beta
+ * become the atom context.
+ *
+ * The ligand half is `lig`, the [L, M] output of `nearestLigandAtoms`, not the
+ * raw atom list: the reference's `featurize` always runs that selection first
+ * and `forward` concatenates onto its result, padding slots included. With a
+ * ligand larger than M the two differ.
+ *
+ * Two consequences worth knowing. The encoder now depends on which positions
+ * are fixed, so changing the selection invalidates the encoding; and the atom
+ * pool is no longer a handful of ligand atoms, so the pair-dedup table below
+ * has more distinct pairs to hold.
+ *
+ * @param {Float32Array} chainMask [L] 1 = being designed, 0 = fixed
+ * @param {{Y: Float32Array, Yt: Int32Array, Ym: Float32Array, Yg: Int32Array}} lig
+ * @returns {{Y: Float32Array, Yt: Int32Array, Ym: Float32Array,
+ *            Yg: Int32Array, Dclosest: Float32Array, poolSize: number}}
+ */
+export function sideChainContext(
+  CB, mask, EIdx, K, xyz37, xyz37Mask, chainMask, lig, L, M,
+) {
+  const nNbr = Math.min(SIDE_CHAIN_NEIGHBORS, K);
+  const nCand = nNbr * SC_SLOTS + M;
+  // Global atom ids: residue r slot s -> r * SC_SLOTS + s, ligand atom a ->
+  // L * SC_SLOTS + 1 + a, with a padding slot at L * SC_SLOTS. The pair table
+  // keys on these, so they have to be unique across the whole structure, not
+  // just within one residue's candidate list.
+  let maxLigId = 0;
+  for (let n = 0; n < lig.Yg.length; n++) maxLigId = Math.max(maxLigId, lig.Yg[n] + 1);
+  const poolSize = L * SC_SLOTS + 1 + maxLigId;
+
+  const Y = new Float32Array(L * M * 3);
+  const Yt = new Int32Array(L * M);
+  const Ym = new Float32Array(L * M);
+  const Yg = new Int32Array(L * M).fill(-1);
+  const Dclosest = new Float32Array(L);
+
+  const take = Math.min(M, nCand);
+  if (take === 0) return { Y, Yt, Ym, Yg, Dclosest, poolSize };
+
+  const row = new Float32Array(nCand);
+  const cm = new Float32Array(nCand);
+  const xyz = new Float32Array(nCand * 3);
+  const type = new Int32Array(nCand);
+  const gid = new Int32Array(nCand);
+  const pick = new Int32Array(take);
+
+  for (let i = 0; i < L; i++) {
+    let c = 0;
+    for (let k = 0; k < nNbr; k++) {
+      const j = EIdx[i * K + k];
+      // A designed neighbour contributes nothing: `xyz_37_m * (1 - chain_mask)`.
+      const keep = chainMask[j] > 0 ? 0 : 1;
+      for (let s = 0; s < SC_SLOTS; s++) {
+        const slot = j * 37 + SIDE_CHAIN_START + s;
+        xyz[c * 3] = xyz37[slot * 3];
+        xyz[c * 3 + 1] = xyz37[slot * 3 + 1];
+        xyz[c * 3 + 2] = xyz37[slot * 3 + 2];
+        type[c] = SIDE_CHAIN_ATOM_TYPES[s];
+        gid[c] = j * SC_SLOTS + s;
+        cm[c] = xyz37Mask[slot] * keep;
+        c++;
+      }
+    }
+    for (let m = 0; m < M; m++) {
+      const src = i * M + m;
+      xyz[c * 3] = lig.Y[src * 3];
+      xyz[c * 3 + 1] = lig.Y[src * 3 + 1];
+      xyz[c * 3 + 2] = lig.Y[src * 3 + 2];
+      type[c] = lig.Yt[src];
+      gid[c] = L * SC_SLOTS + 1 + lig.Yg[src];
+      cm[c] = lig.Ym[src];
+      c++;
+    }
+
+    for (let n = 0; n < nCand; n++) {
+      const m = mask[i] * cm[n];
+      const dx = CB[i * 3] - xyz[n * 3];
+      const dy = CB[i * 3 + 1] - xyz[n * 3 + 1];
+      const dz = CB[i * 3 + 2] - xyz[n * 3 + 2];
+      row[n] = (dx * dx + dy * dy + dz * dz) * m + (1 - m) * 10000.0;
+    }
+    argTopKSmallest(row, nCand, take, pick);
+    Dclosest[i] = Math.sqrt(row[pick[0]]);
+
+    for (let s = 0; s < take; s++) {
+      const n = pick[s];
+      const dst = i * M + s;
+      Y[dst * 3] = xyz[n * 3];
+      Y[dst * 3 + 1] = xyz[n * 3 + 1];
+      Y[dst * 3 + 2] = xyz[n * 3 + 2];
+      Yt[dst] = type[n];
+      // The candidate's own mask, not the adjusted one -- the reference gathers
+      // `Y_m` straight through, so a masked residue i keeps its neighbours'
+      // masks even though its distances were all pushed to the padding value.
+      Ym[dst] = cm[n];
+      Yg[dst] = gid[n];
+    }
+  }
+  return { Y, Yt, Ym, Yg, Dclosest, poolSize };
 }
 
 /**

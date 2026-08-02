@@ -65,6 +65,24 @@ async function waitReady(residues, timeout) {
   );
 }
 
+/**
+ * Wait for a *fresh* encode. `waitReady` alone returns immediately when the
+ * status line still reads the previous run's success, which is exactly the
+ * case whenever something re-encodes the same structure.
+ */
+async function waitReencode(action, residues, timeout) {
+  const before = await page.textContent("#model-status");
+  await action();
+  await page.waitForFunction(
+    ({ prev, n }) => {
+      const text = document.getElementById("model-status").textContent;
+      return text !== prev && new RegExp(`encoded ${n} residues`).test(text);
+    },
+    { prev: before, n: residues },
+    { timeout },
+  );
+}
+
 const problems = [];
 page.on("console", (msg) => {
   if (msg.type() === "error") problems.push(`console: ${msg.text()}`);
@@ -382,6 +400,49 @@ if (!process.argv.includes("--no-ligand")) {
   const changed = await page.evaluate(() =>
     document.querySelectorAll(".res.changed").length);
   console.log(`residues changed: ${changed}`);
+
+  // Side-chain context. Only the fixed residues contribute, so it must both
+  // re-encode when switched on and re-encode again when the selection moves --
+  // the one input that is otherwise read at sampling time only.
+  if (await page.evaluate(() => document.getElementById("side-chain-row").hidden)) {
+    problems.push("side-chain context control stayed hidden for LigandMPNN");
+  }
+  const scoreWith = async () => {
+    await page.click("#score-native");
+    await page.click("#score-btn");
+    await page.waitForFunction(
+      (prev) => {
+        const t = document.getElementById("score-status").textContent;
+        return t !== prev && /nll |Failed/.test(t);
+      },
+      "Scoring…", { timeout: 600000 },
+    );
+    const text = (await page.textContent("#score-status")).trim();
+    return parseFloat(text.match(/nll ([0-9.]+)/)?.[1] ?? "NaN");
+  };
+  // The score averages over the designed positions, which here are the ~14
+  // around biotin -- the setting the flag exists for.
+  const nllPlain = await scoreWith();
+  await waitReencode(() => page.check("#use-side-chains"), 121, 600000);
+  const nllSc = await scoreWith();
+  console.log(`side chains: binding-site nll ${nllPlain.toFixed(4)} -> ${nllSc.toFixed(4)}`);
+  if (!(nllSc < nllPlain)) {
+    problems.push(`side-chain context did not sharpen the score (${nllPlain} -> ${nllSc})`);
+  }
+
+  // Designing everything leaves nothing fixed, so there are no side chains to
+  // add and the answer has to fall back to the plain one exactly. This is also
+  // what catches the selection failing to invalidate the encoding: without the
+  // re-encode the previous, sharper number would still be showing.
+  await waitReencode(() => page.click("#select-all"), 121, 600000);
+  const nllAllSc = await scoreWith();
+  await waitReencode(() => page.uncheck("#use-side-chains"), 121, 600000);
+  const nllAllPlain = await scoreWith();
+  console.log(`side chains: nothing fixed ${nllAllSc.toFixed(4)} vs plain ${nllAllPlain.toFixed(4)}`);
+  if (Math.abs(nllAllSc - nllAllPlain) > 1e-4) {
+    problems.push(`with nothing fixed, side-chain context changed the answer `
+      + `(${nllAllSc} vs ${nllAllPlain})`);
+  }
   if (changed === 0) problems.push("design changed nothing at all");
   if (changed > selected) problems.push("design altered residues that were marked fixed");
 

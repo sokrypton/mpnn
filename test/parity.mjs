@@ -89,6 +89,10 @@ for (const ref of reference) {
     ligandType: Int32Array.from(raw.ligandType),
     ligandMask: Float32Array.from(raw.ligandMask),
     membraneLabels: Int32Array.from(raw.membraneLabels ?? new Array(raw.L).fill(0)),
+    useSideChains: Boolean(testCase.useSideChains),
+    xyz37: raw.xyz37 ? Float32Array.from(raw.xyz37) : undefined,
+    xyz37Mask: raw.xyz37Mask ? Float32Array.from(raw.xyz37Mask) : undefined,
+    chainMask: raw.chainMask ? Float32Array.from(raw.chainMask) : undefined,
   };
 
   const t0 = performance.now();

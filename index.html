@@ -57,6 +57,19 @@
         Use ligand atom context
       </label>
     </div>
+    <div id="side-chain-row" hidden>
+      <div class="row">
+        <label class="check">
+          <input type="checkbox" id="use-side-chains">
+          Also use the side chains of fixed residues
+        </label>
+      </div>
+      <p class="hint">
+        Adds the side-chain atoms of nearby residues you are <em>not</em>
+        designing to the atom context. Because it reads the selection, changing
+        which residues are designed re-runs the encoder.
+      </p>
+    </div>
     <div id="membrane-global-row" hidden>
       <div class="row">
         <select id="membrane-global">

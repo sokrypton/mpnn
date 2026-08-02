@@ -30,7 +30,7 @@ def load_reference_module(ref: pathlib.Path):
     return module
 
 
-def build_model(mu, checkpoint_path, model_type, device):
+def build_model(mu, checkpoint_path, model_type, device, use_side_chains=False):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     atom_context_num = ckpt["atom_context_num"] if model_type == "ligand_mpnn" else 1
     model = mu.ProteinMPNN(
@@ -43,7 +43,7 @@ def build_model(mu, checkpoint_path, model_type, device):
         device=device,
         atom_context_num=atom_context_num,
         model_type=model_type,
-        ligand_mpnn_use_side_chain_context=False,
+        ligand_mpnn_use_side_chain_context=use_side_chains,
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device)
@@ -76,7 +76,7 @@ def nearest_ligand_atoms(CB, mask, Y, Y_t, Y_m, M):
     return Y_out, Y_t_out, Y_m_out, D_closest
 
 
-def make_feature_dict(inputs, model_type, atom_context_num):
+def make_feature_dict(inputs, model_type, atom_context_num, use_side_chains=False):
     L = inputs["L"]
     X = torch.tensor(inputs["X"], dtype=torch.float32).reshape(L, 4, 3)
     mask = torch.tensor(inputs["mask"], dtype=torch.float32)
@@ -113,6 +113,17 @@ def make_feature_dict(inputs, model_type, atom_context_num):
         fd["Y"] = Yn[None]
         fd["Y_t"] = Ytn[None].float()
         fd["Y_m"] = Ymn[None].float()
+
+        if use_side_chains:
+            # `forward` concatenates the neighbours' side chains onto the Y
+            # above -- the already-selected M nearest ligand atoms, padding
+            # slots included -- and reselects M from that pool.
+            fd["xyz_37"] = torch.tensor(
+                inputs["xyz37"], dtype=torch.float32).reshape(1, L, 37, 3)
+            fd["xyz_37_m"] = torch.tensor(
+                inputs["xyz37Mask"], dtype=torch.float32).reshape(1, L, 37)
+            fd["chain_mask"] = torch.tensor(
+                inputs["chainMask"], dtype=torch.float32)[None]
 
     if model_type in ("per_residue_label_membrane_mpnn", "global_label_membrane_mpnn"):
         labels = inputs.get("membraneLabels") or [0] * L
@@ -165,9 +176,10 @@ def main() -> int:
     for case in cases:
         model_type = case["modelType"]
         ckpt_path = args.checkpoints / f"{case['checkpoint']}.pt"
-        model, ckpt = build_model(mu, ckpt_path, model_type, "cpu")
+        side_chains = bool(case.get("useSideChains"))
+        model, ckpt = build_model(mu, ckpt_path, model_type, "cpu", side_chains)
         atom_context_num = ckpt.get("atom_context_num", 1)
-        fd = make_feature_dict(case["inputs"], model_type, atom_context_num)
+        fd = make_feature_dict(case["inputs"], model_type, atom_context_num, side_chains)
         L = case["inputs"]["L"]
 
         with torch.no_grad():

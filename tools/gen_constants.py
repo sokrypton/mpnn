@@ -53,6 +53,20 @@ def main() -> int:
     side_chain_atom_types = literal_after(
         model_utils, r"self\.side_chain_atom_types = torch\.tensor\(\s*\[")
 
+    # `atom_order` is a dict rather than a list, so pull the names out in
+    # slot order. Slots 5..36 are the side-chain atoms the context feature uses,
+    # and their elements have to line up with side_chain_atom_types.
+    atom_order_src = re.search(r"atom_order = \{(.*?)\n    \}", data_utils, re.S).group(1)
+    atom_order = dict(re.findall(r'"([A-Z0-9]+)":\s*(\d+)', atom_order_src))
+    atom37 = [None] * 37
+    for name, slot in atom_order.items():
+        atom37[int(slot)] = name
+    assert all(atom37), "atom_order does not cover all 37 slots"
+    element_of = {"C": 6, "N": 7, "O": 8, "S": 16}
+    for slot, want in enumerate(side_chain_atom_types, start=5):
+        got = element_of[atom37[slot][0]]
+        assert got == want, f"slot {slot} ({atom37[slot]}) is {got}, table says {want}"
+
     assert len(periodic) == 3 and len(periodic[0]) == 119, "unexpected periodic table shape"
     groups, periods = periodic[1], periodic[2]
 
@@ -104,6 +118,18 @@ export const ATOM_PERIOD = new Int32Array([
 export const SIDE_CHAIN_ATOM_TYPES = new Int32Array([
 {js_array(side_chain_atom_types)}
 ]);
+
+/**
+ * PDB atom name of each slot in the 37-atom representation, in the reference's
+ * `atom_order`. Slots 0-4 are the backbone plus C-beta; 5-36 are the side-chain
+ * atoms whose elements SIDE_CHAIN_ATOM_TYPES lists, in the same order.
+ */
+export const ATOM37 = [
+{js_array([f'"{n}"' for n in atom37])}
+];
+
+/** Where the side-chain slots start in ATOM37. */
+export const SIDE_CHAIN_START = 5;
 
 /** Widths of the one-hot atom-type encoding: type, group, period. */
 export const ATOM_TYPE_ONEHOT = {{ type: 120, group: 19, period: 8, total: 147 }};

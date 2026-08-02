@@ -21,6 +21,11 @@ first load.
   within 6 Å of a ligand.
 - **Design** with a temperature, a batch size, per-amino-acid bias and
   omissions, tied/symmetric positions, and a seed that makes a run reproducible.
+  Bias can be global or scoped to the residues you have selected.
+- **Score a sequence** you paste in, per position and averaged, by
+  pseudo-likelihood or true autoregressive likelihood (see *Conditioning*).
+- **Feed LigandMPNN the side chains** of the residues you are not designing,
+  as extra atom context.
 - **Read a position profile** as a sequence logo -- bits on the y axis, glyphs
   stretched to their share of the column, the native residue underneath -- in
   three flavours (see *Conditioning* below). Hovering a column highlights that
@@ -171,6 +176,31 @@ the sampler reports for its own designs.
 > 0.0 against an `ar_mask = 0` pass). `--use_sequence 0`, documented as
 > "backbone info only", is the one that conditions on the rest. This port does
 > not reproduce that.
+
+## Side-chain context
+
+LigandMPNN's `--ligand_mpnn_use_side_chain_context`, on the *Model* panel. Each
+residue takes the 32 side-chain slots of its 16 nearest backbone neighbours,
+drops any belonging to a residue being designed -- that side chain is about to
+change -- appends the ligand atoms it already selected, and keeps the M nearest
+to C-beta. It is worth what it costs on a binding site: redesigning the 14
+residues around biotin in 1STP, mean NLL over those positions goes 1.185 to
+1.064, and in the page's own smoke test 0.504 to 0.370.
+
+Two things follow from the design that are easy to trip over.
+
+**The encoder now depends on the selection.** Everywhere else `chainMask` is a
+sampling-time argument and one encoding serves every run; here it is an encoder
+input, so clicking a residue re-encodes. The page does that automatically and
+says so in the hint. With *nothing* fixed the result is bit-identical to leaving
+the flag off, which is the natural check and the one the browser test makes.
+
+**Side chains crowd out the ligand.** The context is capped at M atoms, and
+side-chain atoms are much closer to C-beta than the ligand is. On 1STP with
+everything fixed, the average residue keeps 1.2 of biotin's 16 atoms in context,
+against 16 with the flag off -- and the score gets *worse*, 1.31 to 1.84. So
+this is a tool for redesigning a pocket inside a fixed scaffold, not something
+to leave on.
 
 ## Correctness
 

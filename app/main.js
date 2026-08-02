@@ -143,6 +143,7 @@ function updateModelHint() {
     + `k=${model.k_neighbors} neighbours`
     + (model.atom_context_num ? `, ${model.atom_context_num} ligand atoms per residue` : "");
   $("atom-context-row").hidden = type !== "ligand_mpnn";
+  $("side-chain-row").hidden = type !== "ligand_mpnn";
   $("membrane-global-row").hidden = type !== "global_label_membrane_mpnn";
   $("membrane-perres-row").hidden = type !== "per_residue_label_membrane_mpnn";
 }
@@ -221,7 +222,14 @@ async function ensureEncoded() {
   if (!structure) return false;
   const name = $("model-select").value;
   const useAtomContext = $("use-atom-context").checked;
-  const key = `${name}|${useAtomContext}|${state.structureId}|${state.membraneVersion}`;
+  // Side-chain context reads the fixed residues' side chains, so unlike every
+  // other input the encoding depends on the selection -- changing it has to
+  // invalidate the cache.
+  const type = $("model-select").selectedOptions[0]?.dataset.type;
+  const useSideChains = $("use-side-chains").checked && type === "ligand_mpnn";
+  const selection = useSideChains ? state.designMask.join("") : "";
+  const key = `${name}|${useAtomContext}|${useSideChains}|${selection}`
+    + `|${state.structureId}|${state.membraneVersion}`;
   if (state.encodedFor === key) return true;
   const token = ++encodeToken;
 
@@ -256,6 +264,14 @@ async function ensureEncoded() {
         ligandMask: structure.ligandMask,
         membraneLabels: state.membraneLabels ? Array.from(state.membraneLabels) : null,
         useAtomContext,
+        useSideChains,
+        ...(useSideChains
+          ? {
+            xyz37: structure.xyz37,
+            xyz37Mask: structure.xyz37Mask,
+            chainMask: Array.from(state.designMask),
+          }
+          : {}),
       },
     });
     // A newer request has superseded us; its encoding is the one the worker
@@ -318,6 +334,11 @@ function refreshSelection() {
   renderSequenceTrack();
   if (state.profile) renderLogo();
   redraw();
+  // With side-chain context on, the selection is an encoder input. Everywhere
+  // else it is only read at sampling time.
+  if ($("use-side-chains").checked && !$("side-chain-row").hidden && state.structure) {
+    ensureEncoded();
+  }
 }
 
 /** Residues with any backbone atom within `cutoff` of a heteroatom. */
@@ -914,6 +935,11 @@ $("model-select").onchange = () => {
 };
 
 $("use-atom-context").onchange = () => {
+  state.encodedFor = null;
+  if (state.structure) ensureEncoded();
+};
+
+$("use-side-chains").onchange = () => {
   state.encodedFor = null;
   if (state.structure) ensureEncoded();
 };
