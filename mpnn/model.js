@@ -652,10 +652,14 @@ export class Model {
     const hVOut = a.f32("smp.hVOut", B * H);
     const maskRow = a.f32("smp.mask", B);
     const paRow = a.f32("smp.pa", B * H);
-    const projRow = a.f32("smp.proj", H);
+    const projBatch = a.f32("smp.projBatch", B * H);
+    const logitsBatch = a.f32("smp.logits", B * V);
     const totalLogits = new Float32Array(B * V);
-    const logitsRow = new Float32Array(V);
     const vis = new Uint8Array(B * K);
+    /** Positions decoded this step, whose W1s projections need refreshing. */
+    const pending = [];
+    const pendingRows = a.f32("smp.pendingRows", B * 8 * H);
+    const pendingOut = a.f32("smp.pendingOut", B * 8 * H);
 
     // Running projections of the two things that change one row per step.
     // Maintaining them incrementally costs one 128x128 product per step; doing
@@ -697,16 +701,21 @@ export class Model {
             const [Wv] = this.decoderLayers[l].blocks;
             const pe = prep.pe[l];
             const pnEnc = prep.pnEnc[l];
+            // Gather the batch's current node states, then project all B rows
+            // in one call. B separate n=1 products fall below the accelerator's
+            // threshold and land back in JS, which is where they showed up in a
+            // profile as ~9% of total runtime.
+            for (let b = 0; b < B; b++) {
+              const t = orders[b][step][g];
+              hVRow.set(stacks[b][l].subarray(t * H, (t + 1) * H), b * H);
+            }
+            linear(hVRow, Wv, this.decoderLayers[l].bias, B, H, H, paRow);
+
             for (let b = 0; b < B; b++) {
               const t = orders[b][step][g];
               const m = mask[t];
-              const stack = stacks[b][l];
               const ps = psCache[b][l];
               const pn = pnCache[b][l];
-              linear(
-                stack.subarray(t * H, (t + 1) * H), Wv, this.decoderLayers[l].bias,
-                1, H, H, paRow.subarray(b * H, (b + 1) * H),
-              );
               for (let k = 0; k < K; k++) {
                 const j = EIdx[t * K + k];
                 const dst = (b * K + k) * H;
@@ -720,20 +729,22 @@ export class Model {
                     + bw * (ps[jo + d] + pn[jo + d]) + fw * pnEnc[jo + d];
                 }
               }
-              hVRow.set(stack.subarray(t * H, (t + 1) * H), b * H);
             }
 
             this.decoderLayers[l].applyPre(hVRow, h1, maskRow, null, B, K, hVOut);
 
+            // The next layer reads h_V_stack[l+1] at these positions, so its
+            // projection is refreshed now -- for the whole batch at once, since
+            // hVOut is already a contiguous [B, H].
+            if (l + 1 < nLayers) {
+              const [, , , Wn] = this.decoderLayers[l + 1].blocks;
+              linear(hVOut, Wn, null, B, H, H, projBatch);
+            }
             for (let b = 0; b < B; b++) {
               const t = orders[b][step][g];
               stacks[b][l + 1].set(hVOut.subarray(b * H, (b + 1) * H), t * H);
-              // The next layer reads h_V_stack[l+1] at this position, so its
-              // projection has to be refreshed now.
               if (l + 1 < nLayers) {
-                const [, , , Wn] = this.decoderLayers[l + 1].blocks;
-                linear(hVOut.subarray(b * H, (b + 1) * H), Wn, null, 1, H, H, projRow);
-                pnCache[b][l + 1].set(projRow, t * H);
+                pnCache[b][l + 1].set(projBatch.subarray(b * H, (b + 1) * H), t * H);
               }
             }
           }
@@ -775,15 +786,19 @@ export class Model {
 
         for (let b = 0; b < B; b++) {
           const t = orders[b][step][g];
-          const top = stacks[b][nLayers];
-          linear(top.subarray(t * H, (t + 1) * H), wOut.weight, wOut.bias, 1, H, V, logitsRow);
-          outLogits[b].set(logitsRow, t * V);
+          hVRow.set(stacks[b][nLayers].subarray(t * H, (t + 1) * H), b * H);
+        }
+        linear(hVRow, wOut.weight, wOut.bias, B, H, V, logitsBatch);
+        for (let b = 0; b < B; b++) {
+          const t = orders[b][step][g];
+          outLogits[b].set(logitsBatch.subarray(b * V, (b + 1) * V), t * V);
           const weight = groups.weightOf(t);
-          for (let v = 0; v < V; v++) totalLogits[b * V + v] += weight * logitsRow[v];
+          for (let v = 0; v < V; v++) totalLogits[b * V + v] += weight * logitsBatch[b * V + v];
         }
       }
 
       // One draw per tied group, broadcast to its members.
+      pending.length = 0;
       for (let b = 0; b < B; b++) {
         const t0 = orders[b][step][0];
         let best = 0;
@@ -804,14 +819,24 @@ export class Model {
           const aa = chainMask[t] > 0 ? best : startS[t];
           outS[b][t] = aa;
           hSs[b].set(table.subarray(aa * H, (aa + 1) * H), t * H);
-          if (prep) {
-            // W1s differs per layer, so every layer's cache needs the new row.
-            const row = table.subarray(aa * H, (aa + 1) * H);
-            for (let l = 0; l < nLayers; l++) {
-              const [, , Ws] = this.decoderLayers[l].blocks;
-              linear(row, Ws, null, 1, H, H, projRow);
-              psCache[b][l].set(projRow, t * H);
-            }
+          if (prep) pending.push([b, t, aa]);
+        }
+      }
+
+      if (prep && pending.length) {
+        // One product per layer over every position decoded this step, rather
+        // than one per (position, layer).
+        const n = pending.length;
+        const rows = pendingRows.subarray(0, n * H);
+        for (let r = 0; r < n; r++) {
+          rows.set(table.subarray(pending[r][2] * H, (pending[r][2] + 1) * H), r * H);
+        }
+        for (let l = 0; l < nLayers; l++) {
+          const [, , Ws] = this.decoderLayers[l].blocks;
+          const out = pendingOut.subarray(0, n * H);
+          linear(rows, Ws, null, n, H, H, out);
+          for (let r = 0; r < n; r++) {
+            psCache[pending[r][0]][l].set(out.subarray(r * H, (r + 1) * H), pending[r][1] * H);
           }
         }
       }

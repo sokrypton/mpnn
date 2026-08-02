@@ -195,7 +195,7 @@ as a pessimistic floor rather than a benchmark.
 | | ProteinMPNN, L = 76 | LigandMPNN, L = 121 |
 | --- | --- | --- |
 | encode | **0.52 s** (was 1.4) | **1.04 s** (was 13.3) |
-| sample | **76 ms/seq** (was 1014) | **91 ms/seq** (was 1113) |
+| sample | **59 ms/seq** (was 1014) | **67 ms/seq** (was 1113) |
 | profile | **0.13 s** (was 1.04) | **0.09 s** (was 1.12) |
 
 Between 2.7x and 13x depending on what you ask for. Four things got it there,
@@ -264,14 +264,28 @@ committed `kernels.wasm` is 10 KB, so most people never will.
 
 ### What is left
 
-- **Batching helps less than it looks.** Eight sequences cost about five times
-  one, not one: the encoder is shared, but decode work is genuinely per-sample.
-  There is no more amortisation to find there — only cheaper steps.
-- **Threads.** Nothing here uses more than one core. A `SharedArrayBuffer`
-  worker pool would scale nearly linearly over a batch, since samples are
-  independent, but it needs COOP/COEP headers that GitHub Pages does not send.
+**Would porting the whole engine to wasm help?** Not much, and it was measured
+rather than assumed. After the above, a profile splits as **71% wasm, 25% JS,
+4% runtime**, so moving *all* remaining JS into wasm caps at **1.34x**, and a
+realistic 3x on that glue is **1.20x**. The usual argument for going all-in —
+staging copies at the JS/wasm boundary — does not apply here: they measure
+**0.6%**, because the arrays that cross are small next to the arithmetic done
+on them. Against that, the JS would stop being the reference implementation
+that makes the parity story checkable, and changing a line of model code would
+start requiring a C toolchain. The coarse-entry-point design gets most of the
+benefit for none of that.
+
+Still open, roughly in order of payoff:
+
+- **Threads.** Nothing here uses more than one core, and samples are completely
+  independent. A worker pool would scale nearly linearly over a batch — a much
+  bigger win than the 1.2x a full wasm port would buy. It does *not* need
+  `SharedArrayBuffer` or COOP/COEP: each worker can be handed a structured
+  clone of the encoding and asked for its share of the sequences.
+- **Batching still helps less than it looks.** Eight sequences cost about 2.7x
+  one, not 1x: the encoder is shared, but decode work is genuinely per-sample.
 - **The rest of the encoder** is three `[L·K, 128] × [128, 128]` products per
-  layer, which no rearrangement removes.
+  layer, which no rearrangement removes — only more cores or a better kernel.
 
 ## Weights
 
