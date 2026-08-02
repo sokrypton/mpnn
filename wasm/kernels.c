@@ -241,3 +241,118 @@ EXPORT void layernorm_f32(const float *x, const float *gamma, const float *beta,
     for (int k = body; k < c; k++) oi[k] = (xi[k] - mean) * inv * gamma[k] + beta[k];
   }
 }
+
+
+// --- coarse blocks -----------------------------------------------------------
+//
+// Same reasoning as tail2_f32: the pieces between the matmuls -- the masked
+// neighbour sum, the residual adds, the LayerNorms, the output mask -- are all
+// memory bound, so exporting them individually would spend as long staging as
+// computing. Exported as whole blocks, they ride along with the matmul that is
+// already here and the intermediates never leave this memory.
+
+static inline void add_into(float *a, const float *b, int n) {
+  int i = 0;
+  for (; i + 4 <= n; i += 4) {
+    wasm_v128_store(a + i, wasm_f32x4_add(wasm_v128_load(a + i), wasm_v128_load(b + i)));
+  }
+  for (; i < n; i++) a[i] += b[i];
+}
+
+/** dh[r] = (1/scale) * sum_j maskAttend[r, j] * msg[r, j, :]; mask may be null. */
+static void reduce_scaled(const float *msg, const float *maskAttend,
+                          int rows, int k, int hidden, float scale, float *dh) {
+  const v128_t inv = wasm_f32x4_splat(1.0f / scale);
+  for (int i = 0; i < rows; i++) {
+    float *d = dh + i * hidden;
+    for (int c = 0; c < hidden; c += 4) wasm_v128_store(d + c, wasm_f32x4_const_splat(0.0f));
+    for (int j = 0; j < k; j++) {
+      const float m = maskAttend ? maskAttend[i * k + j] : 1.0f;
+      if (m == 0.0f) continue;
+      const float *src = msg + ((long)i * k + j) * hidden;
+      if (m == 1.0f) {
+        for (int c = 0; c < hidden; c += 4) {
+          wasm_v128_store(d + c, wasm_f32x4_add(wasm_v128_load(d + c), wasm_v128_load(src + c)));
+        }
+      } else {
+        const v128_t mv = wasm_f32x4_splat(m);
+        for (int c = 0; c < hidden; c += 4) {
+          wasm_v128_store(d + c, wasm_f32x4_add(wasm_v128_load(d + c),
+                                                wasm_f32x4_mul(mv, wasm_v128_load(src + c))));
+        }
+      }
+    }
+    for (int c = 0; c < hidden; c += 4) {
+      wasm_v128_store(d + c, wasm_f32x4_mul(wasm_v128_load(d + c), inv));
+    }
+  }
+}
+
+/**
+ * A whole node update, given W1's pre-activation.
+ *
+ * gelu -> W2 -> gelu -> W3 -> masked neighbour sum -> residual LayerNorm ->
+ * feed-forward -> residual LayerNorm -> mask. This is the encoder's node half
+ * and the decoder's `applyPre` both; they were always the same sequence.
+ *
+ * `scratch` needs rows*(k*hidden + 2*hidden + ff) floats. `maskAttend` and
+ * `maskV` may be null.
+ */
+EXPORT void message_block_f32(
+    float *h1, const float *maskAttend, const float *hV,
+    const float *w2, const float *b2, const float *w3, const float *b3,
+    const float *g1, const float *c1,
+    const float *wIn, const float *bIn, const float *wOut, const float *bOut,
+    const float *g2, const float *c2, const float *maskV,
+    int rows, int k, int hidden, int ff, float scale,
+    float *scratch, float *out) {
+  float *msg = scratch;
+  float *dh = msg + (long)rows * k * hidden;
+  float *tmp = dh + (long)rows * hidden;
+  float *ffbuf = tmp + (long)rows * hidden;
+
+  gelu_f32(h1, rows * k * hidden);
+  linear_f32(h1, w2, b2, rows * k, hidden, hidden, msg);
+  gelu_f32(msg, rows * k * hidden);
+  // h1 is spent by now, so W3 writes over it.
+  linear_f32(msg, w3, b3, rows * k, hidden, hidden, h1);
+
+  reduce_scaled(h1, maskAttend, rows, k, hidden, scale, dh);
+  add_into(dh, hV, rows * hidden);
+  layernorm_f32(dh, g1, c1, rows, hidden, out, 1e-5f);
+
+  linear_f32(out, wIn, bIn, rows, hidden, ff, ffbuf);
+  gelu_f32(ffbuf, rows * ff);
+  linear_f32(ffbuf, wOut, bOut, rows, ff, hidden, tmp);
+  add_into(tmp, out, rows * hidden);
+  layernorm_f32(tmp, g2, c2, rows, hidden, out, 1e-5f);
+
+  if (maskV) {
+    for (int i = 0; i < rows; i++) {
+      const v128_t m = wasm_f32x4_splat(maskV[i]);
+      float *o = out + (long)i * hidden;
+      for (int c = 0; c < hidden; c += 4) {
+        wasm_v128_store(o + c, wasm_f32x4_mul(wasm_v128_load(o + c), m));
+      }
+    }
+  }
+}
+
+/**
+ * The encoder's edge half: gelu -> W2 -> gelu -> W3, then a residual LayerNorm
+ * against the incoming edge state.
+ *
+ * `scratch` needs n*hidden floats. `hE` and `out` may be the same buffer.
+ */
+EXPORT void edge_block_f32(float *h1, const float *hE,
+                           const float *w2, const float *b2,
+                           const float *w3, const float *b3,
+                           const float *g, const float *c,
+                           int n, int hidden, float *scratch, float *out) {
+  gelu_f32(h1, n * hidden);
+  linear_f32(h1, w2, b2, n, hidden, hidden, scratch);
+  gelu_f32(scratch, n * hidden);
+  linear_f32(scratch, w3, b3, n, hidden, hidden, h1);
+  add_into(h1, hE, n * hidden);
+  layernorm_f32(h1, g, c, n, hidden, out, 1e-5f);
+}

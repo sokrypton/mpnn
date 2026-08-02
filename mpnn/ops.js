@@ -60,6 +60,17 @@ export function tryTail2(h1, w2, b2, w3, b3, n, hidden, out) {
   return accel !== null && accel.tail2(h1, w2, b2, w3, b3, n, hidden, out);
 }
 
+/** A whole node update in one accelerator call; false if unavailable. */
+export function tryMessageBlock(h1, maskAttend, hV, w, rows, k, hidden, ff, scale, out) {
+  return accel !== null
+    && accel.messageBlock(h1, maskAttend, hV, w, rows, k, hidden, ff, scale, out);
+}
+
+/** The encoder's edge half in one call; false if unavailable. */
+export function tryEdgeBlock(h1, hE, w, n, hidden, out) {
+  return accel !== null && accel.edgeBlock(h1, hE, w, n, hidden, out);
+}
+
 /** W_in -> gelu -> W_out, likewise. */
 export function tryFeedForward(x, wIn, bIn, wOut, bOut, n, hidden, ff, out) {
   return accel !== null && accel.ff(x, wIn, bIn, wOut, bOut, n, hidden, ff, out);

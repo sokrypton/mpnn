@@ -30,7 +30,9 @@ import {
   linear,
   maskRows,
   reduceMessages,
+  tryEdgeBlock,
   tryFeedForward,
+  tryMessageBlock,
   tryTail2,
 } from "./ops.js";
 import { MESSAGE_SCALE } from "./constants.js";
@@ -102,6 +104,22 @@ export function makeEncoderLayer(w, arena, prefix, hidden, K) {
   const norm1 = w.norm(`${prefix}.norm1`);
   const norm2 = w.norm(`${prefix}.norm2`);
   const norm3 = w.norm(`${prefix}.norm3`);
+  const ffWidth = w.shape(`${prefix}.dense.W_in.weight`)[0];
+
+  const nodeBlock = {
+    w2: w.get(`${prefix}.W2.weight`), b2: w.get(`${prefix}.W2.bias`),
+    w3: w.get(`${prefix}.W3.weight`), b3: w.get(`${prefix}.W3.bias`),
+    g1: norm1.gamma, c1: norm1.beta,
+    wIn: w.get(`${prefix}.dense.W_in.weight`), bIn: w.get(`${prefix}.dense.W_in.bias`),
+    wOut: w.get(`${prefix}.dense.W_out.weight`), bOut: w.get(`${prefix}.dense.W_out.bias`),
+    g2: norm2.gamma, c2: norm2.beta,
+    maskV: null,
+  };
+  const edgeBlock = {
+    w2: w.get(`${prefix}.W12.weight`), b2: w.get(`${prefix}.W12.bias`),
+    w3: w.get(`${prefix}.W13.weight`), b3: w.get(`${prefix}.W13.bias`),
+    g: norm3.gamma, c: norm3.beta,
+  };
 
   return (hV, hE, EIdx, mask, maskAttend, L) => {
     // --- node update (double buffered so neighbours read pre-update states) ---
@@ -109,20 +127,26 @@ export function makeEncoderLayer(w, arena, prefix, hidden, K) {
     let proj = node.project(hV, L);
     for (let start = 0; start < L; start += CHUNK) {
       const rows = Math.min(CHUNK, L - start);
-      const msg = arena.f32("enc.msg", rows * K * hidden);
-      const dh = arena.f32("enc.dh", rows * hidden);
-      const tmp = arena.f32("enc.tmp", rows * hidden);
       const out = hVNext.subarray(start * hidden, (start + rows) * hidden);
+      const h1 = node.buildH1(proj, hE, EIdx, start, rows, K);
+      const hVChunk = hV.subarray(start * hidden, (start + rows) * hidden);
+      const maskChunk = mask.subarray(start, start + rows);
 
-      node.messages(proj, hE, EIdx, start, rows, K, msg);
-      reduceMessages(msg, maskAttend.subarray(start * K), rows, K, hidden, MESSAGE_SCALE, dh);
-      addInto(dh, hV.subarray(start * hidden), rows * hidden);
-      layerNorm(dh, norm1.gamma, norm1.beta, rows, hidden, out);
-
-      dense(out, tmp, rows);
-      addInto(tmp, out, rows * hidden);
-      layerNorm(tmp, norm2.gamma, norm2.beta, rows, hidden, out);
-      maskRows(out, mask.subarray(start), rows, hidden);
+      nodeBlock.maskV = maskChunk;
+      if (!tryMessageBlock(h1, maskAttend.subarray(start * K), hVChunk, nodeBlock,
+        rows, K, hidden, ffWidth, MESSAGE_SCALE, out)) {
+        const msg = arena.f32("enc.msg", rows * K * hidden);
+        const dh = arena.f32("enc.dh", rows * hidden);
+        const tmp = arena.f32("enc.tmp", rows * hidden);
+        node.tail(h1, rows * K, msg);
+        reduceMessages(msg, maskAttend.subarray(start * K), rows, K, hidden, MESSAGE_SCALE, dh);
+        addInto(dh, hVChunk, rows * hidden);
+        layerNorm(dh, norm1.gamma, norm1.beta, rows, hidden, out);
+        dense(out, tmp, rows);
+        addInto(tmp, out, rows * hidden);
+        layerNorm(tmp, norm2.gamma, norm2.beta, rows, hidden, out);
+        maskRows(out, maskChunk, rows, hidden);
+      }
     }
     hV.set(hVNext.subarray(0, L * hidden));
 
@@ -130,12 +154,15 @@ export function makeEncoderLayer(w, arena, prefix, hidden, K) {
     proj = edge.project(hV, L);
     for (let start = 0; start < L; start += CHUNK) {
       const rows = Math.min(CHUNK, L - start);
-      const msg = arena.f32("enc.msg", rows * K * hidden);
       const slice = hE.subarray(start * K * hidden, (start + rows) * K * hidden);
+      const h1 = edge.buildH1(proj, hE, EIdx, start, rows, K);
 
-      edge.messages(proj, hE, EIdx, start, rows, K, msg);
-      addInto(msg, slice, rows * K * hidden);
-      layerNorm(msg, norm3.gamma, norm3.beta, rows * K, hidden, slice);
+      if (!tryEdgeBlock(h1, slice, edgeBlock, rows * K, hidden, slice)) {
+        const msg = arena.f32("enc.msg", rows * K * hidden);
+        edge.tail(h1, rows * K, msg);
+        addInto(msg, slice, rows * K * hidden);
+        layerNorm(msg, norm3.gamma, norm3.beta, rows * K, hidden, slice);
+      }
     }
   };
 }
@@ -160,7 +187,8 @@ function makeFusedMessage(w, arena, prefix, names, hidden, tag) {
       return { self, neighbor };
     },
 
-    messages(proj, hE, EIdx, start, rows, K, out) {
+    /** W1's pre-activation for rows [start, start+rows). */
+    buildH1(proj, hE, EIdx, start, rows, K) {
       const h1 = arena.f32(`${tag}.h1`, rows * K * hidden);
       linear(
         hE.subarray(start * K * hidden, (start + rows) * K * hidden),
@@ -174,8 +202,14 @@ function makeFusedMessage(w, arena, prefix, names, hidden, tag) {
           for (let d = 0; d < hidden; d++) h1[to + d] += proj.self[so + d] + proj.neighbor[no + d];
         }
       }
-      return tail(h1, rows * K, out);
+      return h1;
     },
+
+    messages(proj, hE, EIdx, start, rows, K, out) {
+      return tail(this.buildH1(proj, hE, EIdx, start, rows, K), rows * K, out);
+    },
+
+    tail,
   };
 }
 
@@ -202,8 +236,23 @@ export function makeDecoderLayer(w, arena, prefix, hidden, edgeDim, tag = "dec")
     ? splitColumns(w1.weight, hidden, hidden, nBlocks)
     : null;
 
+  const blockWeights = {
+    w2: w.get(`${prefix}.W2.weight`), b2: w.get(`${prefix}.W2.bias`),
+    w3: w.get(`${prefix}.W3.weight`), b3: w.get(`${prefix}.W3.bias`),
+    g1: norm1.gamma, c1: norm1.beta,
+    wIn: w.get(`${prefix}.dense.W_in.weight`), bIn: w.get(`${prefix}.dense.W_in.bias`),
+    wOut: w.get(`${prefix}.dense.W_out.weight`), bOut: w.get(`${prefix}.dense.W_out.bias`),
+    g2: norm2.gamma, c2: norm2.beta,
+    maskV: null,
+  };
+  const ffWidth = w.shape(`${prefix}.dense.W_in.weight`)[0];
+
   /** Finish a layer given W1's pre-activation `h1` ([rows·k, hidden]). */
   function applyPre(hV, h1, mask, maskAttend, rows, k, out) {
+    blockWeights.maskV = mask;
+    if (tryMessageBlock(h1, maskAttend, hV, blockWeights,
+      rows, k, hidden, ffWidth, MESSAGE_SCALE, out)) return out;
+
     const msg = arena.f32(`${tag}.msg`, rows * k * hidden);
     const dh = arena.f32(`${tag}.dh`, rows * hidden);
     const tmp = arena.f32(`${tag}.tmp`, rows * hidden);

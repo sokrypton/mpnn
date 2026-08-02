@@ -94,18 +94,35 @@ export function computeBackbone(X, L) {
 }
 
 /**
- * k-nearest-neighbour graph over C-alpha, with masked residues pushed to the
- * back of every row exactly as `ProteinFeatures._dist` does.
+ * k-nearest-neighbour graph over C-alpha.
+ *
+ * Reproduces `ProteinFeatures._dist` exactly, including its handling of masked
+ * residues: a pair with either end masked has distance 0, and every such entry
+ * is then pushed out to the row's maximum, so masked residues sort to the back.
  *
  * @returns {{EIdx: Int32Array, DNeighbors: Float32Array, K: number}}
  */
 export function neighborGraph(CA, mask, L, topK) {
   const K = Math.min(topK, L);
+  let unmasked = 0;
+  for (let i = 0; i < L; i++) if (mask[i] !== 0) unmasked++;
+
+  // The grid can only certify a row when the K nearest are guaranteed to be
+  // unmasked residues, which needs strictly more than K of them. Otherwise the
+  // row's answer depends on ties at the row maximum and the exact sweep decides.
+  const grid = unmasked > K ? buildGrid(CA, mask, L, K) : null;
+
   const EIdx = new Int32Array(L * K);
   const DNeighbors = new Float32Array(L * K);
   const row = new Float32Array(L);
 
   for (let i = 0; i < L; i++) {
+    const out = EIdx.subarray(i * K, (i + 1) * K);
+    if (grid !== null && mask[i] !== 0) {
+      gridNearest(grid, CA, i, K, out);
+      for (let k = 0; k < K; k++) DNeighbors[i * K + k] = dist(CA, i * 3, CA, out[k] * 3);
+      continue;
+    }
     let rowMax = 0;
     for (let j = 0; j < L; j++) {
       const m = mask[i] * mask[j];
@@ -116,10 +133,124 @@ export function neighborGraph(CA, mask, L, topK) {
     for (let j = 0; j < L; j++) {
       if (mask[i] * mask[j] === 0) row[j] += rowMax;
     }
-    argTopKSmallest(row, L, K, EIdx.subarray(i * K, (i + 1) * K));
-    for (let k = 0; k < K; k++) DNeighbors[i * K + k] = row[EIdx[i * K + k]];
+    argTopKSmallest(row, L, K, out);
+    for (let k = 0; k < K; k++) DNeighbors[i * K + k] = row[out[k]];
   }
   return { EIdx, DNeighbors, K };
+}
+
+/**
+ * Uniform bucket grid over the unmasked C-alpha, so the neighbour search stops
+ * being O(L²·K).
+ *
+ * The cell edge is chosen so a 3x3x3 block holds a few times K points, which is
+ * usually enough to answer a query after one expansion.
+ */
+function buildGrid(CA, mask, L, K) {
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+  let n = 0;
+  for (let i = 0; i < L; i++) {
+    if (mask[i] === 0) continue;
+    n++;
+    const x = CA[i * 3], y = CA[i * 3 + 1], z = CA[i * 3 + 2];
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (z < minZ) minZ = z;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+    if (z > maxZ) maxZ = z;
+  }
+  const volume = Math.max((maxX - minX) * (maxY - minY) * (maxZ - minZ), 1);
+  const cell = Math.max(Math.cbrt((volume * K) / (n * 4)), 2);
+
+  const nx = Math.max(1, Math.ceil((maxX - minX) / cell) + 1);
+  const ny = Math.max(1, Math.ceil((maxY - minY) / cell) + 1);
+  const nz = Math.max(1, Math.ceil((maxZ - minZ) / cell) + 1);
+  const cells = nx * ny * nz;
+
+  const cellOf = new Int32Array(L).fill(-1);
+  const counts = new Int32Array(cells + 1);
+  for (let i = 0; i < L; i++) {
+    if (mask[i] === 0) continue;
+    const cx = Math.min(nx - 1, Math.floor((CA[i * 3] - minX) / cell));
+    const cy = Math.min(ny - 1, Math.floor((CA[i * 3 + 1] - minY) / cell));
+    const cz = Math.min(nz - 1, Math.floor((CA[i * 3 + 2] - minZ) / cell));
+    const c = (cz * ny + cy) * nx + cx;
+    cellOf[i] = c;
+    counts[c + 1]++;
+  }
+  for (let c = 0; c < cells; c++) counts[c + 1] += counts[c];
+  const start = Int32Array.from(counts);
+  const items = new Int32Array(n);
+  const cursor = Int32Array.from(counts);
+  // Fill in ascending residue index, so a cell's members stay index-ordered and
+  // ties resolve the same way the exact sweep resolves them.
+  for (let i = 0; i < L; i++) {
+    if (cellOf[i] >= 0) items[cursor[cellOf[i]]++] = i;
+  }
+  return { minX, minY, minZ, cell, nx, ny, nz, start, items };
+}
+
+/**
+ * The K nearest unmasked residues to `i`, ascending, ties broken toward the
+ * lower index -- the same order `argTopKSmallest` produces.
+ *
+ * Rings of cells are scanned outward. Everything left unscanned after ring r
+ * lies at least `r · cell` away, so once the current K-th distance is below
+ * that the answer cannot change.
+ */
+function gridNearest(grid, CA, i, K, out) {
+  const { minX, minY, minZ, cell, nx, ny, nz, start, items } = grid;
+  const cx = Math.min(nx - 1, Math.floor((CA[i * 3] - minX) / cell));
+  const cy = Math.min(ny - 1, Math.floor((CA[i * 3 + 1] - minY) / cell));
+  const cz = Math.min(nz - 1, Math.floor((CA[i * 3 + 2] - minZ) / cell));
+
+  // Insertion-sorted top-K by (distance, index).
+  const bestD = new Float64Array(K).fill(Infinity);
+  const bestI = new Int32Array(K).fill(0x7fffffff);
+  let filled = 0;
+
+  const consider = (j) => {
+    // Rounded to float32 before comparing. The exact sweep buffers its row in a
+    // Float32Array, so that is the precision its ordering is decided at; two
+    // distances that differ as doubles can tie once rounded, and then the tie
+    // must break by index the same way. Without this the graphs diverge on a
+    // couple of edges in a few thousand.
+    const d = Math.fround(dist(CA, i * 3, CA, j * 3));
+    if (filled === K && (d > bestD[K - 1] || (d === bestD[K - 1] && j > bestI[K - 1]))) return;
+    let p = Math.min(filled, K - 1);
+    while (p > 0 && (d < bestD[p - 1] || (d === bestD[p - 1] && j < bestI[p - 1]))) {
+      bestD[p] = bestD[p - 1];
+      bestI[p] = bestI[p - 1];
+      p--;
+    }
+    bestD[p] = d;
+    bestI[p] = j;
+    if (filled < K) filled++;
+  };
+
+  const maxRing = Math.max(nx, ny, nz);
+  for (let r = 0; ; r++) {
+    const x0 = Math.max(0, cx - r), x1 = Math.min(nx - 1, cx + r);
+    const y0 = Math.max(0, cy - r), y1 = Math.min(ny - 1, cy + r);
+    const z0 = Math.max(0, cz - r), z1 = Math.min(nz - 1, cz + r);
+    for (let z = z0; z <= z1; z++) {
+      for (let y = y0; y <= y1; y++) {
+        // Only the shell added by this ring, except on the first pass.
+        const onShellZY = r === 0 || z === cz - r || z === cz + r || y === cy - r || y === cy + r;
+        for (let x = x0; x <= x1; x++) {
+          if (!onShellZY && x !== cx - r && x !== cx + r) continue;
+          const c = (z * ny + y) * nx + x;
+          for (let t = start[c]; t < start[c + 1]; t++) consider(items[t]);
+        }
+      }
+    }
+    // Strict, so a point exactly on the boundary cannot be missed.
+    if (filled === K && bestD[K - 1] < r * cell) break;
+    if (r >= maxRing) break;
+  }
+  out.set(bestI.subarray(0, K));
 }
 
 // The 24 recomputed distance blocks, in the reference's order. `null` marks the

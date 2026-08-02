@@ -123,6 +123,83 @@ export class Accelerator {
   }
 
   /**
+   * A whole node update: gelu -> W2 -> gelu -> W3 -> masked neighbour sum ->
+   * residual LayerNorm -> feed-forward -> residual LayerNorm -> mask.
+   *
+   * @returns {boolean} true if it ran here
+   */
+  messageBlock(h1, maskAttend, hV, w, rows, k, hidden, ff, scale, out) {
+    if (rows * k * hidden * hidden < MIN_MACS) return false;
+    const ptr = {};
+    for (const key of ["w2", "b2", "w3", "b3", "g1", "c1",
+      "wIn", "bIn", "wOut", "bOut", "g2", "c2"]) {
+      ptr[key] = w[key] === null || w[key] === undefined ? 0 : this._upload(w[key]);
+    }
+
+    let s = this._stage(this.scratch, rows * k * hidden * 4);
+    const h1Ptr = s.at;
+    s = this._stage(s.next, maskAttend ? rows * k * 4 : 0);
+    const maPtr = maskAttend ? s.at : 0;
+    s = this._stage(s.next, rows * hidden * 4);
+    const hVPtr = s.at;
+    s = this._stage(s.next, hV === out ? 0 : rows * 4);
+    const mvPtr = 0;
+    s = this._stage(s.next, rows * 4);
+    const maskVPtr = s.at;
+    s = this._stage(s.next, rows * (k * hidden + 2 * hidden + ff) * 4);
+    const scratchPtr = s.at;
+    s = this._stage(s.next, rows * hidden * 4);
+    const outPtr = s.at;
+    void mvPtr;
+
+    const mem = this.f32;
+    mem.set(h1.subarray(0, rows * k * hidden), h1Ptr >> 2);
+    if (maskAttend) mem.set(maskAttend.subarray(0, rows * k), maPtr >> 2);
+    mem.set(hV.subarray(0, rows * hidden), hVPtr >> 2);
+    if (w.maskV) mem.set(w.maskV.subarray(0, rows), maskVPtr >> 2);
+
+    this.exports.message_block_f32(
+      h1Ptr, maPtr, hVPtr,
+      ptr.w2, ptr.b2, ptr.w3, ptr.b3, ptr.g1, ptr.c1,
+      ptr.wIn, ptr.bIn, ptr.wOut, ptr.bOut, ptr.g2, ptr.c2,
+      w.maskV ? maskVPtr : 0,
+      rows, k, hidden, ff, scale, scratchPtr, outPtr,
+    );
+    out.set(this.f32.subarray(outPtr >> 2, (outPtr >> 2) + rows * hidden), 0);
+    this.calls++;
+    return true;
+  }
+
+  /** gelu -> W2 -> gelu -> W3, then a residual LayerNorm against `hE`. */
+  edgeBlock(h1, hE, w, n, hidden, out) {
+    if (n * hidden * hidden < MIN_MACS) return false;
+    const w2 = this._upload(w.w2);
+    const b2 = w.b2 === null ? 0 : this._upload(w.b2);
+    const w3 = this._upload(w.w3);
+    const b3 = w.b3 === null ? 0 : this._upload(w.b3);
+    const g = this._upload(w.g);
+    const c = this._upload(w.c);
+
+    let s = this._stage(this.scratch, n * hidden * 4);
+    const h1Ptr = s.at;
+    s = this._stage(s.next, n * hidden * 4);
+    const hEPtr = s.at;
+    s = this._stage(s.next, n * hidden * 4);
+    const scratchPtr = s.at;
+    s = this._stage(s.next, n * hidden * 4);
+    const outPtr = s.at;
+
+    const mem = this.f32;
+    mem.set(h1.subarray(0, n * hidden), h1Ptr >> 2);
+    mem.set(hE.subarray(0, n * hidden), hEPtr >> 2);
+    this.exports.edge_block_f32(h1Ptr, hEPtr, w2, b2, w3, b3, g, c,
+      n, hidden, scratchPtr, outPtr);
+    out.set(this.f32.subarray(outPtr >> 2, (outPtr >> 2) + n * hidden), 0);
+    this.calls++;
+    return true;
+  }
+
+  /**
    * @returns {boolean} true if the call ran here, false to fall back to JS
    */
   linear(x, w, b, n, cin, cout, out) {
