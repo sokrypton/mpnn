@@ -262,6 +262,17 @@ this: still ~1e-5 on the logits, on both kernels.
 Rebuild with `./wasm/build.sh` (needs clang with the wasm32 target). The
 committed `kernels.wasm` is 10 KB, so most people never will.
 
+**Why C and not Rust?** Only that clang and wasm-ld ship with LLVM and were
+already there, so the build is one command with no package manager and no extra
+target to install. It is not a performance argument:
+[`wasm/bench/`](wasm/bench/) builds the same matmul five ways and Rust with
+`core::arch::wasm32` intrinsics measures **identical** to the C — same LLVM,
+same emitted code. What actually matters is writing the intrinsics at all.
+Idiomatic safe Rust manages 3-4 GFLOP/s against the hand-written 20+, and so
+does the equivalent plain C loop, because LLVM will not reassociate a float
+reduction without being asked. Switching languages is free; switching away from
+explicit SIMD costs 5-6x.
+
 ### What is left
 
 **Would porting the whole engine to wasm help?** Not much, and it was measured
