@@ -16,7 +16,9 @@ jobs:
           node-version: "22"
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # ligandmpnn on PyPI declares >=3.11,<3.12, so 3.12 resolves to no
+          # candidate at all rather than to an older release.
+          python-version: "3.11"
 
       - name: Install reference implementation
         run: pip install --quiet ligandmpnn numpy "torch~=2.0" --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
