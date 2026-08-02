@@ -28,20 +28,19 @@ function loadModel(name) {
 }
 
 
-const CASES = structures.length ? structures : [
-  ["assets/1ubq.pdb", "proteinmpnn_v_48_020"],
-  ["assets/1stp.pdb", "ligandmpnn_v_32_010_25"],
-];
+// Args are `path=checkpoint` pairs; with none, the two committed fixtures.
+const CASES = structures.length
+  ? structures.map((spec) => spec.split("="))
+  : [["assets/1ubq.pdb", "proteinmpnn_v_48_020"],
+     ["assets/1stp.pdb", "ligandmpnn_v_32_010_25"]];
+
+const mb = () => (process.memoryUsage().rss / 1e6).toFixed(0);
 
 for (const [path, modelName] of CASES) {
   const s = structureFromText(readFileSync(path, "utf8"));
   const model = loadModel(modelName);
   console.log(`\n${path}  ${modelName}  L=${s.L}  K=${model.K}`
     + (model.isLigand ? `  M=${model.M}  ligandAtoms=${s.ligandType.length}` : ""));
-
-  // warm
-  const warm = model.encode(s);
-  model.sample(warm, { batch: 1 });
 
   let t0 = performance.now();
   const enc = model.encode(s);
@@ -59,9 +58,10 @@ for (const [path, modelName] of CASES) {
   model.profile(enc);
   const profileMs = performance.now() - t0;
 
-  console.log(`    encode          ${encodeMs.toFixed(0)} ms`);
-  console.log(`    sample batch 1  ${sample1.toFixed(0)} ms`);
-  console.log(`    sample batch 8  ${sample8.toFixed(0)} ms `
-    + `(${(sample8 / 8).toFixed(0)} ms/seq, ${(sample1 * 8 / sample8).toFixed(2)}x from batching)`);
-  console.log(`    profile         ${profileMs.toFixed(0)} ms`);
+  console.log(`    encode          ${(encodeMs / 1000).toFixed(2)} s`);
+  console.log(`    sample batch 1  ${(sample1 / 1000).toFixed(2)} s`);
+  console.log(`    sample batch 8  ${(sample8 / 1000).toFixed(2)} s `
+    + `(${(sample8 / 8 / 1000).toFixed(2)} s/seq, ${(sample1 * 8 / sample8).toFixed(2)}x batched)`);
+  console.log(`    profile         ${(profileMs / 1000).toFixed(2)} s`);
+  console.log(`    rss             ${mb()} MB`);
 }

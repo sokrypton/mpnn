@@ -29,6 +29,16 @@ import { gatherNodes, layerNorm, linear, logSoftmax, softmax } from "./ops.js";
 const LIGAND_CHUNK = 32;
 const DECODE_CHUNK = 96;
 
+/**
+ * Budget for the cached per-edge W1 projection, [3, L·K, 128] floats.
+ *
+ * Past this the decoder falls back to building the concatenation, which is
+ * correct but roughly 2.5x slower -- and the fallback used to trigger silently
+ * at L ≈ 1400, which is exactly where someone designing a large complex would
+ * notice and have no idea why. 320 MB covers L ≈ 4500 at K = 48.
+ */
+export const DEFAULT_PREP_BUDGET = 320 << 20;
+
 /** Conditioning modes accepted by `score()` and `profile()`. */
 export const AR = {
   /** Backbone only: no position sees any amino acid. One pass, exact. */
@@ -60,6 +70,8 @@ export class Model {
     this.modelType = weights.modelType;
     this.K = weights.kNeighbors;
     this.M = weights.atomContextNum;
+    /** See DEFAULT_PREP_BUDGET. Lower it on memory-constrained devices. */
+    this.prepBudget = DEFAULT_PREP_BUDGET;
 
     // `features.*` in the checkpoint; recorded on the weights object so the
     // featuriser can address it without knowing the model variant.
@@ -426,8 +438,9 @@ export class Model {
     const { L, K, hE } = enc;
     const H = this.hidden;
     const bytes = this.decoderLayers.length * L * K * H * 4;
-    if (bytes > 96 << 20) {
+    if (bytes > this.prepBudget) {
       enc.prep = null;
+      enc.prepSkippedBytes = bytes;
       return null;
     }
     const pe = [];

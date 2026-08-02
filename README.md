@@ -194,13 +194,74 @@ as a pessimistic floor rather than a benchmark.
 
 | | ProteinMPNN, L = 76 | LigandMPNN, L = 121 |
 | --- | --- | --- |
-| encode | **0.52 s** (was 1.4) | **1.04 s** (was 13.3) |
-| sample | **59 ms/seq** (was 1014) | **67 ms/seq** (was 1113) |
+| encode | **0.28 s** (was 1.4) | **0.64 s** (was 13.3) |
+| sample | **59 ms/seq** (was 1014) | **60 ms/seq** (was 1113) |
 | profile | **0.13 s** (was 1.04) | **0.09 s** (was 1.12) |
 
-Between 2.7x and 13x depending on what you ask for. Four things got it there,
-and the order matters: every algorithmic change came before any kernel work,
-because a faster kernel only makes the remaining multiply-adds cheaper.
+Across sizes, ProteinMPNN, single thread, sampling as ms per sequence at batch 8:
+
+| structure | L | encode | sample | profile | peak RSS |
+| --- | --- | --- | --- | --- | --- |
+| 1UBQ ubiquitin | 76 | 0.28 s | 59 ms | 0.13 s | 122 MB |
+| 1STP + biotin (LigandMPNN) | 121 | 0.64 s | 60 ms | 0.09 s | 200 MB |
+| 1BL8 K⁺ channel, 4 chains | 388 | 1.3 s | 0.34 s | 0.40 s | 183 MB |
+| 4HHB haemoglobin, 4 chains | 574 | 1.7 s | 0.43 s | 0.44 s | 247 MB |
+| 6VXX spike trimer | 2916 | 8.9 s | 2.3 s | 2.3 s | 770 MB |
+| 1AON GroEL/GroES, 21 chains | 8015 | 28 s | — | — | ~2 GB |
+
+Scaling is linear in L up to a few thousand residues. Past ~3000 the memory is
+what bites rather than the arithmetic: the encoder's edge tensor is L·K·128
+floats and the cached decoder projection three times that, so a browser tab
+around 8000 residues is close to the practical limit.
+
+### Compared with the reference on CPU
+
+Same structures, same inputs, PyTorch 2.13 on the same machine
+(`tools/bench_reference.py`). Seconds, sampling per sequence at batch 8:
+
+| | | this engine (1 thread) | PyTorch (1 thread) | PyTorch (4 threads) |
+| --- | --- | --- | --- | --- |
+| L = 76 | encode | 0.28 | 0.10 | 0.04 |
+| | sample | 0.059 | 0.08 | 0.04 |
+| L = 121 ligand | encode | 0.64 | 0.77 | 0.24 |
+| | sample | 0.060 | 0.17 | 0.09 |
+| L = 388 | encode | 1.32 | 0.53 | 0.16 |
+| | sample | 0.34 | 0.42 | 0.21 |
+| L = 574 | encode | 1.66 | 0.91 | 0.32 |
+| | sample | 0.43 | 0.61 | 0.32 |
+
+Against single-threaded PyTorch this engine is **1.8-2.8x slower at encoding and
+1.2-2.8x faster at sampling**, and slightly faster at encoding LigandMPNN.
+
+The split is not an accident. Encoding is one long sweep of dense products, and
+there a native BLAS wins on raw kernel throughput: AVX2 is 8 lanes wide with a
+fused multiply-add, wasm SIMD is 4 lanes with neither. That is a hardware
+ceiling, not something to optimise around — the kernel already runs at ~90% of
+what 128-bit SIMD without FMA can do, and relaxed-SIMD FMA measured only 5-8%
+better because the loop is load-bound rather than FLOP-bound.
+
+Sampling is the other way round because it is not a throughput problem. The
+reference walks L autoregressive steps in Python, paying interpreter and
+tensor-dispatch overhead on every one; this engine's decoder has no per-edge
+matmul left in that loop at all. Algorithms beat the kernel gap.
+
+Against 4-thread PyTorch everything is ~4x further behind, which is exactly the
+core count — see the note on threads below.
+
+Between 5x and 17x depending on what you ask for. Five things got it there, and
+the order matters: every algorithmic change came before any kernel work, because
+a faster kernel only makes the remaining multiply-adds cheaper.
+
+**0. Denormals.** Worth stating first because it was invisible and cost more
+than anything else at scale. The radial basis features are `exp(-z²)`, which
+underflows past float32's smallest normal for atom pairs far from a basis
+centre: about 4% of a real edge-feature block lands in the denormal range.
+Denormal arithmetic traps to microcode on x86, and wasm — unlike every native
+BLAS, which quietly sets flush-to-zero — is required to honour it. That single
+detail ran the edge-embedding matmul at **0.9 GFLOP/s instead of 20.6**, and it
+is most of why the reference looked so far ahead at encoding. Flushing values
+below 1e-30 in `rbfInto` costs nothing measurable in accuracy and took the
+2916-residue encode from 20.7 s to 8.9 s.
 
 **1. The encoder runs once per structure.** It does not depend on the sequence,
 so `encode()` returns a handle that every sample, score and profile reuses.

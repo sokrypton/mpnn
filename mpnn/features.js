@@ -23,11 +23,29 @@ for (let i = 0; i < RBF.count; i++) {
 const RBF_SIGMA = (RBF.max - RBF.min) / RBF.count;
 const RBF_INV_SIGMA = 1 / RBF_SIGMA;
 
+/**
+ * Below this, a radial basis value is flushed to zero.
+ *
+ * `exp(-z²)` underflows past float32's smallest normal (1.18e-38) for atom
+ * pairs far from a basis centre, and about 4% of the entries in a real edge
+ * feature block land in the denormal range. Denormal arithmetic is trapped to
+ * microcode on x86, and wasm -- unlike every native BLAS, which sets
+ * flush-to-zero -- is required to honour it: measured, that one detail cost
+ * **21x** on the edge-embedding matmul, 0.9 GFLOP/s against 20.6.
+ *
+ * The threshold sits well above the denormal boundary so that products with the
+ * weights cannot fall into it either. Discarding a feature of size 1e-30 next
+ * to features of order 1 is not an approximation anyone can measure, and it is
+ * what the reference implementation effectively does already.
+ */
+const RBF_FLUSH = 1e-30;
+
 /** Write the 16-channel radial basis expansion of `d` at `out[off..off+16]`. */
 function rbfInto(out, off, d) {
   for (let c = 0; c < RBF.count; c++) {
     const z = (d - RBF_MU[c]) * RBF_INV_SIGMA;
-    out[off + c] = Math.exp(-z * z);
+    const v = Math.exp(-z * z);
+    out[off + c] = v < RBF_FLUSH ? 0 : v;
   }
 }
 
