@@ -1,0 +1,356 @@
+// Geometric featurisation: backbone frames, the k-nearest-neighbour graph, and
+// the edge/node embeddings that feed the encoder.
+//
+// This mirrors ProteinFeatures / ProteinFeaturesLigand in the reference
+// implementation, including its small inconsistencies (the Ca-Ca block reuses
+// the masked, adjusted distance from the neighbour search while the other 24
+// blocks recompute a raw distance). Those quirks are load-bearing for parity.
+
+import {
+  ATOM_GROUP,
+  ATOM_PERIOD,
+  ATOM_TYPE_ONEHOT,
+  CB_COEFF,
+  MAX_RELATIVE_FEATURE,
+  RBF,
+} from "./constants.js";
+import { argTopKSmallest, layerNorm, linear } from "./ops.js";
+
+const RBF_MU = new Float32Array(RBF.count);
+for (let i = 0; i < RBF.count; i++) {
+  RBF_MU[i] = RBF.min + (i * (RBF.max - RBF.min)) / (RBF.count - 1);
+}
+const RBF_SIGMA = (RBF.max - RBF.min) / RBF.count;
+const RBF_INV_SIGMA = 1 / RBF_SIGMA;
+
+/** Write the 16-channel radial basis expansion of `d` at `out[off..off+16]`. */
+function rbfInto(out, off, d) {
+  for (let c = 0; c < RBF.count; c++) {
+    const z = (d - RBF_MU[c]) * RBF_INV_SIGMA;
+    out[off + c] = Math.exp(-z * z);
+  }
+}
+
+function dist(a, ai, b, bi) {
+  const dx = a[ai] - b[bi];
+  const dy = a[ai + 1] - b[bi + 1];
+  const dz = a[ai + 2] - b[bi + 2];
+  return Math.sqrt(dx * dx + dy * dy + dz * dz + 1e-6);
+}
+
+/**
+ * Split [L, 4, 3] backbone coordinates into per-atom arrays and derive the
+ * virtual C-beta.
+ *
+ * @param {Float32Array} X [L, 4, 3] ordered N, CA, C, O
+ */
+export function computeBackbone(X, L) {
+  const N = new Float32Array(L * 3);
+  const CA = new Float32Array(L * 3);
+  const C = new Float32Array(L * 3);
+  const O = new Float32Array(L * 3);
+  const CB = new Float32Array(L * 3);
+  for (let i = 0; i < L; i++) {
+    const s = i * 12;
+    const d = i * 3;
+    for (let j = 0; j < 3; j++) {
+      N[d + j] = X[s + j];
+      CA[d + j] = X[s + 3 + j];
+      C[d + j] = X[s + 6 + j];
+      O[d + j] = X[s + 9 + j];
+    }
+    const bx = CA[d] - N[d];
+    const by = CA[d + 1] - N[d + 1];
+    const bz = CA[d + 2] - N[d + 2];
+    const cx = C[d] - CA[d];
+    const cy = C[d + 1] - CA[d + 1];
+    const cz = C[d + 2] - CA[d + 2];
+    const ax = by * cz - bz * cy;
+    const ay = bz * cx - bx * cz;
+    const az = bx * cy - by * cx;
+    CB[d] = CB_COEFF.a * ax + CB_COEFF.b * bx + CB_COEFF.c * cx + CA[d];
+    CB[d + 1] = CB_COEFF.a * ay + CB_COEFF.b * by + CB_COEFF.c * cy + CA[d + 1];
+    CB[d + 2] = CB_COEFF.a * az + CB_COEFF.b * bz + CB_COEFF.c * cz + CA[d + 2];
+  }
+  return { N, CA, C, O, CB };
+}
+
+/**
+ * k-nearest-neighbour graph over C-alpha, with masked residues pushed to the
+ * back of every row exactly as `ProteinFeatures._dist` does.
+ *
+ * @returns {{EIdx: Int32Array, DNeighbors: Float32Array, K: number}}
+ */
+export function neighborGraph(CA, mask, L, topK) {
+  const K = Math.min(topK, L);
+  const EIdx = new Int32Array(L * K);
+  const DNeighbors = new Float32Array(L * K);
+  const row = new Float32Array(L);
+
+  for (let i = 0; i < L; i++) {
+    let rowMax = 0;
+    for (let j = 0; j < L; j++) {
+      const m = mask[i] * mask[j];
+      const d = m === 0 ? 0 : dist(CA, i * 3, CA, j * 3);
+      row[j] = d;
+      if (d > rowMax) rowMax = d;
+    }
+    for (let j = 0; j < L; j++) {
+      if (mask[i] * mask[j] === 0) row[j] += rowMax;
+    }
+    argTopKSmallest(row, L, K, EIdx.subarray(i * K, (i + 1) * K));
+    for (let k = 0; k < K; k++) DNeighbors[i * K + k] = row[EIdx[i * K + k]];
+  }
+  return { EIdx, DNeighbors, K };
+}
+
+// The 24 recomputed distance blocks, in the reference's order. `null` marks the
+// leading Ca-Ca block, which reuses the neighbour-search distance instead.
+const RBF_PAIRS = [
+  null,
+  ["N", "N"], ["C", "C"], ["O", "O"], ["CB", "CB"],
+  ["CA", "N"], ["CA", "C"], ["CA", "O"], ["CA", "CB"],
+  ["N", "C"], ["N", "O"], ["N", "CB"],
+  ["CB", "C"], ["CB", "O"], ["O", "C"],
+  ["N", "CA"], ["C", "CA"], ["O", "CA"], ["CB", "CA"],
+  ["C", "N"], ["O", "N"], ["CB", "N"],
+  ["C", "CB"], ["O", "CB"], ["C", "O"],
+];
+
+export const EDGE_IN_DIM = 16 + RBF.count * 25; // 416
+
+/**
+ * Edge embeddings E = LayerNorm(W_edge · [positional ‖ 25 × RBF]).
+ *
+ * Built in row chunks so the intermediate [L, K, 416] block never has to exist
+ * all at once -- at L = 1000, K = 48 that would be 160 MB.
+ *
+ * @returns {Float32Array} [L, K, 128]
+ */
+export function edgeFeatures(w, bb, EIdx, DNeighbors, residueIdx, chainLabels, L, K, chunk = 64) {
+  const edgeEmbed = w.linear(`${w.featurePrefix}.edge_embedding`);
+  const normEdges = w.norm(`${w.featurePrefix}.norm_edges`);
+  const posLinear = w.linear(`${w.featurePrefix}.embeddings.linear`);
+  const posIn = 2 * MAX_RELATIVE_FEATURE + 2; // 66
+  const hidden = edgeEmbed.shape[0];
+
+  const E = new Float32Array(L * K * hidden);
+  const scratch = new Float32Array(chunk * K * EDGE_IN_DIM);
+  const projected = new Float32Array(chunk * K * hidden);
+
+  for (let start = 0; start < L; start += chunk) {
+    const end = Math.min(L, start + chunk);
+    const rows = end - start;
+    scratch.fill(0, 0, rows * K * EDGE_IN_DIM);
+
+    for (let i = start; i < end; i++) {
+      for (let k = 0; k < K; k++) {
+        const j = EIdx[i * K + k];
+        const base = ((i - start) * K + k) * EDGE_IN_DIM;
+
+        // Relative position encoding: a one-hot times a Linear is a column read.
+        const sameChain = chainLabels[i] === chainLabels[j] ? 1 : 0;
+        const offset = residueIdx[i] - residueIdx[j];
+        const clipped = Math.min(
+          Math.max(offset + MAX_RELATIVE_FEATURE, 0),
+          2 * MAX_RELATIVE_FEATURE,
+        );
+        const d = sameChain ? clipped : 2 * MAX_RELATIVE_FEATURE + 1;
+        for (let o = 0; o < 16; o++) {
+          scratch[base + o] = posLinear.weight[o * posIn + d] + posLinear.bias[o];
+        }
+
+        // 25 distance blocks.
+        let off = base + 16;
+        rbfInto(scratch, off, DNeighbors[i * K + k]);
+        off += RBF.count;
+        for (let p = 1; p < RBF_PAIRS.length; p++) {
+          const [an, bn] = RBF_PAIRS[p];
+          rbfInto(scratch, off, dist(bb[an], i * 3, bb[bn], j * 3));
+          off += RBF.count;
+        }
+      }
+    }
+
+    linear(scratch, edgeEmbed.weight, edgeEmbed.bias, rows * K, EDGE_IN_DIM, hidden, projected);
+    layerNorm(
+      projected, normEdges.gamma, normEdges.beta, rows * K, hidden,
+      E.subarray(start * K * hidden, end * K * hidden),
+    );
+  }
+  return E;
+}
+
+// ---------------------------------------------------------------------------
+// Ligand context
+// ---------------------------------------------------------------------------
+
+const { type: N_TYPE, group: N_GROUP, period: N_PERIOD, total: N_ATOM_FEAT } = ATOM_TYPE_ONEHOT;
+
+/**
+ * Apply a Linear to the concatenated [type ‖ group ‖ period] one-hot without
+ * materialising the 147-wide vector: three column reads plus the bias.
+ */
+function atomTypeLinear(out, off, lin, cout, t) {
+  const g = N_TYPE + ATOM_GROUP[t];
+  const p = N_TYPE + N_GROUP + ATOM_PERIOD[t];
+  for (let o = 0; o < cout; o++) {
+    const row = o * N_ATOM_FEAT;
+    out[off + o] = lin.weight[row + t] + lin.weight[row + g] + lin.weight[row + p]
+      + (lin.bias === null ? 0 : lin.bias[o]);
+  }
+}
+
+/**
+ * For each residue, pick the `M` ligand atoms nearest its C-beta.
+ *
+ * Mirrors `get_nearest_neighbours`: masked pairs are pushed out to a distance
+ * of 1000 Å², and residues with fewer than M reachable atoms are zero padded.
+ *
+ * @param {Float32Array} ligXyz [A, 3]
+ * @param {Int32Array}   ligType [A] atom-type index
+ * @returns {{Y: Float32Array, Yt: Int32Array, Ym: Float32Array, Dclosest: Float32Array}}
+ */
+export function nearestLigandAtoms(CB, mask, ligXyz, ligType, ligMask, L, M) {
+  const A = ligType.length;
+  const Y = new Float32Array(L * M * 3);
+  const Yt = new Int32Array(L * M);
+  const Ym = new Float32Array(L * M);
+  const Dclosest = new Float32Array(L);
+  if (A === 0) return { Y, Yt, Ym, Dclosest };
+
+  const take = Math.min(M, A);
+  const row = new Float32Array(A);
+  const pick = new Int32Array(take);
+
+  for (let i = 0; i < L; i++) {
+    for (let a = 0; a < A; a++) {
+      const m = mask[i] * ligMask[a];
+      const dx = CB[i * 3] - ligXyz[a * 3];
+      const dy = CB[i * 3 + 1] - ligXyz[a * 3 + 1];
+      const dz = CB[i * 3 + 2] - ligXyz[a * 3 + 2];
+      const l2 = dx * dx + dy * dy + dz * dz;
+      row[a] = l2 * m + (1 - m) * 1000.0;
+    }
+    argTopKSmallest(row, A, take, pick);
+    Dclosest[i] = Math.sqrt(row[pick[0]]);
+    for (let s = 0; s < take; s++) {
+      const a = pick[s];
+      Y[(i * M + s) * 3] = ligXyz[a * 3];
+      Y[(i * M + s) * 3 + 1] = ligXyz[a * 3 + 1];
+      Y[(i * M + s) * 3 + 2] = ligXyz[a * 3 + 2];
+      Yt[i * M + s] = ligType[a];
+      Ym[i * M + s] = ligMask[a];
+    }
+  }
+  return { Y, Yt, Ym, Dclosest };
+}
+
+/**
+ * Per-residue ligand node features.
+ *
+ * V is the projected [5 × RBF ‖ atom-type ‖ frame angles] block; YNodes is the
+ * atom-type embedding used by the ligand-to-ligand message passing.
+ *
+ * @returns {{V: Float32Array, YNodes: Float32Array}} both [L, M, 128]
+ */
+export function ligandNodeFeatures(w, bb, Y, Yt, L, M) {
+  const projectDown = w.linear("features.node_project_down");
+  const normNodes = w.norm("features.norm_nodes");
+  const typeLinear = w.linear("features.type_linear");
+  const yNodesLin = w.linear("features.y_nodes");
+  const normYNodes = w.norm("features.norm_y_nodes");
+  const hidden = projectDown.shape[0];
+  const inDim = 5 * RBF.count + 64 + 4; // 148
+
+  const feats = new Float32Array(L * M * inDim);
+  const yNodesRaw = new Float32Array(L * M * hidden);
+  const atoms = [bb.N, bb.CA, bb.C, bb.O, bb.CB];
+
+  for (let i = 0; i < L; i++) {
+    // Local frame: e1 along N-CA, e2 in the N-CA-C plane, e3 completing it.
+    const d = i * 3;
+    const v1x = bb.N[d] - bb.CA[d];
+    const v1y = bb.N[d + 1] - bb.CA[d + 1];
+    const v1z = bb.N[d + 2] - bb.CA[d + 2];
+    const v2x = bb.C[d] - bb.CA[d];
+    const v2y = bb.C[d + 1] - bb.CA[d + 1];
+    const v2z = bb.C[d + 2] - bb.CA[d + 2];
+    const n1 = Math.max(Math.sqrt(v1x * v1x + v1y * v1y + v1z * v1z), 1e-12);
+    const e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
+    const dot = e1x * v2x + e1y * v2y + e1z * v2z;
+    const u2x = v2x - e1x * dot, u2y = v2y - e1y * dot, u2z = v2z - e1z * dot;
+    const n2 = Math.max(Math.sqrt(u2x * u2x + u2y * u2y + u2z * u2z), 1e-12);
+    const e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
+    const e3x = e1y * e2z - e1z * e2y;
+    const e3y = e1z * e2x - e1x * e2z;
+    const e3z = e1x * e2y - e1y * e2x;
+
+    for (let m = 0; m < M; m++) {
+      const yo = (i * M + m) * 3;
+      const base = (i * M + m) * inDim;
+      for (let a = 0; a < 5; a++) {
+        rbfInto(feats, base + a * RBF.count, dist(atoms[a], d, Y, yo));
+      }
+      atomTypeLinear(feats, base + 5 * RBF.count, typeLinear, 64, Yt[i * M + m]);
+
+      // Direction of the ligand atom in the residue frame, as (cosφ, sinφ, cosθ, sinθ).
+      const rx = Y[yo] - bb.CA[d];
+      const ry = Y[yo + 1] - bb.CA[d + 1];
+      const rz = Y[yo + 2] - bb.CA[d + 2];
+      const lx = rx * e1x + ry * e1y + rz * e1z;
+      const ly = rx * e2x + ry * e2y + rz * e2z;
+      const lz = rx * e3x + ry * e3y + rz * e3z;
+      const rxy = Math.sqrt(lx * lx + ly * ly + 1e-8);
+      const rxyz = Math.sqrt(lx * lx + ly * ly + lz * lz) + 1e-8;
+      const fo = base + 5 * RBF.count + 64;
+      feats[fo] = lx / rxy;
+      feats[fo + 1] = ly / rxy;
+      feats[fo + 2] = rxy / rxyz;
+      feats[fo + 3] = lz / rxyz;
+
+      atomTypeLinear(yNodesRaw, (i * M + m) * hidden, yNodesLin, hidden, Yt[i * M + m]);
+    }
+  }
+
+  const V = new Float32Array(L * M * hidden);
+  linear(feats, projectDown.weight, projectDown.bias, L * M, inDim, hidden, V);
+  layerNorm(V, normNodes.gamma, normNodes.beta, L * M, hidden, V);
+  const YNodes = layerNorm(yNodesRaw, normYNodes.gamma, normYNodes.beta, L * M, hidden);
+  return { V, YNodes };
+}
+
+/**
+ * Ligand-atom pair edges for residues `[start, end)`, already projected and
+ * normalised: LayerNorm(W_y_edges · RBF(‖Y_m - Y_m'‖)).
+ *
+ * Computed per chunk because the full tensor is [L, M, M, 128] -- 160 MB at
+ * L = 500, M = 25.
+ *
+ * @returns {Float32Array} [end - start, M, M, 128]
+ */
+export function ligandEdgeChunk(w, Y, M, start, end, scratch, out) {
+  const yEdges = w.linear("features.y_edges");
+  const normYEdges = w.norm("features.norm_y_edges");
+  const hidden = yEdges.shape[0];
+  const rows = end - start;
+  const pairs = rows * M * M;
+
+  scratch = scratch ?? new Float32Array(pairs * RBF.count);
+  out = out ?? new Float32Array(pairs * hidden);
+
+  let at = 0;
+  for (let i = start; i < end; i++) {
+    for (let m = 0; m < M; m++) {
+      const ao = (i * M + m) * 3;
+      for (let n = 0; n < M; n++) {
+        const bo = (i * M + n) * 3;
+        rbfInto(scratch, at, dist(Y, ao, Y, bo));
+        at += RBF.count;
+      }
+    }
+  }
+  linear(scratch, yEdges.weight, yEdges.bias, pairs, RBF.count, hidden, out);
+  layerNorm(out, normYEdges.gamma, normYEdges.beta, pairs, hidden, out);
+  return out;
+}

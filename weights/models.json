@@ -1,0 +1,156 @@
+[
+  {
+    "file": "global_label_membrane_mpnn_v_48_020.mpnn",
+    "name": "global_label_membrane_mpnn_v_48_020",
+    "model_type": "global_label_membrane_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.2,
+    "atom_context_num": 0,
+    "params": 1677637,
+    "bytes": 3364554
+  },
+  {
+    "file": "ligandmpnn_v_32_005_25.mpnn",
+    "name": "ligandmpnn_v_32_005_25",
+    "model_type": "ligand_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 32,
+    "noise_level": 0.05,
+    "atom_context_num": 25,
+    "params": 2618693,
+    "bytes": 5252490
+  },
+  {
+    "file": "ligandmpnn_v_32_010_25.mpnn",
+    "name": "ligandmpnn_v_32_010_25",
+    "model_type": "ligand_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 32,
+    "noise_level": 0.1,
+    "atom_context_num": 25,
+    "params": 2618693,
+    "bytes": 5252490
+  },
+  {
+    "file": "ligandmpnn_v_32_020_25.mpnn",
+    "name": "ligandmpnn_v_32_020_25",
+    "model_type": "ligand_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 32,
+    "noise_level": 0.2,
+    "atom_context_num": 25,
+    "params": 2618693,
+    "bytes": 5252490
+  },
+  {
+    "file": "ligandmpnn_v_32_030_25.mpnn",
+    "name": "ligandmpnn_v_32_030_25",
+    "model_type": "ligand_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 32,
+    "noise_level": 0.3,
+    "atom_context_num": 25,
+    "params": 2618693,
+    "bytes": 5252490
+  },
+  {
+    "file": "per_residue_label_membrane_mpnn_v_48_020.mpnn",
+    "name": "per_residue_label_membrane_mpnn_v_48_020",
+    "model_type": "per_residue_label_membrane_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.2,
+    "atom_context_num": 0,
+    "params": 1677637,
+    "bytes": 3364554
+  },
+  {
+    "file": "proteinmpnn_v_48_002.mpnn",
+    "name": "proteinmpnn_v_48_002",
+    "model_type": "protein_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.02,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  },
+  {
+    "file": "proteinmpnn_v_48_010.mpnn",
+    "name": "proteinmpnn_v_48_010",
+    "model_type": "protein_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.1,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  },
+  {
+    "file": "proteinmpnn_v_48_020.mpnn",
+    "name": "proteinmpnn_v_48_020",
+    "model_type": "protein_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.2,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  },
+  {
+    "file": "proteinmpnn_v_48_030.mpnn",
+    "name": "proteinmpnn_v_48_030",
+    "model_type": "protein_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.3,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  },
+  {
+    "file": "solublempnn_v_48_002.mpnn",
+    "name": "solublempnn_v_48_002",
+    "model_type": "soluble_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.02,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  },
+  {
+    "file": "solublempnn_v_48_010.mpnn",
+    "name": "solublempnn_v_48_010",
+    "model_type": "soluble_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.1,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  },
+  {
+    "file": "solublempnn_v_48_020.mpnn",
+    "name": "solublempnn_v_48_020",
+    "model_type": "soluble_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.2,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  },
+  {
+    "file": "solublempnn_v_48_030.mpnn",
+    "name": "solublempnn_v_48_030",
+    "model_type": "soluble_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 48,
+    "noise_level": 0.3,
+    "atom_context_num": 0,
+    "params": 1660485,
+    "bytes": 3329866
+  }
+]
