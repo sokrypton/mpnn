@@ -194,7 +194,7 @@ as a pessimistic floor rather than a benchmark.
 
 | | ProteinMPNN, L = 76 | LigandMPNN, L = 121 |
 | --- | --- | --- |
-| encode | **0.25 s** (was 1.4) | **0.64 s** (was 13.3) |
+| encode | **0.22 s** (was 1.4) | **0.60 s** (was 13.3) |
 | sample | **59 ms/seq** (was 1014) | **60 ms/seq** (was 1113) |
 | profile | **0.13 s** (was 1.04) | **0.09 s** (was 1.12) |
 
@@ -202,12 +202,12 @@ Across sizes, ProteinMPNN, single thread, sampling as ms per sequence at batch 8
 
 | structure | L | encode | sample | profile | peak RSS |
 | --- | --- | --- | --- | --- | --- |
-| 1UBQ ubiquitin | 76 | 0.25 s | 60 ms | 0.12 s | 118 MB |
-| 1STP + biotin (LigandMPNN) | 121 | 0.64 s | 60 ms | 0.08 s | 191 MB |
-| 1BL8 K⁺ channel, 4 chains | 388 | 1.04 s | 0.29 s | 0.38 s | 199 MB |
-| 4HHB haemoglobin, 4 chains | 574 | 1.5 s | 0.39 s | 0.41 s | 266 MB |
-| 6VXX spike trimer | 2916 | 7.2 s | 2.2 s | 2.2 s | 760 MB |
-| 1AON GroEL/GroES, 21 chains | 8015 | 20.5 s | — | — | ~2 GB |
+| 1UBQ ubiquitin | 76 | 0.22 s | 60 ms | 0.12 s | 118 MB |
+| 1STP + biotin (LigandMPNN) | 121 | 0.60 s | 60 ms | 0.08 s | 191 MB |
+| 1BL8 K⁺ channel, 4 chains | 388 | 0.93 s | 0.29 s | 0.34 s | 193 MB |
+| 4HHB haemoglobin, 4 chains | 574 | 1.25 s | 0.41 s | 0.43 s | 266 MB |
+| 6VXX spike trimer | 2916 | 6.54 s | 2.09 s | 2.04 s | 760 MB |
+| 1AON GroEL/GroES, 21 chains | 8015 | 17.4 s | — | — | ~2 GB |
 
 Scaling is linear in L. Past ~3000 residues memory bites before arithmetic
 does: the encoder's edge tensor is L·K·128 floats and the cached decoder
@@ -221,17 +221,17 @@ Same structures, same inputs, PyTorch 2.13 on the same machine
 
 | | | this engine (1 thread) | PyTorch (1 thread) | PyTorch (4 threads) |
 | --- | --- | --- | --- | --- |
-| L = 76 | encode | 0.25 | 0.10 | 0.04 |
+| L = 76 | encode | 0.22 | 0.10 | 0.04 |
 | | sample | **0.060** | 0.08 | 0.04 |
-| L = 121 ligand | encode | **0.64** | 0.77 | 0.24 |
+| L = 121 ligand | encode | **0.60** | 0.77 | 0.24 |
 | | sample | **0.060** | 0.17 | 0.09 |
-| L = 388 | encode | 1.04 | 0.53 | 0.16 |
+| L = 388 | encode | 0.93 | 0.53 | 0.16 |
 | | sample | **0.29** | 0.42 | 0.21 |
-| L = 574 | encode | 1.47 | 0.91 | 0.32 |
-| | sample | **0.39** | 0.61 | 0.32 |
-| L = 2916 | encode | **7.24** | 11.60 | 3.76 |
-| | sample | **2.19** | 7.02 | 2.45 |
-| L = 8015 | encode | **20.5** | — | 21.9 |
+| L = 574 | encode | 1.25 | 0.91 | 0.32 |
+| | sample | **0.41** | 0.61 | 0.32 |
+| L = 2916 | encode | **6.54** | 11.60 | 3.76 |
+| | sample | **2.09** | 7.02 | 2.45 |
+| L = 8015 | encode | **17.4** | — | 21.9 |
 
 Sampling is faster than single-threaded PyTorch everywhere, by 1.3x at small L
 and 3.2x at large, and within 1.1-1.5x of PyTorch on four cores. That is not kernel throughput: the reference walks L
@@ -239,9 +239,9 @@ autoregressive steps in Python and pays interpreter and tensor-dispatch overhead
 on each one, while this decoder's inner loop has no per-edge matmul left in it.
 
 Encoding crosses over, and the crossover is the interesting part. PyTorch is
-1.6-2.5x ahead up to a few hundred residues, level around L ≈ 1500, and behind
-by L ≈ 3000. At L = 8015 this engine on **one** thread edges out PyTorch on
-**four** (20.5 s against 21.9 s).
+1.4-2.2x ahead up to a few hundred residues, level around L ≈ 1000, and behind
+by L ≈ 3000. At L = 8015 this engine on **one** thread beats PyTorch on **four**
+(17.4 s against 21.9 s).
 
 The two implementations scale differently. The reference builds full `[L, L]`
 distance matrices for each of 25 atom pairs in `_get_rbf` — O(L²) — while this
@@ -284,9 +284,18 @@ down from 37%. Two of the three items named here have been dealt with:
   accelerator call each for a whole layer half, so the intermediates never
   cross the boundary
 
-What is left, in order: the radial basis evaluation is now the largest single
-JavaScript item (10% at L = 2916 — 56 million `exp` calls), and it wants to be
-fused with the edge embedding that consumes it. Then threads.
+- the radial basis evaluation followed, into `edge_features_f32`. It was the
+  largest remaining JavaScript item at every size — 400 `exp` calls per edge, 56
+  million on a spike trimer — and it is fused with the 416-wide projection and
+  LayerNorm that consume it, so the encoder's widest intermediate never crosses
+  the boundary. ~12% off encode
+
+Encode is now ~75% inside the kernel, and what remains there is at the hardware
+ceiling. **Threads are the only multiplicative lever left**, and they are worth
+most exactly where this is weakest: a worker pool would take L = 76 encode from
+0.22 s to roughly 0.06 s, past single-threaded PyTorch and level with four
+threads. Sampling parallelises without any shared memory at all, since the
+samples are independent and each worker needs only a copy of the encoding.
 
 Between 5x and 17x depending on what you ask for. Five things got it there, and
 the order matters: every algorithmic change came before any kernel work, because

@@ -66,6 +66,12 @@ export function tryMessageBlock(h1, maskAttend, hV, w, rows, k, hidden, ff, scal
     && accel.messageBlock(h1, maskAttend, hV, w, rows, k, hidden, ff, scale, out);
 }
 
+/** The whole edge featurisation for a chunk; false if unavailable. */
+export function tryEdgeFeatures(pos16, xyz, eidx, dCaCa, rowOf, w, g, b, rows, k, hidden, out) {
+  return accel !== null
+    && accel.edgeFeatures(pos16, xyz, eidx, dCaCa, rowOf, w, g, b, rows, k, hidden, out);
+}
+
 /** The encoder's edge half in one call; false if unavailable. */
 export function tryEdgeBlock(h1, hE, w, n, hidden, out) {
   return accel !== null && accel.edgeBlock(h1, hE, w, n, hidden, out);

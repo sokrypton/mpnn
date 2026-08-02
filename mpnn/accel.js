@@ -170,6 +170,48 @@ export class Accelerator {
     return true;
   }
 
+  /**
+   * The whole edge featurisation for one chunk: 25 radial-basis blocks, the
+   * 416-wide projection, and its LayerNorm.
+   *
+   * @returns {boolean} true if it ran here
+   */
+  edgeFeatures(pos16, xyz, eidx, dCaCa, rowOf, w, g, b, rows, k, hidden, out) {
+    if (rows * k * 416 * hidden < MIN_MACS) return false;
+    const wPtr = this._upload(w);
+    const gPtr = this._upload(g);
+    const bPtr = this._upload(b);
+
+    let s = this._stage(this.scratch, rows * k * 16 * 4);
+    const posPtr = s.at;
+    s = this._stage(s.next, xyz.length * 4);
+    const xyzPtr = s.at;
+    s = this._stage(s.next, rows * k * 4);
+    const eidxPtr = s.at;
+    s = this._stage(s.next, rows * k * 4);
+    const dPtr = s.at;
+    s = this._stage(s.next, rows * 4);
+    const rowPtr = s.at;
+    s = this._stage(s.next, rows * k * 416 * 4);
+    const scratchPtr = s.at;
+    s = this._stage(s.next, rows * k * hidden * 4);
+    const outPtr = s.at;
+
+    const mem = this.f32;
+    mem.set(pos16.subarray(0, rows * k * 16), posPtr >> 2);
+    mem.set(xyz, xyzPtr >> 2);
+    mem.set(dCaCa.subarray(0, rows * k), dPtr >> 2);
+    const i32 = new Int32Array(this.memory.buffer);
+    i32.set(eidx.subarray(0, rows * k), eidxPtr >> 2);
+    i32.set(rowOf.subarray(0, rows), rowPtr >> 2);
+
+    this.exports.edge_features_f32(posPtr, xyzPtr, eidxPtr, dPtr, rowPtr,
+      wPtr, gPtr, bPtr, rows, k, hidden, scratchPtr, outPtr);
+    out.set(this.f32.subarray(outPtr >> 2, (outPtr >> 2) + rows * k * hidden), 0);
+    this.calls++;
+    return true;
+  }
+
   /** gelu -> W2 -> gelu -> W3, then a residual LayerNorm against `hE`. */
   edgeBlock(h1, hE, w, n, hidden, out) {
     if (n * hidden * hidden < MIN_MACS) return false;

@@ -14,7 +14,7 @@ import {
   MAX_RELATIVE_FEATURE,
   RBF,
 } from "./constants.js";
-import { argTopKSmallest, layerNorm, linear } from "./ops.js";
+import { argTopKSmallest, layerNorm, linear, tryEdgeFeatures } from "./ops.js";
 
 const RBF_MU = new Float32Array(RBF.count);
 for (let i = 0; i < RBF.count; i++) {
@@ -286,18 +286,29 @@ export function edgeFeatures(w, bb, EIdx, DNeighbors, residueIdx, chainLabels, L
   const E = new Float32Array(L * K * hidden);
   const scratch = new Float32Array(chunk * K * EDGE_IN_DIM);
   const projected = new Float32Array(chunk * K * hidden);
+  const pos16 = new Float32Array(chunk * K * 16);
+  const rowOf = new Int32Array(chunk);
+  // N, CA, C, O, CB interleaved, which is the layout the fused kernel indexes.
+  const xyz = new Float32Array(L * 15);
+  for (let i = 0; i < L; i++) {
+    const atoms = [bb.N, bb.CA, bb.C, bb.O, bb.CB];
+    for (let a = 0; a < 5; a++) {
+      xyz[i * 15 + a * 3] = atoms[a][i * 3];
+      xyz[i * 15 + a * 3 + 1] = atoms[a][i * 3 + 1];
+      xyz[i * 15 + a * 3 + 2] = atoms[a][i * 3 + 2];
+    }
+  }
 
   for (let start = 0; start < L; start += chunk) {
     const end = Math.min(L, start + chunk);
     const rows = end - start;
-    scratch.fill(0, 0, rows * K * EDGE_IN_DIM);
 
+    // The relative-position block is a one-hot times a Linear, so it is a
+    // column read either way; it stays here and is handed to the kernel.
     for (let i = start; i < end; i++) {
+      rowOf[i - start] = i;
       for (let k = 0; k < K; k++) {
         const j = EIdx[i * K + k];
-        const base = ((i - start) * K + k) * EDGE_IN_DIM;
-
-        // Relative position encoding: a one-hot times a Linear is a column read.
         const sameChain = chainLabels[i] === chainLabels[j] ? 1 : 0;
         const offset = residueIdx[i] - residueIdx[j];
         const clipped = Math.min(
@@ -305,11 +316,25 @@ export function edgeFeatures(w, bb, EIdx, DNeighbors, residueIdx, chainLabels, L
           2 * MAX_RELATIVE_FEATURE,
         );
         const d = sameChain ? clipped : 2 * MAX_RELATIVE_FEATURE + 1;
+        const base = ((i - start) * K + k) * 16;
         for (let o = 0; o < 16; o++) {
-          scratch[base + o] = posLinear.weight[o * posIn + d] + posLinear.bias[o];
+          pos16[base + o] = posLinear.weight[o * posIn + d] + posLinear.bias[o];
         }
+      }
+    }
 
-        // 25 distance blocks.
+    const dest = E.subarray(start * K * hidden, end * K * hidden);
+    if (tryEdgeFeatures(
+      pos16, xyz, EIdx.subarray(start * K), DNeighbors.subarray(start * K), rowOf,
+      edgeEmbed.weight, normEdges.gamma, normEdges.beta, rows, K, hidden, dest,
+    )) continue;
+
+    scratch.fill(0, 0, rows * K * EDGE_IN_DIM);
+    for (let i = start; i < end; i++) {
+      for (let k = 0; k < K; k++) {
+        const j = EIdx[i * K + k];
+        const base = ((i - start) * K + k) * EDGE_IN_DIM;
+        for (let o = 0; o < 16; o++) scratch[base + o] = pos16[((i - start) * K + k) * 16 + o];
         let off = base + 16;
         rbfInto(scratch, off, DNeighbors[i * K + k]);
         off += RBF.count;
@@ -320,12 +345,8 @@ export function edgeFeatures(w, bb, EIdx, DNeighbors, residueIdx, chainLabels, L
         }
       }
     }
-
     linear(scratch, edgeEmbed.weight, edgeEmbed.bias, rows * K, EDGE_IN_DIM, hidden, projected);
-    layerNorm(
-      projected, normEdges.gamma, normEdges.beta, rows * K, hidden,
-      E.subarray(start * K * hidden, end * K * hidden),
-    );
+    layerNorm(projected, normEdges.gamma, normEdges.beta, rows * K, hidden, dest);
   }
   return E;
 }

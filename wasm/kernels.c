@@ -356,3 +356,92 @@ EXPORT void edge_block_f32(float *h1, const float *hE,
   add_into(h1, hE, n * hidden);
   layernorm_f32(h1, g, c, n, hidden, out, 1e-5f);
 }
+
+
+// --- edge featurisation ------------------------------------------------------
+//
+// The 25 radial-basis blocks were the last big piece still evaluated in
+// JavaScript: 400 exp() calls per edge, 56 million of them on a spike trimer,
+// and then the 416-wide block had to be staged across the boundary to be
+// multiplied. Computing it here means the widest intermediate in the whole
+// encoder never leaves this memory.
+
+/** N, CA, C, O, CB per residue, in that order. */
+#define ATOM_STRIDE 15
+
+// The 24 recomputed distance blocks, as (atom of i, atom of j). The 25th, Ca-Ca,
+// reuses the neighbour search's own distance and is passed in.
+static const unsigned char RBF_PAIRS[24][2] = {
+  {0,0},{2,2},{3,3},{4,4},
+  {1,0},{1,2},{1,3},{1,4},
+  {0,2},{0,3},{0,4},
+  {4,2},{4,3},{3,2},
+  {0,1},{2,1},{3,1},{4,1},
+  {2,0},{3,0},{4,0},
+  {2,4},{3,4},{2,3},
+};
+
+/**
+ * 16-channel radial basis of `d`, written to `out[0..16]`.
+ *
+ * Values below 1e-30 are flushed to zero. exp(-z^2) underflows into float32's
+ * denormal range for pairs far from a basis centre, and denormal arithmetic
+ * traps to microcode -- left alone it costs ~20x on the matmul that consumes
+ * this.
+ */
+static inline void rbf16(float d, float *out) {
+  const v128_t dv = wasm_f32x4_splat(d);
+  const v128_t inv = wasm_f32x4_const_splat(1.0f / 1.25f);
+  const v128_t floor_ = wasm_f32x4_const_splat(1e-30f);
+  const float step = 20.0f / 15.0f;
+  for (int c = 0; c < 16; c += 4) {
+    v128_t mu = wasm_f32x4_make(2.0f + (c + 0) * step, 2.0f + (c + 1) * step,
+                                2.0f + (c + 2) * step, 2.0f + (c + 3) * step);
+    v128_t z = wasm_f32x4_mul(wasm_f32x4_sub(dv, mu), inv);
+    v128_t e = exp_f32x4(wasm_f32x4_neg(wasm_f32x4_mul(z, z)));
+    // Flush anything that would land in the denormal range.
+    e = wasm_v128_and(e, wasm_f32x4_ge(e, floor_));
+    wasm_v128_store(out + c, e);
+  }
+}
+
+static inline float dist3(const float *a, const float *b) {
+  float dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
+  return __builtin_sqrtf(dx * dx + dy * dy + dz * dz + 1e-6f);
+}
+
+/**
+ * E = LayerNorm(W · [positional ‖ 25 × RBF]) for one chunk of residues.
+ *
+ * @param pos16   [rows*k, 16] relative-position encoding, already gathered
+ * @param xyz     [L, 5, 3] N, CA, C, O, CB
+ * @param eidx    [rows*k] neighbour residue indices
+ * @param dCaCa   [rows*k] Ca-Ca distances from the neighbour search
+ * @param rowOf   [rows] global residue index of each row
+ * @param scratch [rows*k, 416]
+ */
+EXPORT void edge_features_f32(
+    const float *pos16, const float *xyz, const int *eidx, const float *dCaCa,
+    const int *rowOf, const float *w, const float *g, const float *b,
+    int rows, int k, int hidden, float *scratch, float *out) {
+  const int in_dim = 416;
+  for (int r = 0; r < rows; r++) {
+    const float *xi = xyz + (long)rowOf[r] * ATOM_STRIDE;
+    for (int j = 0; j < k; j++) {
+      const long e = (long)r * k + j;
+      float *dst = scratch + e * in_dim;
+      const float *xj = xyz + (long)eidx[e] * ATOM_STRIDE;
+
+      for (int c = 0; c < 16; c += 4) {
+        wasm_v128_store(dst + c, wasm_v128_load(pos16 + e * 16 + c));
+      }
+      rbf16(dCaCa[e], dst + 16);
+      for (int pp = 0; pp < 24; pp++) {
+        rbf16(dist3(xi + RBF_PAIRS[pp][0] * 3, xj + RBF_PAIRS[pp][1] * 3),
+              dst + 16 + 16 + pp * 16);
+      }
+    }
+  }
+  linear_f32(scratch, w, (const float *)0, rows * k, in_dim, hidden, out);
+  layernorm_f32(out, g, b, rows * k, hidden, out, 1e-5f);
+}
