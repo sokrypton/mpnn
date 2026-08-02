@@ -204,10 +204,10 @@ Across sizes, ProteinMPNN, single thread, sampling as ms per sequence at batch 8
 | --- | --- | --- | --- | --- | --- |
 | 1UBQ ubiquitin | 76 | 0.25 s | 60 ms | 0.12 s | 118 MB |
 | 1STP + biotin (LigandMPNN) | 121 | 0.64 s | 60 ms | 0.08 s | 191 MB |
-| 1BL8 K⁺ channel, 4 chains | 388 | 1.2 s | 0.31 s | 0.37 s | 180 MB |
+| 1BL8 K⁺ channel, 4 chains | 388 | 1.04 s | 0.29 s | 0.38 s | 199 MB |
 | 4HHB haemoglobin, 4 chains | 574 | 1.5 s | 0.39 s | 0.41 s | 266 MB |
 | 6VXX spike trimer | 2916 | 7.2 s | 2.2 s | 2.2 s | 760 MB |
-| 1AON GroEL/GroES, 21 chains | 8015 | 22 s | — | — | ~2 GB |
+| 1AON GroEL/GroES, 21 chains | 8015 | 20.5 s | — | — | ~2 GB |
 
 Scaling is linear in L. Past ~3000 residues memory bites before arithmetic
 does: the encoder's edge tensor is L·K·128 floats and the cached decoder
@@ -225,25 +225,36 @@ Same structures, same inputs, PyTorch 2.13 on the same machine
 | | sample | **0.060** | 0.08 | 0.04 |
 | L = 121 ligand | encode | **0.64** | 0.77 | 0.24 |
 | | sample | **0.060** | 0.17 | 0.09 |
-| L = 388 | encode | 1.24 | 0.53 | 0.16 |
-| | sample | **0.31** | 0.42 | 0.21 |
+| L = 388 | encode | 1.04 | 0.53 | 0.16 |
+| | sample | **0.29** | 0.42 | 0.21 |
 | L = 574 | encode | 1.47 | 0.91 | 0.32 |
 | | sample | **0.39** | 0.61 | 0.32 |
-| L = 2916 | encode | **7.24** | 11.60 | — |
-| | sample | **2.19** | 7.02 | — |
+| L = 2916 | encode | **7.24** | 11.60 | 3.76 |
+| | sample | **2.19** | 7.02 | 2.45 |
+| L = 8015 | encode | **20.5** | — | 21.9 |
 
-Sampling is faster than single-threaded PyTorch everywhere, by 1.2x at small L
-and 3.1x at large. That is not kernel throughput: the reference walks L
+Sampling is faster than single-threaded PyTorch everywhere, by 1.3x at small L
+and 3.2x at large, and within 1.1-1.5x of PyTorch on four cores. That is not kernel throughput: the reference walks L
 autoregressive steps in Python and pays interpreter and tensor-dispatch overhead
 on each one, while this decoder's inner loop has no per-edge matmul left in it.
 
-Encoding crosses over. PyTorch is ~2x ahead up to a few hundred residues and
-behind by L ≈ 3000, because the two implementations scale differently: the
-reference builds full `[L, L]` distance matrices for each of 25 atom pairs in
-`_get_rbf`, which is O(L²), whereas this one evaluates distances only at the K
-neighbours it kept, which is O(L·K). At L = 2916 that is 8.5 million pairs
-against 140 thousand. PyTorch's encode grows 12.7x between L = 574 and L = 2916,
-a 5.1x jump in size; this one grows 5.4x, which is linear.
+Encoding crosses over, and the crossover is the interesting part. PyTorch is
+1.6-2.5x ahead up to a few hundred residues, level around L ≈ 1500, and behind
+by L ≈ 3000. At L = 8015 this engine on **one** thread edges out PyTorch on
+**four** (20.5 s against 21.9 s).
+
+The two implementations scale differently. The reference builds full `[L, L]`
+distance matrices for each of 25 atom pairs in `_get_rbf` — O(L²) — while this
+one evaluates distances only at the K neighbours it kept, and since the grid
+search that finds them is no longer O(L²) either, the whole encode is O(L·K).
+At L = 2916 that is 8.5 million pairs against 140 thousand. Between L = 574 and
+L = 2916, PyTorch's encode grows 12.7x for a 5.1x jump in size; this one grows
+4.9x, which is linear.
+
+So the honest summary is that the gap is a small-protein gap. On anything under
+a few hundred residues a native BLAS on four cores is 5-6x ahead and always will
+be; from about a thousand residues up, the asymptotics matter more than the
+kernel and this implementation is competitive or better.
 
 ### Why encoding is still slower at small and medium L
 
