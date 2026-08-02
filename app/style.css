@@ -377,6 +377,7 @@ details > summary {
 }
 
 .aa-bias .cell.omitted { opacity: 0.4; }
+.aa-bias .cell.override { border-color: var(--accent-2); }
 .aa-bias .cell input { width: 100%; flex: 1; min-width: 0; }
 .aa-bias .cell .letter { cursor: pointer; user-select: none; width: 1.2em; }
 
@@ -389,3 +390,17 @@ footer {
 }
 
 footer a { color: var(--accent); }
+
+textarea {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  resize: vertical;
+}
+
+#score-orders { flex: 0 0 60px; }

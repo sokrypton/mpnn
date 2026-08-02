@@ -4,7 +4,7 @@
 // unsolicited {type: "progress"} messages while long jobs run.
 
 import { enableAcceleration } from "../mpnn/accel.js";
-import { AR, Model } from "../mpnn/model.js";
+import { AR, Model, perPositionNLL } from "../mpnn/model.js";
 import { Weights } from "../mpnn/weights.js";
 
 // Best effort. If the module is missing or the runtime has no SIMD this
@@ -121,15 +121,72 @@ const handlers = {
     };
   },
 
-  async score({ S }) {
+  /**
+   * Negative log-likelihood of a sequence, per position and averaged.
+   *
+   * The default is the pseudo-likelihood mask -- every position scored as if it
+   * were decoded last, all in one pass. `AR.ORDER` is the other useful reading:
+   * the true autoregressive likelihood, which depends on the decoding order and
+   * so is averaged over several random ones, with the spread reported.
+   */
+  async score({ S, mode = AR.ALL_BUT_SELF, orders = 8, chainMask, seed }) {
     if (!encoded) throw new Error("nothing encoded");
+    const L = encoded.L;
+    const V = current.numLetters;
     const seq = new Int32Array(S);
-    const order = new Int32Array(encoded.L);
-    for (let i = 0; i < encoded.L; i++) order[i] = i;
-    // A fixed left-to-right order keeps repeated scoring of the same sequence
-    // comparable between calls.
-    const logits = current.score(encoded, seq, { type: AR.ORDER, order });
-    return { logits: logits.buffer };
+    const weight = new Float32Array(L);
+    for (let i = 0; i < L; i++) {
+      weight[i] = encoded.mask[i] * (chainMask ? chainMask[i] : 1);
+    }
+
+    const nRuns = mode === AR.ORDER ? Math.max(1, orders) : 1;
+    const rng = seed === undefined || seed === null ? Math.random : mulberry32(seed);
+    const perPosition = new Float32Array(L);
+    const step = new Float32Array(L);
+    const order = new Int32Array(L);
+    const runs = [];
+    const t0 = performance.now();
+
+    for (let r = 0; r < nRuns; r++) {
+      let ar;
+      if (mode === AR.ORDER) {
+        for (let i = 0; i < L; i++) order[i] = i;
+        for (let i = L - 1; i > 0; i--) {
+          const j = Math.floor(rng() * (i + 1));
+          const t = order[i];
+          order[i] = order[j];
+          order[j] = t;
+        }
+        ar = { type: AR.ORDER, order };
+      } else {
+        ar = { type: mode };
+      }
+      perPositionNLL(current.score(encoded, seq, ar), seq, L, V, step);
+      let total = 0;
+      let n = 0;
+      for (let i = 0; i < L; i++) {
+        perPosition[i] += step[i] / nRuns;
+        if (weight[i] > 0) {
+          total += step[i];
+          n++;
+        }
+      }
+      runs.push(n ? total / n : 0);
+      if (nRuns > 1) post({ type: "progress", stage: "score", received: r + 1, total: nRuns });
+    }
+
+    const mean = runs.reduce((a, b) => a + b, 0) / runs.length;
+    const sd = runs.length < 2 ? null : Math.sqrt(
+      runs.reduce((a, b) => a + (b - mean) ** 2, 0) / (runs.length - 1),
+    );
+    return {
+      ms: performance.now() - t0,
+      mean,
+      sd,
+      mode,
+      orders: nRuns,
+      perPosition: perPosition.buffer,
+    };
   },
 };
 

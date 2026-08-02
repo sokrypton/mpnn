@@ -203,6 +203,103 @@ for (const mode of ["chain", "design", "confidence", "identity", "rainbow"]) {
 }
 console.log("colour modes: ok");
 
+// --- per-position bias and sequence scoring ---------------------------------
+{
+  // The bias controls live inside a <details>, which starts collapsed.
+  await page.evaluate(() => {
+    for (const d of document.querySelectorAll("details")) d.open = true;
+  });
+
+  // Scope the bias to a selection and confirm only those positions carry it.
+  await page.click("#select-none");
+  await page.evaluate(() => {
+    for (let i = 10; i < 20; i++) document.querySelector(`.res[data-i="${i}"]`).click();
+  });
+  await page.selectOption("#bias-scope", "selected");
+  await page.evaluate(() => {
+    const cell = [...document.querySelectorAll("#aa-bias .cell")]
+      .find((c) => c.querySelector(".letter").textContent === "W");
+    const input = cell.querySelector("input");
+    input.value = "5";
+    input.dispatchEvent(new Event("input"));
+  });
+  const built = await page.evaluate(() => {
+    // Reach into the module's own bias builder through a design run's payload
+    // would be indirect; instead read the summary it renders.
+    return document.getElementById("bias-summary").textContent;
+  });
+  console.log("bias:", built.trim());
+  if (!/10 position\(s\) carry an override/.test(built)) {
+    problems.push("per-position bias override was not recorded");
+  }
+
+  // With W boosted only at 10..19, a low-temperature design should put W there
+  // and (mostly) not elsewhere. Results accumulate and re-sort by score across
+  // runs, so clear them first -- otherwise `.design` is whichever earlier,
+  // unbiased sequence happens to score best.
+  await page.click("#clear-results");
+  await page.click("#select-all");
+  await page.fill("#temperature", "0.1");
+  await page.evaluate(() => document.getElementById("temperature")
+    .dispatchEvent(new Event("input")));
+  await page.fill("#batch", "1");
+  await page.evaluate(() => document.getElementById("batch").dispatchEvent(new Event("input")));
+  await page.click("#design-btn");
+  await page.waitForFunction(
+    () => /sequences in/.test(document.getElementById("design-status").textContent),
+    { timeout: 300000 },
+  );
+  const seq = await page.evaluate(() =>
+    document.querySelector(".design .seq").textContent.trim());
+  const inWindow = [...seq.slice(10, 20)].filter((c) => c === "W").length;
+  const outside = [...seq.slice(0, 10) + seq.slice(20)].filter((c) => c === "W").length;
+  console.log(`bias: W inside biased window ${inWindow}/10, outside ${outside}/${seq.length - 10}`);
+  // 8-9 of 10, not 10 -- bias is added to the logits, not a constraint, and a
+  // couple of buried core positions in ubiquitin have a raw logit gap wider
+  // than 5 nats. `omit` (-1e9) is the hard version; sampling.mjs checks it.
+  if (inWindow < 5) problems.push("per-position bias did not steer the design");
+  await page.click("#bias-clear-overrides");
+  await page.selectOption("#bias-scope", "global");
+
+  // Scoring. The default is the single-pass pseudo-likelihood, which reports no
+  // spread because there is nothing to average over.
+  await page.click("#score-native");
+  const scoreOnce = async () => {
+    await page.click("#score-btn");
+    await page.waitForFunction(
+      (prev) => {
+        const t = document.getElementById("score-status").textContent;
+        return t !== prev && /nll |Failed/.test(t);
+      },
+      "Scoring…", { timeout: 300000 },
+    );
+    return (await page.textContent("#score-status")).trim();
+  };
+
+  if (await page.isVisible("#score-orders-row")) {
+    problems.push("the orders control is shown for a mode that does not average");
+  }
+  const plText = await scoreOnce();
+  console.log("score (pseudo-likelihood):", plText);
+  if (!/^nll [0-9.]+, /.test(plText)) {
+    problems.push(`pseudo-likelihood scoring did not report a value: ${plText}`);
+  }
+  if (/±/.test(plText)) problems.push("single-pass score reported a spread");
+  if (!/100% identical/.test(plText)) problems.push("native sequence not recognised as identical");
+
+  await page.selectOption("#score-mode", "order");
+  if (!await page.isVisible("#score-orders-row")) {
+    problems.push("the orders control stayed hidden for autoregressive scoring");
+  }
+  await page.fill("#score-orders", "4");
+  const arText = await scoreOnce();
+  console.log("score (autoregressive):", arText);
+  if (!/nll [0-9.]+ ± [0-9.]+ over 4 orders/.test(arText)) {
+    problems.push(`autoregressive scoring did not report a value: ${arText}`);
+  }
+  await page.selectOption("#score-mode", "all-but-self");
+}
+
 // --- membrane labels must reach the encoder ---------------------------------
 {
   console.log("\n-- MembraneMPNN --");

@@ -36,6 +36,8 @@ export class Weights {
     this.kNeighbors = header.k_neighbors;
     this.atomContextNum = header.atom_context_num;
     this.noiseLevel = header.noise_level;
+    /** "float16" (what the page ships) or "float32" (what parity tests need). */
+    this.dtype = header.dtype;
     this.hiddenDim = header.hidden_dim;
     this.numLetters = header.num_letters;
   }

@@ -114,25 +114,73 @@ rather than a decoding order: `arMask[i][j] = 1` means position `i` may see
 position `j`'s amino acid. That collapses three separate code paths into one and
 makes the cheap cases obvious.
 
-| Mode | Cost | Exact? |
-| --- | --- | --- |
-| `AR.NONE` — nobody sees any sequence | 1 decoder pass | yes |
-| `AR.ORDER` — the usual triangular mask from a decoding order | 1 pass | yes |
-| `AR.ALL_BUT_SELF` — everyone sees everyone else | 1 pass | **no** |
-| `profile({exact: true})` — each position decoded last in its own pass | L passes | yes |
+| Mode | Cost |
+| --- | --- |
+| `AR.NONE` — nobody sees any sequence | 1 decoder pass |
+| `AR.ORDER` — the usual triangular mask from a decoding order | 1 pass |
+| `AR.ALL_BUT_SELF` — pseudo-likelihood, `ar_mask = 1 - I` | 1 pass |
+| `profile({exact: true})` — each position decoded last in its own pass | L passes |
 
-The caveat on `ALL_BUT_SELF` is real and the page says so in the UI: the decoder
-is three layers deep, so with a cyclic mask a residue's own identity reaches it
-again through two-hop paths. It is a good fast approximation of the conditional
-profile, not the thing itself. The reference implementation's `single_aa_score`
-computes the exact version, and so does `profile({exact: true})` — at L times
-the cost.
+### Scoring a sequence
+
+The default is `AR.ALL_BUT_SELF`: every position scored as if it were decoded
+last, all in one pass. This is what the [ProteinMPNN-in-JAX
+notebook](https://github.com/sokrypton/ColabDesign/blob/main/mpnn/examples/proteinmpnn_in_jax.ipynb)
+calls `conditional`, and `score()` here takes the same `ar_mask` argument
+ColabDesign's does.
+
+The usual objection is that the mask is cyclic — `i` tells `j` its identity at
+layer 0 and `j` hands it back at layer 1, so across three decoder layers a
+residue partly sees itself. That is true. But the L-pass alternative is not a
+clean reference point either: putting position `t` last leaves the order of the
+other L−1 free, and the decoder is not invariant to it, because `t` reads its
+neighbours' layer-1 states and those depend on *their* masks. So the "exact"
+profile is a family of answers.
+
+`test/pseudolikelihood.mjs` measures both spreads on the same structure:
+
+```
+assets/1ubq.pdb  proteinmpnn_v_48_020  L=76
+    mean nll     one pass 1.3280  L passes 1.2973 1.3053 1.3047  backbone 1.3846
+    L vs L       mae 0.0449  max 0.329  argmax 93.0%
+    1 vs L       mae 0.1015  argmax 91.7%  ratio 2.3x the L-vs-L spread
+    cost         218 ms vs 6377 ms (29x)
+
+assets/1stp.pdb  ligandmpnn_v_32_010_25  L=121
+    mean nll     one pass 1.3075  L passes 1.2957 1.2847 1.2895  backbone 1.3723
+    L vs L       mae 0.0448  max 0.568  argmax 97.2%
+    1 vs L       mae 0.1146  argmax 96.4%  ratio 2.6x the L-vs-L spread
+    cost         175 ms vs 11486 ms (66x)
+```
+
+Two L-pass profiles that differ only in the arbitrary part disagree by 0.045
+nats per position. The single pass sits 0.10–0.11 nats from either — the same
+kind of number, about 2.5×, for 1/L of the work. It errs *high* (1.328 against
+1.297), so it does not flatter a sequence. Those figures were cross-checked
+against PyTorch and agree to four decimals.
+
+`AR.ORDER` averaged over random orders is still offered, because it is a
+genuinely different quantity: the true autoregressive likelihood, and the one
+the sampler reports for its own designs.
+
+> The reference implementation has its `single_aa_score` flags backwards.
+> `--use_sequence 1`, the default and documented as
+> `p(AA_i | backbone, AA_{all except i})`, builds `order_mask` with a zero at
+> the target, which sorts the target to the *front* of the decoding order — so
+> it returns the backbone-only logits, bit for bit (verified: max difference
+> 0.0 against an `ar_mask = 0` pass). `--use_sequence 0`, documented as
+> "backbone info only", is the one that conditions on the rest. This port does
+> not reproduce that.
 
 ## Correctness
 
 `test/parity.mjs` checks the port against golden tensors produced by the real
-PyTorch model on the same inputs (`tools/make_reference.py`). Current state, on
-ubiquitin and on streptavidin + biotin:
+PyTorch model on the same inputs (`tools/make_reference.py`). Point it at a
+**float32** weights directory — `weights/` here is the float16 build the page
+downloads, and fp16's ~5e-4 relative error swamps every tolerance below and
+reads as a broken port. Rerun `tools/convert_weights.py --dtype float32` into a
+scratch directory for testing; the test refuses to run on float16 rather than
+failing mysteriously. Current state, on ubiquitin and on streptavidin + biotin:
 
 ```
 1ubq  (protein_mpnn, L=76, K=48)
@@ -155,6 +203,9 @@ every downstream feature is indexed by it — and it does. The last check is an
 internal invariant rather than a comparison: autoregressive sampling and
 teacher-forced scoring of the resulting sequence under the same order must give
 identical logits, which catches decoder bugs the golden tensors would not.
+
+`test/pseudolikelihood.mjs` backs the numbers in *Scoring a sequence* above,
+and asserts the properties they imply rather than the digits themselves.
 
 `test/sampling.mjs` covers what logits cannot reach — per-amino-acid bias,
 omissions, fixed residues, tied positions and the ligand-context switch all live

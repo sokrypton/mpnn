@@ -93,6 +93,7 @@
           <option value="identity">colour: identity to input</option>
           <option value="rainbow">colour: N → C</option>
           <option value="membrane">colour: membrane label</option>
+          <option value="score">colour: per-position score</option>
         </select>
         <button id="select-all">All</button>
         <button id="select-none">None</button>
@@ -135,12 +136,20 @@
         Bias is added to the logits before sampling, so +2 makes a residue
         roughly e² times more likely. Omit removes it entirely.
       </p>
+      <div class="row">
+        <select id="bias-scope">
+          <option value="global">applies to: every position</option>
+          <option value="selected">applies to: selected positions only</option>
+        </select>
+      </div>
       <div id="aa-bias" class="aa-bias"></div>
       <div class="row">
-        <button id="bias-reset">Reset bias</button>
+        <button id="bias-reset">Reset all</button>
         <button id="omit-cys">Omit C</button>
         <button id="omit-met">Omit M</button>
+        <button id="bias-clear-overrides" hidden>Clear overrides</button>
       </div>
+      <p class="hint" id="bias-summary"></p>
     </details>
 
     <details class="control">
@@ -177,14 +186,38 @@
   </section>
 
   <!-- ------------------------------------------------------------------ -->
+  <section class="panel wide" id="score-panel">
+    <div class="viewer-head">
+      <h2>Score a sequence</h2>
+      <div class="viewer-tools">
+        <select id="score-mode">
+          <option value="all-but-self">pseudo-likelihood (1 pass)</option>
+          <option value="none">backbone only (1 pass)</option>
+          <option value="order">autoregressive (averaged)</option>
+        </select>
+        <label class="check" id="score-orders-row" hidden>
+          orders
+          <input type="number" id="score-orders" value="8" min="1" max="64" step="1">
+        </label>
+        <button id="score-native">Use input sequence</button>
+        <button id="score-btn" disabled>Score</button>
+      </div>
+    </div>
+    <p class="hint" id="score-hint"></p>
+    <textarea id="score-seq" rows="3" spellcheck="false"
+      placeholder="MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQ..."></textarea>
+    <p class="status" id="score-status"></p>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
   <section class="panel wide" id="profile-panel" hidden>
     <div class="viewer-head">
       <h2>Position profile</h2>
       <div class="viewer-tools">
         <select id="profile-mode">
           <option value="none">backbone only (1 pass)</option>
-          <option value="all-but-self">conditioned on the rest (1 pass, approximate)</option>
-          <option value="exact">conditioned on the rest (L passes, exact)</option>
+          <option value="all-but-self">pseudo-likelihood (1 pass)</option>
+          <option value="exact">one pass per position (L passes)</option>
         </select>
         <button id="logo-wider" title="wider columns">&plus;</button>
         <button id="logo-narrower" title="narrower columns">&minus;</button>

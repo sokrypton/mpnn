@@ -46,10 +46,21 @@ export const AR = {
   /** Standard autoregressive mask induced by a decoding order. */
   ORDER: "order",
   /**
-   * Every position sees every other position's amino acid. One pass, but only
-   * an approximation of the per-position conditional: because the decoder is
-   * three layers deep, a residue's own identity leaks back to it through
-   * two-hop paths. `profile({exact: true})` runs the L-pass version instead.
+   * Pseudo-likelihood: every position sees every other position's amino acid
+   * and none sees its own, in one pass. `ar_mask = 1 - I`, which is exactly
+   * what the ProteinMPNN-in-JAX notebook calls `conditional`.
+   *
+   * This is not literally L separate conditionals. The mask is cyclic, so
+   * across three decoder layers a residue's own identity can return to it by a
+   * two-hop path -- i tells j at layer 0, j tells i at layer 1. But the L-pass
+   * alternative is not a clean reference point either: putting position t last
+   * still leaves the order of the other L-1 free, and the decoder is not
+   * invariant to it. Measured on ubiquitin and streptavidin, two L-pass
+   * profiles that differ only in that order disagree by 0.04-0.05 nats per
+   * position (argmax agreeing 96%), and the single pass sits 0.10-0.11 nats
+   * from either -- the same kind of number, about twice as large, for 1/L of
+   * the work. It also errs high (mean NLL 1.33 vs 1.29 on ubiquitin), so it
+   * does not flatter a sequence. See `test/pseudolikelihood.mjs`.
    */
   ALL_BUT_SELF: "all-but-self",
 };
@@ -555,13 +566,19 @@ export class Model {
    * Per-position amino-acid distribution.
    *
    * `mode: AR.NONE` (default) is a single pass and asks "what does the backbone
-   * alone want here". `exact: true` runs the L-pass conditional profile, where
-   * every position sees the true identity of all others -- the quantity the
-   * reference calls `single_aa_score`. That costs L decoder passes.
+   * alone want here"; `mode: AR.ALL_BUT_SELF` is the one-pass pseudo-likelihood.
+   * `exact: true` instead runs L passes, each putting one position last.
+   *
+   * That last one is not more correct so much as more expensive. The other L-1
+   * positions still have to be decoded in *some* order, and the answer depends
+   * on which -- see the note on `AR.ALL_BUT_SELF`. `order` picks it; the
+   * default is sequence order.
    *
    * @returns {{logits: Float32Array, probs: Float32Array}} [L, 21] each
    */
-  profile(enc, { S = null, mode = AR.NONE, exact = false, onProgress = null } = {}) {
+  profile(enc, {
+    S = null, mode = AR.NONE, exact = false, order: others = null, onProgress = null,
+  } = {}) {
     const { L } = enc;
     const V = this.numLetters;
     const seq = S ?? new Int32Array(L).fill(20);
@@ -572,12 +589,12 @@ export class Model {
     }
 
     const logits = new Float32Array(L * V);
+    const base = others ?? Int32Array.from({ length: L }, (_, i) => i);
     const order = new Int32Array(L);
-    for (let i = 0; i < L; i++) order[i] = i;
     for (let target = 0; target < L; target++) {
       // Decode `target` last so it sees every other position's identity.
       let at = 0;
-      for (let i = 0; i < L; i++) if (i !== target) order[at++] = i;
+      for (let i = 0; i < L; i++) if (base[i] !== target) order[at++] = base[i];
       order[L - 1] = target;
       const step = this.score(enc, seq, { type: AR.ORDER, order });
       logits.set(step.subarray(target * V, (target + 1) * V), target * V);
@@ -953,6 +970,23 @@ function rowSoftmax(logits, rows, cols) {
   const out = new Float32Array(rows * cols);
   for (let i = 0; i < rows; i++) {
     softmax(logits.subarray(i * cols, (i + 1) * cols), out.subarray(i * cols, (i + 1) * cols));
+  }
+  return out;
+}
+
+/**
+ * Negative log-likelihood of each residue of `S` under `logits`.
+ *
+ * @param {Float32Array} logits [L, V]
+ * @param {Int32Array} S [L]
+ * @param {Float32Array} [out] [L]
+ */
+export function perPositionNLL(logits, S, L, V, out) {
+  out = out ?? new Float32Array(L);
+  const lp = new Float32Array(V);
+  for (let i = 0; i < L; i++) {
+    logSoftmax(logits.subarray(i * V, (i + 1) * V), lp);
+    out[i] = -lp[S[i]];
   }
   return out;
 }

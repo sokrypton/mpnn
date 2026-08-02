@@ -70,6 +70,14 @@ for (const ref of reference) {
     buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
   );
   const model = new Model(weights);
+  // float16 weights lose ~5e-4 relative, which swamps every tolerance below and
+  // reads as a broken port. The page ships float16; parity needs
+  // `convert_weights.py --dtype float32`.
+  if (weights.dtype !== "float32") {
+    console.log(`\n${weightsDir} holds ${weights.dtype} weights. `
+      + "Parity needs float32 -- rerun tools/convert_weights.py --dtype float32.");
+    process.exit(2);
+  }
 
   const raw = testCase.inputs;
   const inputs = {

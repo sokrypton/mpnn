@@ -52,9 +52,17 @@ const state = {
   designMask: null,
   bias: new Float32Array(21),
   omitted: new Set(),
+  /**
+   * Position -> Float32Array(21) of bias values that replace the global table
+   * there, and Position -> Set of omitted amino acids. Sparse: only positions
+   * the user actually touched appear.
+   */
+  biasOverrides: new Map(),
+  omitOverrides: new Map(),
   designs: [],
   activeDesign: -1,
   profile: null,
+  scorePerPosition: null,
   hover: -1,
   encodedFor: null,
   /** Bumped on every structure load so a stale encode cannot be reused. */
@@ -166,6 +174,8 @@ async function loadStructureText(text, label) {
   state.structureId += 1;
   state.designMask = new Float32Array(structure.L).fill(1);
   state.membraneLabels = new Int32Array(structure.L);
+  state.biasOverrides.clear();
+  state.omitOverrides.clear();
   state.membraneVersion += 1;
   state.designs = [];
   state.activeDesign = -1;
@@ -259,6 +269,7 @@ async function ensureEncoded() {
     );
     $("design-btn").disabled = false;
     $("profile-btn").disabled = false;
+    $("score-btn").disabled = false;
     return true;
   } catch (error) {
     onProgress = null;
@@ -303,6 +314,7 @@ function renderChainToggles() {
 }
 
 function refreshSelection() {
+  if ($("bias-scope").value === "selected") renderBiasGrid();
   renderSequenceTrack();
   if (state.profile) renderLogo();
   redraw();
@@ -376,6 +388,13 @@ function colourFor(i) {
     case "rainbow":
       rgb = spectrumRgb(i / Math.max(s.L - 1, 1));
       break;
+    case "score": {
+      if (!state.scorePerPosition) return { rgb: [100, 116, 139], dim };
+      // 0 to ~3 nats covers everything from confident to badly out of place.
+      const t = Math.min(state.scorePerPosition[i] / 3, 1);
+      rgb = lerpRgb([74, 222, 128], [248, 113, 113], t);
+      break;
+    }
     case "membrane": {
       const label = state.membraneLabels ? state.membraneLabels[i] : 0;
       rgb = [[100, 116, 139], [251, 191, 36], [56, 189, 248]][label] ?? [100, 116, 139];
@@ -517,13 +536,73 @@ function topAAs(probs, i, n = 3) {
 // Amino-acid bias grid
 // ---------------------------------------------------------------------------
 
+function selectedPositions() {
+  const out = [];
+  if (!state.structure) return out;
+  for (let i = 0; i < state.structure.L; i++) if (state.designMask[i] > 0) out.push(i);
+  return out;
+}
+
+/**
+ * The bias currently shown in the grid.
+ *
+ * In "selected" scope this is the value shared by every selected position, or
+ * the global value where they disagree -- editing then writes to all of them,
+ * which is the behaviour that makes a mixed selection usable.
+ */
+function shownBias(v) {
+  if ($("bias-scope").value === "global") {
+    return { value: state.bias[v], omitted: state.omitted.has(v), override: false };
+  }
+  const positions = selectedPositions();
+  if (!positions.length) {
+    return { value: state.bias[v], omitted: state.omitted.has(v), override: false };
+  }
+  const first = state.biasOverrides.get(positions[0]);
+  const value = first ? first[v] : state.bias[v];
+  const omitted = (state.omitOverrides.get(positions[0]) ?? state.omitted).has(v);
+  const override = positions.some((p) => state.biasOverrides.has(p) || state.omitOverrides.has(p));
+  return { value, omitted, override };
+}
+
+function writeBias(v, value) {
+  if ($("bias-scope").value === "global") {
+    state.bias[v] = value;
+    return;
+  }
+  for (const p of selectedPositions()) {
+    if (!state.biasOverrides.has(p)) state.biasOverrides.set(p, Float32Array.from(state.bias));
+    state.biasOverrides.get(p)[v] = value;
+  }
+}
+
+function toggleOmit(v) {
+  if ($("bias-scope").value === "global") {
+    if (state.omitted.has(v)) state.omitted.delete(v);
+    else state.omitted.add(v);
+    return;
+  }
+  const positions = selectedPositions();
+  const turningOn = !(state.omitOverrides.get(positions[0]) ?? state.omitted).has(v);
+  for (const p of positions) {
+    if (!state.omitOverrides.has(p)) state.omitOverrides.set(p, new Set(state.omitted));
+    if (turningOn) state.omitOverrides.get(p).add(v);
+    else state.omitOverrides.get(p).delete(v);
+  }
+}
+
 function renderBiasGrid() {
   const wrap = $("aa-bias");
   wrap.innerHTML = "";
+  const scoped = $("bias-scope").value === "selected";
+  const nSelected = selectedPositions().length;
+
   for (let v = 0; v < 20; v++) {
     const aa = ALPHABET[v];
+    const shown = shownBias(v);
     const cell = document.createElement("div");
-    cell.className = "cell" + (state.omitted.has(v) ? " omitted" : "");
+    cell.className = "cell" + (shown.omitted ? " omitted" : "")
+      + (scoped && shown.override ? " override" : "");
 
     const letter = document.createElement("span");
     letter.className = "letter";
@@ -531,23 +610,32 @@ function renderBiasGrid() {
     letter.style.color = AA_COLORS[aa];
     letter.title = "click to omit";
     letter.onclick = () => {
-      if (state.omitted.has(v)) state.omitted.delete(v);
-      else state.omitted.add(v);
+      toggleOmit(v);
       renderBiasGrid();
     };
 
     const input = document.createElement("input");
     input.type = "number";
     input.step = "0.5";
-    input.value = String(state.bias[v]);
+    input.value = String(shown.value);
+    input.disabled = scoped && nSelected === 0;
     input.oninput = () => {
-      state.bias[v] = parseFloat(input.value) || 0;
+      writeBias(v, parseFloat(input.value) || 0);
+      renderBiasGrid();
     };
 
     cell.appendChild(letter);
     cell.appendChild(input);
     wrap.appendChild(cell);
   }
+
+  const overrides = new Set([...state.biasOverrides.keys(), ...state.omitOverrides.keys()]);
+  $("bias-clear-overrides").hidden = overrides.size === 0;
+  $("bias-summary").textContent = scoped
+    ? `Editing ${nSelected} selected position(s). ${overrides.size} position(s) carry an override.`
+    : (overrides.size
+      ? `${overrides.size} position(s) carry an override, which wins over these values.`
+      : "");
 }
 
 /** Expand the per-amino-acid bias into the [L, 21] array the model wants. */
@@ -555,8 +643,10 @@ function buildBias() {
   const L = state.structure.L;
   const bias = new Float32Array(L * 21);
   for (let i = 0; i < L; i++) {
+    const local = state.biasOverrides.get(i);
+    const omit = state.omitOverrides.get(i) ?? state.omitted;
     for (let v = 0; v < 20; v++) {
-      bias[i * 21 + v] = state.omitted.has(v) ? -1e9 : state.bias[v];
+      bias[i * 21 + v] = omit.has(v) ? -1e9 : (local ? local[v] : state.bias[v]);
     }
     bias[i * 21 + 20] = -1e9; // never emit X
   }
@@ -678,18 +768,94 @@ async function runProfile() {
   }
 }
 
+/** Parse a pasted sequence: one letter per residue, separators ignored. */
+function parseSequence(text, L) {
+  const letters = text.toUpperCase().replace(/[^A-Z]/g, "");
+  if (letters.length !== L) {
+    throw new Error(`expected ${L} residues, got ${letters.length}`);
+  }
+  const S = new Int32Array(L);
+  for (let i = 0; i < L; i++) {
+    const v = ALPHABET.indexOf(letters[i]);
+    if (v < 0 || v === 20) throw new Error(`unknown amino acid "${letters[i]}" at position ${i + 1}`);
+    S[i] = v;
+  }
+  return S;
+}
+
+async function runScore() {
+  if (!await ensureEncoded()) return;
+  const button = $("score-btn");
+  button.disabled = true;
+  let S;
+  try {
+    S = parseSequence($("score-seq").value, state.structure.L);
+  } catch (error) {
+    setStatus("score-status", error.message, "error");
+    button.disabled = false;
+    return;
+  }
+  const mode = $("score-mode").value;
+  setStatus("score-status", "Scoring…", "busy");
+  showProgress(0);
+  onProgress = (message) => {
+    if (message.stage === "score") showProgress(message.received / message.total);
+  };
+  try {
+    const result = await call("score", {
+      S: Array.from(S),
+      mode,
+      orders: parseInt($("score-orders").value, 10) || 8,
+      chainMask: Array.from(state.designMask),
+      seed: 0,
+    });
+    state.scorePerPosition = new Float32Array(result.perPosition);
+    const native = state.structure.S;
+    let same = 0;
+    for (let i = 0; i < S.length; i++) if (S[i] === native[i]) same++;
+    const spread = result.sd === null
+      ? ""
+      : ` ± ${result.sd.toFixed(4)} over ${result.orders} orders`;
+    setStatus(
+      "score-status",
+      `nll ${result.mean.toFixed(4)}${spread}, `
+      + `${((same / S.length) * 100).toFixed(0)}% identical to the input structure's sequence `
+      + `(${(result.ms / 1000).toFixed(2)} s)`,
+    );
+    $("color-mode").value = "score";
+    redraw();
+  } catch (error) {
+    setStatus("score-status", `Failed: ${error.message}`, "error");
+  } finally {
+    onProgress = null;
+    hideProgress();
+    button.disabled = false;
+  }
+}
+
+const MODE_TEXT = {
+  none: "No position sees any amino acid — this is what the backbone alone implies. "
+    + "One decoder pass.",
+  "all-but-self": "Pseudo-likelihood: every position is scored as if it were decoded last, "
+    + "seeing all the others and none of itself, in a single pass (ar_mask = 1 − I). "
+    + "Cheap and stable — see the README for how it compares with the L-pass version.",
+  order: "The true autoregressive likelihood, which depends on the decoding order, so it is "
+    + "averaged over that many random ones. This is the number the sampler reports for its own "
+    + "designs, so it is the like-for-like comparison against them.",
+  exact: "One decoder pass per position, each putting that position last. L times the cost, and "
+    + "still order-dependent: the other L−1 positions have to be decoded in some order too.",
+};
+
 function describeProfileMode(mode) {
-  if (mode === "none") {
-    return "No position sees any amino acid — this is what the backbone alone implies. "
-      + "One decoder pass, exact.";
-  }
-  if (mode === "all-but-self") {
-    return "Every position sees all the others in one pass. Fast, but because the decoder is "
-      + "three layers deep a residue's own identity leaks back through two-hop paths, so treat "
-      + "this as an approximation of the conditional profile.";
-  }
-  return "Each position is decoded last in its own pass, so it genuinely sees every other "
-    + "residue and nothing of itself. Exact, and costs one decoder pass per position.";
+  return MODE_TEXT[mode] ?? "";
+}
+
+function describeScoreMode() {
+  const mode = $("score-mode").value;
+  $("score-orders-row").hidden = mode !== "order";
+  $("score-hint").textContent = `${MODE_TEXT[mode]} Lower is better. Paste one letter per `
+    + "residue; slashes and whitespace are ignored, so a multi-chain sequence can be pasted as "
+    + "it is displayed.";
 }
 
 function fastaText() {
@@ -819,19 +985,34 @@ $("membrane-global").onchange = (event) => {
   ensureEncoded();
 };
 
+$("score-btn").onclick = runScore;
+$("score-mode").onchange = describeScoreMode;
+describeScoreMode();
+$("score-native").onclick = () => {
+  if (state.structure) $("score-seq").value = state.structure.sequence;
+};
+
 $("design-btn").onclick = runDesign;
 $("profile-btn").onclick = runProfile;
+$("bias-scope").onchange = renderBiasGrid;
 $("bias-reset").onclick = () => {
   state.bias.fill(0);
   state.omitted.clear();
+  state.biasOverrides.clear();
+  state.omitOverrides.clear();
+  renderBiasGrid();
+};
+$("bias-clear-overrides").onclick = () => {
+  state.biasOverrides.clear();
+  state.omitOverrides.clear();
   renderBiasGrid();
 };
 $("omit-cys").onclick = () => {
-  state.omitted.add(ALPHABET.indexOf("C"));
+  toggleOmit(ALPHABET.indexOf("C"));
   renderBiasGrid();
 };
 $("omit-met").onclick = () => {
-  state.omitted.add(ALPHABET.indexOf("M"));
+  toggleOmit(ALPHABET.indexOf("M"));
   renderBiasGrid();
 };
 

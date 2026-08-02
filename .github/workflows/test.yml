@@ -71,6 +71,9 @@ jobs:
           node test/sampling.mjs /tmp/sample_golden.json /tmp/sample_cases.json /tmp/w32
           MPNN_NO_SIMD=1 node test/sampling.mjs /tmp/sample_golden.json /tmp/sample_cases.json /tmp/w32
 
+      - name: Pseudo-likelihood behaves as the README says
+        run: node test/pseudolikelihood.mjs /tmp/w32 3
+
       - name: The committed kernel matches its source
         run: |
           sudo apt-get install -y --no-install-recommends clang lld
