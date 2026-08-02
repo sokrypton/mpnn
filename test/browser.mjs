@@ -16,6 +16,7 @@ const TYPES = {
   ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript",
   ".css": "text/css", ".json": "application/json", ".mpnn": "application/octet-stream",
   ".pdb": "text/plain", ".cif": "text/plain", ".png": "image/png",
+  ".wasm": "application/wasm",
 };
 
 const server = createServer(async (req, res) => {
@@ -80,6 +81,9 @@ await page.setInputFiles("#file-input", pdbPath);
 await waitReady(76, 180000);
 console.log("load :", (await page.textContent("#load-status")).trim());
 console.log("model:", (await page.textContent("#model-status")).trim());
+const kernel = await page.textContent("#kernel-status");
+console.log("kernel:", kernel.trim());
+if (!/SIMD/.test(kernel)) problems.push("the SIMD kernel did not load in the browser");
 
 const canvasInk = await page.evaluate(() => {
   const c = document.getElementById("viewer");
@@ -220,8 +224,17 @@ if (!process.argv.includes("--no-ligand")) {
   console.log(`near-ligand selection: ${selected} of ${total} residues`);
   if (selected === 0 || selected >= total) problems.push("near-ligand selection looks wrong");
 
+  // A fixed seed and a warmer temperature, so "did the sampler actually move"
+  // is a deterministic question. At T = 0.1 LigandMPNN reproduces a biotin site
+  // exactly, which is a real result rather than a failure -- but it makes the
+  // assertion below vacuous.
   await page.fill("#batch", "1");
   await page.evaluate(() => document.getElementById("batch").dispatchEvent(new Event("input")));
+  await page.fill("#temperature", "0.6");
+  await page.evaluate(() => document.getElementById("temperature")
+    .dispatchEvent(new Event("input")));
+  await page.uncheck("#random-seed");
+  await page.fill("#seed", "12345");
   await page.click("#design-btn");
   await page.waitForFunction(
     () => /sequences in/.test(document.getElementById("design-status").textContent),

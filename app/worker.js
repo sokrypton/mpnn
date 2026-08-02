@@ -3,8 +3,15 @@
 // Protocol: the page posts {id, type, ...} and gets back {id, ok, ...}, plus
 // unsolicited {type: "progress"} messages while long jobs run.
 
+import { enableAcceleration } from "../mpnn/accel.js";
 import { AR, Model } from "../mpnn/model.js";
 import { Weights } from "../mpnn/weights.js";
+
+// Best effort. If the module is missing or the runtime has no SIMD this
+// resolves to null and everything runs on the JS kernel instead.
+const acceleration = enableAcceleration(new URL("../wasm/kernels.wasm", import.meta.url))
+  .then((a) => Boolean(a))
+  .catch(() => false);
 
 /** @type {Map<string, Model>} */
 const models = new Map();
@@ -55,9 +62,11 @@ function mulberry32(seed) {
 
 const handlers = {
   async load({ name, baseUrl }) {
+    const simd = await acceleration;
     current = await loadModel(name, baseUrl);
     encoded = null;
     return {
+      simd,
       modelType: current.modelType,
       k: current.K,
       atomContextNum: current.M,

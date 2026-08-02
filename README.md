@@ -81,6 +81,8 @@ mpnn/               the engine, usable on its own from Node or a browser
   model.js            encode / score / profile / sample
   pdb.js              PDB + mmCIF parsing
   weights.js          .mpnn file reader
+  accel.js            optional WebAssembly SIMD accelerator
+wasm/kernels.c      the SIMD kernels; build.sh rebuilds kernels.wasm
 weights/            13 converted checkpoints (~55 MB total, fp16)
 tools/              checkpoint conversion, constant generation, golden tensors
 test/               parity against PyTorch, plus a browser smoke test
@@ -187,72 +189,89 @@ node test/browser.mjs --shot page.png
 
 ## Speed
 
-Measured in Node 22 on one core of the development container, so treat these as
-a pessimistic floor rather than a benchmark.
+Measured on one core of the development container with Node 22, so treat these
+as a pessimistic floor rather than a benchmark.
 
-| | L = 76 (ProteinMPNN) | L = 121 (LigandMPNN) |
+| | ProteinMPNN, L = 76 | LigandMPNN, L = 121 |
 | --- | --- | --- |
-| encode | 1.5 s | 14 s |
-| sample | ~1.1 s / sequence | ~1.2 s / sequence |
-| profile (backbone only) | 1.1 s | — |
+| encode | **0.52 s** (was 1.4) | **1.04 s** (was 13.3) |
+| sample | **76 ms/seq** (was 1014) | **91 ms/seq** (was 1113) |
+| profile | **0.13 s** (was 1.04) | **0.09 s** (was 1.12) |
 
-Three things are already done, in descending order of how much they mattered:
+Between 2.7x and 13x depending on what you ask for. Four things got it there,
+and the order matters: every algorithmic change came before any kernel work,
+because a faster kernel only makes the remaining multiply-adds cheaper.
 
-1. **The encoder runs once per structure.** It does not depend on the sequence,
-   so `encode()` returns a handle that every sample, score and profile reuses.
-   This is the ColabDesign split and it is worth more than any kernel work.
+**1. The encoder runs once per structure.** It does not depend on the sequence,
+so `encode()` returns a handle that every sample, score and profile reuses.
+This is the ColabDesign split and it is worth more than any kernel.
 
-2. **A Linear over a concatenation is split into per-block projections.** Every
-   message MLP starts with `W1 · [h_V_i ‖ h_E_ij ‖ h_V_j]`, and a Linear
-   distributes over a concatenation:
+**2. A Linear over a concatenation splits into per-block projections.** Every
+message MLP begins with `W1 · [a ‖ b ‖ …]`, and a Linear distributes over a
+concatenation: `W1 · [a ‖ b ‖ c] = W1a·a + W1b·b + W1c·c`.
 
-   ```
-   W1 · [a ‖ b ‖ c]  =  W1a · a  +  W1b · b  +  W1c · c
-   ```
+In the *encoder* two of the three blocks are per-residue rather than per-edge.
+Projecting those once and gathering them onto edges turns an
+`[L·K, 384] × [384, 128]` product into an `[L·K, 128] × [128, 128]` one — about
+1.6x fewer multiply-adds.
 
-   Two of those three blocks are per-*residue*, not per-*edge*. Projecting them
-   once per residue and gathering onto edges turns an `[L·K, 384] × [384, 128]`
-   product into an `[L·K, 128] × [128, 128]` one plus two tiny `[L, 128]` ones —
-   about 1.6× fewer multiply-adds through the encoder.
+In the *decoder* it is better than that. W1 there takes
+`[h_V_i ‖ h_E ‖ h_S_j ‖ h_V_j]`: three of the four blocks are per-node, and the
+`h_E` block never changes — not between layers, not between decode steps, not
+across the batch. So `W1e · h_E` is computed once per structure and cached on
+the encoding. During sampling, `h_S` and the layer stacks change exactly one row
+per step, so their projections are maintained incrementally instead of being
+recomputed. The decoder's inner loop ends up with **no per-edge matmul at all**,
+just gathers of four precomputed tables. 2.5x on sampling, before any SIMD.
 
-3. **The dense kernel blocks 8 rows against each pass over the weights.** The
-   naive triple loop streams the whole weight matrix from L2 once per row and is
-   bandwidth bound; blocking roughly doubles throughput (1.15 → 2.43 GFLOP/s on
-   a representative `[3648, 384] × [384, 128]`).
+**3. Ligand atom pairs are deduplicated.** This is why LigandMPNN used to cost
+ten times ProteinMPNN. Its two atom-context layers message-pass among the M = 25
+nearest ligand atoms *of every residue* — 75,625 rows for streptavidin. But an
+atom pair's contribution depends only on which two ligand atoms it is, never on
+the residue looking at them, and biotin has 16 atoms: **289 distinct pairs, not
+75,625**. The pair edge embedding is pair-pure, and so is the entire message of
+the first atom layer, because that layer's node input is the atom-type embedding
+— also a function of the atom alone. The second layer's node input has absorbed
+a per-residue sum and is no longer pair-pure, but its edge half still is, and
+its rows are restricted to pairs whose mask is 1 (59% of biotin's slots are zero
+padding). 3.1x on LigandMPNN's encode.
 
-### What is next, and why
+**4. A WebAssembly SIMD kernel.** After all of that, a CPU profile put 90% of
+the remaining time in a single function. `wasm/kernels.c` is ~200 lines of
+`-msimd128` C, built with plain clang and wasm-ld — no Emscripten — and reaches
+**~22 GFLOP/s against the JS kernel's ~2.4**, roughly 9x on the shapes that
+matter.
 
-These are ordered by expected payoff. Nothing here is started; the notes are
-here so the reasoning does not have to be rediscovered.
+Two things about how it is integrated, both taken from CIRPIN-web:
 
-- **A WASM SIMD kernel.** The obvious next step and the largest remaining lever.
-  The shape to copy is CIRPIN-web's: one coarse entry point, all weights and
-  intermediates living in a single pre-allocated `WebAssembly.Memory` arena so
-  nothing is copied per call, and the JS staying as the reference implementation
-  and the fallback when instantiation fails. `mpnn/arena.js` already centralises
-  every scratch buffer, which is the part that would otherwise need unpicking.
-  Expect 2-4× on top of the blocked JS kernel.
+- **JS stays the reference.** `mpnn/ops.js` defines what the model computes; the
+  kernel has to agree with it, and the parity suite runs against both
+  (`MPNN_NO_SIMD=1` selects the JS path). There is no feature probe — a runtime
+  without SIMD fails to validate a module containing `v128`, so instantiation
+  *is* the probe, and any failure falls back silently.
+- **The entry points are coarse.** A bare `gelu` export would not pay: GELU is
+  memory bound, so staging its array in and back out costs roughly what the
+  arithmetic does. Instead `tail2_f32` runs a whole `gelu → W2 → gelu → W3`
+  chain inside wasm memory, and `ff_f32` a whole feed-forward. That turned GELU
+  from 29% of runtime into part of the matmul.
 
-- **Extend the block split into the decoder.** The decoder's W1 takes
-  `[h_V_i ‖ h_E ‖ h_S_j ‖ h_V_j]` — *three* of four blocks are per-node, and the
-  `h_E` block never changes at all, so `W1e · h_E` can be computed once per
-  structure and shared across every layer, every decode step and the whole
-  batch. During sampling `h_S` and the layer stacks change one row per step, so
-  their projections can be maintained incrementally, which removes the W1
-  matmul from the inner loop almost entirely. Roughly 2× on scoring and ~3× on
-  sampling. `makeDecoderLayer` already exposes `.blocks` and `.applyPre()` for
-  exactly this; only `model.js` needs to change.
+`exp` in the kernel is range reduction plus a degree-6 series, good to about
+1e-7 relative — float32 epsilon. Agreement with PyTorch is unchanged by any of
+this: still ~1e-5 on the logits, on both kernels.
 
-- **Cache the ligand atom-pair messages.** This is why LigandMPNN's encode is
-  ~10× ProteinMPNN's. The two `y_context_encoder` layers message-pass among the
-  M = 25 nearest ligand atoms *per residue*, which is `L · M · M` = 75 625 rows
-  for streptavidin. But biotin only has 16 atoms, so there are at most 256
-  distinct atom pairs — and in the first of the two layers the entire message is
-  a pure function of the atom pair, not of the residue. Deduplicating would cut
-  that layer by two orders of magnitude on small ligands.
+Rebuild with `./wasm/build.sh` (needs clang with the wasm32 target). The
+committed `kernels.wasm` is 10 KB, so most people never will.
 
-- **Stream results.** `sample()` currently returns the whole batch at once; the
-  page could show sequences as they finish.
+### What is left
+
+- **Batching helps less than it looks.** Eight sequences cost about five times
+  one, not one: the encoder is shared, but decode work is genuinely per-sample.
+  There is no more amortisation to find there — only cheaper steps.
+- **Threads.** Nothing here uses more than one core. A `SharedArrayBuffer`
+  worker pool would scale nearly linearly over a batch, since samples are
+  independent, but it needs COOP/COEP headers that GitHub Pages does not send.
+- **The rest of the encoder** is three `[L·K, 128] × [128, 128]` products per
+  layer, which no rearrangement removes.
 
 ## Weights
 

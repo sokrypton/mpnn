@@ -209,15 +209,23 @@ function atomTypeLinear(out, off, lin, cout, t) {
  *
  * @param {Float32Array} ligXyz [A, 3]
  * @param {Int32Array}   ligType [A] atom-type index
- * @returns {{Y: Float32Array, Yt: Int32Array, Ym: Float32Array, Dclosest: Float32Array}}
+ * `Yg` records which global ligand atom landed in each slot, or -1 for the
+ * zero padding used when a residue has fewer than M atoms in reach. Everything
+ * downstream that depends only on *which* atoms are involved -- the atom-pair
+ * distances, and therefore the whole first round of atom-to-atom message
+ * passing -- is deduplicated through it.
+ *
+ * @returns {{Y: Float32Array, Yt: Int32Array, Ym: Float32Array,
+ *            Yg: Int32Array, Dclosest: Float32Array}}
  */
 export function nearestLigandAtoms(CB, mask, ligXyz, ligType, ligMask, L, M) {
   const A = ligType.length;
   const Y = new Float32Array(L * M * 3);
   const Yt = new Int32Array(L * M);
   const Ym = new Float32Array(L * M);
+  const Yg = new Int32Array(L * M).fill(-1);
   const Dclosest = new Float32Array(L);
-  if (A === 0) return { Y, Yt, Ym, Dclosest };
+  if (A === 0) return { Y, Yt, Ym, Yg, Dclosest };
 
   const take = Math.min(M, A);
   const row = new Float32Array(A);
@@ -241,9 +249,73 @@ export function nearestLigandAtoms(CB, mask, ligXyz, ligType, ligMask, L, M) {
       Y[(i * M + s) * 3 + 2] = ligXyz[a * 3 + 2];
       Yt[i * M + s] = ligType[a];
       Ym[i * M + s] = ligMask[a];
+      Yg[i * M + s] = a;
     }
   }
-  return { Y, Yt, Ym, Dclosest };
+  return { Y, Yt, Ym, Yg, Dclosest };
+}
+
+/**
+ * Deduplicate the M x M atom pairs each residue sees down to the distinct
+ * global atom pairs across the whole structure.
+ *
+ * The atom-pair distance depends only on which two ligand atoms are involved,
+ * never on the residue looking at them, so a structure with a 16-atom ligand
+ * has at most 17 x 17 distinct pairs (padding included) where the naive loop
+ * computes L x 25 x 25 of them -- 289 against 75625 for streptavidin. Every
+ * quantity derived purely from the pair inherits the same reduction, which for
+ * the first atom-context layer is its entire message.
+ *
+ * @param {Int32Array} Yg [L, M] global atom index per slot, -1 for padding
+ * @param {number} A total ligand atoms, used to key the pair map
+ * @returns {{pairId: Int32Array, count: number, dist: Float32Array}}
+ *          `pairId` is [L, M, M]; `dist` is one distance per distinct pair
+ */
+export function ligandPairTable(Yg, Y, L, M, A) {
+  const pairId = new Int32Array(L * M * M);
+  const seen = new Map();
+  const dist2Of = [];
+  let count = 0;
+
+  for (let i = 0; i < L; i++) {
+    for (let m = 0; m < M; m++) {
+      const ga = Yg[i * M + m];
+      const ao = (i * M + m) * 3;
+      for (let n = 0; n < M; n++) {
+        const gb = Yg[i * M + n];
+        // Padding always sits at the origin, the same point for every residue,
+        // so (-1, b) is a well-defined pair and shares one entry.
+        const key = (ga + 1) * (A + 1) + (gb + 1);
+        let id = seen.get(key);
+        if (id === undefined) {
+          id = count++;
+          seen.set(key, id);
+          dist2Of.push(dist(Y, ao, Y, (i * M + n) * 3));
+        }
+        pairId[(i * M + m) * M + n] = id;
+      }
+    }
+  }
+  return { pairId, count, dist: Float32Array.from(dist2Of) };
+}
+
+/** RBF expansion of one distance per distinct pair. */
+export function pairRbf(dists, count, out) {
+  out = out ?? new Float32Array(count * RBF.count);
+  for (let p = 0; p < count; p++) rbfInto(out, p * RBF.count, dists[p]);
+  return out;
+}
+
+/**
+ * The atom-type embedding, one row per element rather than per (residue, slot).
+ *
+ * @returns {Float32Array} [120, hidden]
+ */
+export function atomTypeEmbedding(w, prefix, cout) {
+  const lin = w.linear(prefix);
+  const out = new Float32Array(N_TYPE * cout);
+  for (let t = 0; t < N_TYPE; t++) atomTypeLinear(out, t * cout, lin, cout, t);
+  return out;
 }
 
 /**

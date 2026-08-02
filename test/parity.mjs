@@ -7,8 +7,15 @@ import { readFileSync } from "node:fs";
 
 import { AR, Model } from "../mpnn/model.js";
 import { Weights } from "../mpnn/weights.js";
+import { enableAcceleration } from "../mpnn/accel.js";
 
 const [, , refPath, inputsPath, weightsDir] = process.argv;
+const wasmPath = new URL("../wasm/kernels.wasm", import.meta.url);
+const simd = process.env.MPNN_NO_SIMD
+  ? null
+  : await enableAcceleration(readFileSync(wasmPath).buffer);
+console.log(`kernel: ${simd ? "wasm simd" : "javascript"}`);
+
 const reference = JSON.parse(readFileSync(refPath, "utf8"));
 const cases = JSON.parse(readFileSync(inputsPath, "utf8"));
 

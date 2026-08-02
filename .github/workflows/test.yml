@@ -43,7 +43,7 @@ jobs:
           python tools/gen_constants.py --ref "${{ steps.ref.outputs.dir }}" --out /tmp/constants.js
           diff /tmp/constants.js mpnn/constants.js
 
-      - name: Parity against PyTorch
+      - name: Parity against PyTorch (both kernels)
         run: |
           node test/dump_inputs.mjs /tmp/inputs.json \
             "1ubq=assets/1ubq.pdb=proteinmpnn_v_48_020=protein_mpnn" \
@@ -55,6 +55,14 @@ jobs:
             --checkpoints "${{ steps.ref.outputs.dir }}/data/model_params" \
             --inputs /tmp/inputs.json --out /tmp/reference.json
           node test/parity.mjs /tmp/reference.json /tmp/inputs.json /tmp/w32
+          MPNN_NO_SIMD=1 node test/parity.mjs /tmp/reference.json /tmp/inputs.json /tmp/w32
+
+      - name: The committed kernel matches its source
+        run: |
+          sudo apt-get install -y --no-install-recommends clang lld
+          cp wasm/kernels.wasm /tmp/kernels.wasm
+          ./wasm/build.sh
+          cmp /tmp/kernels.wasm wasm/kernels.wasm
 
   browser:
     runs-on: ubuntu-latest

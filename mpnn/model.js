@@ -12,14 +12,16 @@
 // the all-zero mask gives backbone-only logits in a single pass.
 
 import { Arena } from "./arena.js";
-import { ALPHABET } from "./constants.js";
+import { ALPHABET, MESSAGE_SCALE } from "./constants.js";
 import {
+  atomTypeEmbedding,
   computeBackbone,
   edgeFeatures,
-  ligandEdgeChunk,
   ligandNodeFeatures,
+  ligandPairTable,
   nearestLigandAtoms,
   neighborGraph,
+  pairRbf,
 } from "./features.js";
 import { makeDecoderLayer, makeEncoderLayer } from "./layers.js";
 import { gatherNodes, layerNorm, linear, logSoftmax, softmax } from "./ops.js";
@@ -164,24 +166,52 @@ export class Model {
     const types = inputs.ligandType ?? new Int32Array(0);
     const ligMask = inputs.ligandMask ?? new Float32Array(types.length).fill(1);
 
-    const { Y, Yt, Ym, Dclosest } = nearestLigandAtoms(bb.CB, mask, xyz, types, ligMask, L, M);
+    const { Y, Yt, Ym, Yg, Dclosest } = nearestLigandAtoms(
+      bb.CB, mask, xyz, types, ligMask, L, M);
     if (inputs.useAtomContext === false) Ym.fill(0);
-    const { V, YNodes } = ligandNodeFeatures(this.w, bb, Y, Yt, L, M);
-    return { Y, Yt, Ym, Dclosest, V, YNodes, M, nAtoms: types.length };
+    const { V } = ligandNodeFeatures(this.w, bb, Y, Yt, L, M);
+
+    const pairs = ligandPairTable(Yg, Y, L, M, types.length);
+    // The first atom of each distinct pair, so its type embedding can be added
+    // to the cached message without another lookup table.
+    const pairTypeA = new Int32Array(pairs.count);
+    for (let i = 0; i < L; i++) {
+      for (let m = 0; m < M; m++) {
+        for (let n = 0; n < M; n++) {
+          pairTypeA[pairs.pairId[(i * M + m) * M + n]] = Yt[i * M + m];
+        }
+      }
+    }
+    return { Y, Yt, Ym, Yg, Dclosest, V, M, pairs, pairTypeA, nAtoms: types.length };
   }
 
   /**
    * Fold the ligand context into the node states.
    *
-   * Every residue's ligand block is independent, so this runs chunk-outer /
-   * layer-inner: the [rows, M, M, 128] atom-pair edges are built once per chunk
-   * and both context iterations consume them before the chunk is dropped.
+   * This is where LigandMPNN spends nearly all of its time, because the two
+   * atom-context layers message-pass among the M nearest ligand atoms *of every
+   * residue*: L x M x M rows, 75625 of them for streptavidin at M = 25. Two
+   * observations cut most of that away.
+   *
+   * First, an atom pair's contribution depends only on which two ligand atoms
+   * it is, never on the residue looking at them. Biotin has 16 atoms, so there
+   * are 289 distinct pairs including padding, not 75625. The atom-pair edge
+   * embedding is pair-pure, and so is the *entire* message of the first layer,
+   * because that layer's node input is the atom-type embedding -- also a
+   * function of the atom alone. Both are computed once per distinct pair here.
+   *
+   * Second, the second layer's node input has absorbed a per-residue sum and is
+   * no longer pair-pure, so its W2/W3 still run per (residue, atom, atom) --
+   * but only over pairs whose mask is 1. When the ligand has fewer atoms than
+   * M, the rest of every row is zero padding contributing nothing, which for
+   * biotin is 59% of the rows.
    */
   _encodeLigandContext(hV, ligand, mask, L) {
     const w = this.w;
     const H = this.hidden;
     const M = ligand.M;
     const a = this.arena;
+    const { pairId, count: nPairs } = ligand.pairs;
 
     const wV = w.linear("W_v");
     const wC = w.linear("W_c");
@@ -193,55 +223,144 @@ export class Model {
     const hEContext = linear(ligand.V, wV.weight, wV.bias, L * M, H, H);
     const hVC = linear(hV, wC.weight, wC.bias, L, H, H);
 
-    for (let start = 0; start < L; start += LIGAND_CHUNK) {
-      const end = Math.min(L, start + LIGAND_CHUNK);
-      const rows = end - start;
+    // --- pair-pure quantities, once for the whole structure ----------------
+    // LayerNorm(W_y_edges · RBF(d)) then W_edges_y, over distinct pairs.
+    const rbf = pairRbf(ligand.pairs.dist, nPairs);
+    const yEdgesLin = w.linear("features.y_edges");
+    const normYEdges = w.norm("features.norm_y_edges");
+    let yEdges = linear(rbf, yEdgesLin.weight, yEdgesLin.bias, nPairs, 16, H);
+    layerNorm(yEdges, normYEdges.gamma, normYEdges.beta, nPairs, H, yEdges);
+    yEdges = linear(yEdges, wEdgesY.weight, wEdgesY.bias, nPairs, H, H);
 
-      const yEdgesRaw = ligandEdgeChunk(
-        w, ligand.Y, M, start, end,
-        a.f32("lig.rbf", rows * M * M * 16), a.f32("lig.edges0", rows * M * M * H),
-      );
-      const yEdges = linear(yEdgesRaw, wEdgesY.weight, wEdgesY.bias, rows * M * M, H, H,
-        a.f32("lig.edges", rows * M * M * H));
+    // Atom-type node embedding, one row per element rather than per slot.
+    const normYNodes = w.norm("features.norm_y_nodes");
+    let nodeByType = atomTypeEmbedding(w, "features.y_nodes", H);
+    layerNorm(nodeByType, normYNodes.gamma, normYNodes.beta, 120, H, nodeByType);
+    nodeByType = linear(nodeByType, wNodesY.weight, wNodesY.bias, 120, H, H);
 
-      let yNodes = linear(
-        ligand.YNodes.subarray(start * M * H, end * M * H),
-        wNodesY.weight, wNodesY.bias, rows * M, H, H, a.f32("lig.nodes", rows * M * H),
-      );
-      const yNodesOut = a.f32("lig.nodesOut", rows * M * H);
+    // --- layer 0: the whole message is a function of the pair --------------
+    const layer0 = this.atomLayers[0];
+    const [W0v, W0e] = layer0.blocks;
+    const pairH1 = a.f32("lig.pairH1", nPairs * H);
+    {
+      // W1 · [node(type of a) ‖ edge(pair)] = W1v · node + W1e · edge.
+      const nodePart = linear(nodeByType, W0v, layer0.bias, 120, H, H,
+        a.f32("lig.nodePart", 120 * H));
+      linear(yEdges, W0e, null, nPairs, H, H, pairH1);
+      for (let p = 0; p < nPairs; p++) {
+        const t = ligand.pairTypeA[p] * H;
+        const o = p * H;
+        for (let d = 0; d < H; d++) pairH1[o + d] += nodePart[t + d];
+      }
+    }
+    const pairMsg0 = layer0.tail(pairH1, nPairs, a.f32("lig.pairMsg0", nPairs * H));
 
-      const ymChunk = ligand.Ym.subarray(start * M, end * M);
-      const ymEdges = a.f32("lig.ymEdges", rows * M * M);
-      for (let i = 0; i < rows; i++) {
+    const layer1 = this.atomLayers[1];
+    const [W1v, W1e] = layer1.blocks;
+    const pairEdge1 = linear(yEdges, W1e, null, nPairs, H, H, a.f32("lig.pairEdge1", nPairs * H));
+
+    // --- per residue -------------------------------------------------------
+    const yNodes = a.f32("lig.yNodes", L * M * H);
+    for (let i = 0; i < L * M; i++) {
+      yNodes.set(nodeByType.subarray(ligand.Yt[i] * H, (ligand.Yt[i] + 1) * H), i * H);
+    }
+
+    const dh = a.f32("lig.dh", L * M * H);
+    const yNext = a.f32("lig.yNext", L * M * H);
+    const scale = 1 / MESSAGE_SCALE;
+
+    // Layer 0: gather the cached pair messages and sum them.
+    dh.fill(0, 0, L * M * H);
+    for (let i = 0; i < L; i++) {
+      for (let m = 0; m < M; m++) {
+        const row = i * M + m;
+        if (ligand.Ym[row] === 0) continue;
+        const to = row * H;
+        for (let n = 0; n < M; n++) {
+          if (ligand.Ym[i * M + n] === 0) continue;
+          const from = pairId[row * M + n] * H;
+          for (let d = 0; d < H; d++) dh[to + d] += pairMsg0[from + d];
+        }
+        for (let d = 0; d < H; d++) dh[to + d] *= scale;
+      }
+    }
+    layer0.finish(yNodes, dh, ligand.Ym, L * M, yNext);
+    yNodes.set(yNext.subarray(0, L * M * H));
+
+    // Context layer 0.
+    this._contextStep(0, hVC, hEContext, yNodes, mask, ligand, L, M);
+
+    // Layer 1: node half is per (residue, atom) now, edge half is still cached.
+    const pa = linear(yNodes, W1v, layer1.bias, L * M, H, H, a.f32("lig.pa", L * M * H));
+    dh.fill(0, 0, L * M * H);
+    {
+      // Only unmasked pairs contribute, so build a compacted batch of rows.
+      const CAP = 8192;
+      const h1 = a.f32("lig.h1", CAP * H);
+      const msg = a.f32("lig.msg", CAP * H);
+      const owner = new Int32Array(CAP);
+      let n1 = 0;
+      const flush = () => {
+        if (!n1) return;
+        layer1.tail(h1, n1, msg);
+        for (let r = 0; r < n1; r++) {
+          const to = owner[r] * H;
+          const from = r * H;
+          for (let d = 0; d < H; d++) dh[to + d] += msg[from + d];
+        }
+        n1 = 0;
+      };
+      for (let i = 0; i < L; i++) {
         for (let m = 0; m < M; m++) {
+          const row = i * M + m;
+          if (ligand.Ym[row] === 0) continue;
+          const po = row * H;
           for (let n = 0; n < M; n++) {
-            ymEdges[(i * M + m) * M + n] = ymChunk[i * M + m] * ymChunk[i * M + n];
+            if (ligand.Ym[i * M + n] === 0) continue;
+            const eo = pairId[row * M + n] * H;
+            const to = n1 * H;
+            for (let d = 0; d < H; d++) h1[to + d] = pa[po + d] + pairEdge1[eo + d];
+            owner[n1++] = row;
+            if (n1 === CAP) flush();
           }
         }
       }
-
-      const cat = a.f32("lig.cat", rows * M * H * 2);
-      const hVCChunk = hVC.subarray(start * H, end * H);
-      const hVCOut = a.f32("lig.hVCOut", rows * H);
-
-      for (let it = 0; it < 2; it++) {
-        this.atomLayers[it](yNodes, yEdges, ymChunk, ymEdges, rows * M, M, yNodesOut);
-        yNodes.set(yNodesOut);
-
-        for (let r = 0; r < rows * M; r++) {
-          cat.set(hEContext.subarray((start * M + r) * H, (start * M + r + 1) * H), r * 2 * H);
-          cat.set(yNodes.subarray(r * H, (r + 1) * H), r * 2 * H + H);
-        }
-        this.contextLayers[it](
-          hVCChunk, cat, mask.subarray(start, end), ymChunk, rows, M, hVCOut,
-        );
-        hVCChunk.set(hVCOut);
-      }
+      flush();
     }
+    for (let i = 0; i < L * M * H; i++) dh[i] *= scale;
+    layer1.finish(yNodes, dh, ligand.Ym, L * M, yNext);
+    yNodes.set(yNext.subarray(0, L * M * H));
+
+    // Context layer 1.
+    this._contextStep(1, hVC, hEContext, yNodes, mask, ligand, L, M);
 
     const projected = linear(hVC, vC.weight, vC.bias, L, H, H);
     layerNorm(projected, vCNorm.gamma, vCNorm.beta, L, H, projected);
     for (let i = 0; i < L * H; i++) hV[i] += projected[i];
+  }
+
+  /** One residue-level context layer: h_V_C attends over its ligand atoms. */
+  _contextStep(it, hVC, hEContext, yNodes, mask, ligand, L, M) {
+    const H = this.hidden;
+    const a = this.arena;
+    const chunk = 256;
+    const cat = a.f32("lig.cat", chunk * M * H * 2);
+    const out = a.f32("lig.hVCOut", chunk * H);
+
+    for (let start = 0; start < L; start += chunk) {
+      const rows = Math.min(chunk, L - start);
+      for (let r = 0; r < rows * M; r++) {
+        const src = (start * M + r) * H;
+        cat.set(hEContext.subarray(src, src + H), r * 2 * H);
+        cat.set(yNodes.subarray(src, src + H), r * 2 * H + H);
+      }
+      this.contextLayers[it](
+        hVC.subarray(start * H, (start + rows) * H), cat,
+        mask.subarray(start, start + rows), ligand.Ym.subarray(start * M, (start + rows) * M),
+        rows, M, out.subarray(0, rows * H),
+      );
+      hVC.set(out.subarray(0, rows * H), start * H);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -291,6 +410,38 @@ export class Model {
   }
 
   /**
+   * Per-layer pieces of W1 that do not depend on the sequence, cached on the
+   * encoding.
+   *
+   * W1's input is [h_V_i ‖ h_E_ij ‖ h_S_j ‖ h_V_j]. The h_E block is the only
+   * per-edge one, and it never changes -- not between decoder layers, not
+   * between decode steps, not across a batch. Projecting it once turns the
+   * decoder's dominant [rows·K, 512] × [512, 128] product into a gather.
+   *
+   * Returns null when the projection would be too large to hold, in which case
+   * callers fall back to building the concatenation.
+   */
+  _decoderPrep(enc) {
+    if (enc.prep !== undefined) return enc.prep;
+    const { L, K, hE } = enc;
+    const H = this.hidden;
+    const bytes = this.decoderLayers.length * L * K * H * 4;
+    if (bytes > 96 << 20) {
+      enc.prep = null;
+      return null;
+    }
+    const pe = [];
+    const pnEnc = [];
+    for (const layer of this.decoderLayers) {
+      const [, We, , Wn] = layer.blocks;
+      pe.push(linear(hE, We, null, L * K, H, H));
+      pnEnc.push(linear(enc.hV, Wn, null, L, H, H));
+    }
+    enc.prep = { pe, pnEnc };
+    return enc.prep;
+  }
+
+  /**
    * Teacher-forced decoder: one pass over all positions.
    *
    * @param {Encoded} enc
@@ -303,44 +454,82 @@ export class Model {
     const H = this.hidden;
     const a = this.arena;
     const edgeDim = H * 3;
+    const prep = this._decoderPrep(enc);
 
     const { bw, fw } = this._edgeMasks(enc, ar);
     const hS = this._embedSequence(S, L, a.f32("dec.hS", L * H));
     const hVEnc = enc.hV;
 
-    let hV = a.f32("dec.hV", L * H);
+    const hV = a.f32("dec.hV", L * H);
     hV.set(hVEnc);
     const hVNext = a.f32("dec.hVNext", L * H);
 
-    for (const layer of this.decoderLayers) {
-      for (let start = 0; start < L; start += DECODE_CHUNK) {
-        const rows = Math.min(DECODE_CHUNK, L - start);
-        const edges = a.f32("dec.edges", rows * K * edgeDim);
+    for (let l = 0; l < this.decoderLayers.length; l++) {
+      const layer = this.decoderLayers[l];
 
-        for (let r = 0; r < rows; r++) {
-          const i = start + r;
-          for (let k = 0; k < K; k++) {
-            const j = EIdx[i * K + k];
-            const dst = (r * K + k) * edgeDim;
-            const eo = (i * K + k) * H;
-            const b = bw[i * K + k];
-            const f = fw[i * K + k];
-            for (let d = 0; d < H; d++) {
-              const e = hE[eo + d];
-              // [h_E ‖ h_S(j) ‖ h_V(j)] weighted backward, plus the encoder-only
-              // [h_E ‖ 0 ‖ h_V_enc(j)] weighted forward.
-              edges[dst + d] = (b + f) * e;
-              edges[dst + H + d] = b * hS[j * H + d];
-              edges[dst + 2 * H + d] = b * hV[j * H + d] + f * hVEnc[j * H + d];
+      if (prep) {
+        // Fused path: W1 · [a ‖ b ‖ c ‖ d] = Σ W1x · x, and three of the four
+        // blocks are per-residue, so they are projected once here and gathered
+        // onto edges below instead of being multiplied per edge.
+        const [Wv, , Ws, Wn] = layer.blocks;
+        const pa = linear(hV, Wv, layer.bias, L, H, H, a.f32("dec.pa", L * H));
+        const ps = linear(hS, Ws, null, L, H, H, a.f32("dec.ps", L * H));
+        const pn = linear(hV, Wn, null, L, H, H, a.f32("dec.pn", L * H));
+        const pe = prep.pe[l];
+        const pnEnc = prep.pnEnc[l];
+
+        for (let start = 0; start < L; start += DECODE_CHUNK) {
+          const rows = Math.min(DECODE_CHUNK, L - start);
+          const h1 = a.f32("dec.h1", rows * K * H);
+          for (let r = 0; r < rows; r++) {
+            const i = start + r;
+            const m = mask[i];
+            const ao = i * H;
+            for (let k = 0; k < K; k++) {
+              const j = EIdx[i * K + k];
+              const dst = (r * K + k) * H;
+              const eo = (i * K + k) * H;
+              const b = bw[i * K + k];
+              const f = fw[i * K + k];
+              const jo = j * H;
+              for (let d = 0; d < H; d++) {
+                h1[dst + d] = m * pe[eo + d] + pa[ao + d]
+                  + b * (ps[jo + d] + pn[jo + d]) + f * pnEnc[jo + d];
+              }
             }
           }
+          layer.applyPre(
+            hV.subarray(start * H, (start + rows) * H), h1,
+            mask.subarray(start, start + rows), null, rows, K,
+            hVNext.subarray(start * H, (start + rows) * H),
+          );
         }
-
-        layer(
-          hV.subarray(start * H, (start + rows) * H), edges,
-          mask.subarray(start, start + rows), null, rows, K,
-          hVNext.subarray(start * H, (start + rows) * H),
-        );
+      } else {
+        for (let start = 0; start < L; start += DECODE_CHUNK) {
+          const rows = Math.min(DECODE_CHUNK, L - start);
+          const edges = a.f32("dec.edges", rows * K * edgeDim);
+          for (let r = 0; r < rows; r++) {
+            const i = start + r;
+            for (let k = 0; k < K; k++) {
+              const j = EIdx[i * K + k];
+              const dst = (r * K + k) * edgeDim;
+              const eo = (i * K + k) * H;
+              const b = bw[i * K + k];
+              const f = fw[i * K + k];
+              for (let d = 0; d < H; d++) {
+                const e = hE[eo + d];
+                edges[dst + d] = (b + f) * e;
+                edges[dst + H + d] = b * hS[j * H + d];
+                edges[dst + 2 * H + d] = b * hV[j * H + d] + f * hVEnc[j * H + d];
+              }
+            }
+          }
+          layer(
+            hV.subarray(start * H, (start + rows) * H), edges,
+            mask.subarray(start, start + rows), null, rows, K,
+            hVNext.subarray(start * H, (start + rows) * H),
+          );
+        }
       }
       hV.set(hVNext);
     }
@@ -416,6 +605,7 @@ export class Model {
     const table = this.w.get("W_s.weight");
     const wOut = this.w.linear("W_out");
 
+    const prep = this._decoderPrep(enc);
     const startS = opts.S ?? new Int32Array(L).fill(20);
     const chainMask = new Float32Array(L);
     for (let i = 0; i < L; i++) {
@@ -456,60 +646,130 @@ export class Model {
       outLogits.push(new Float32Array(L * V));
     }
 
+    const h1 = a.f32("smp.h1", B * K * H);
     const edges = a.f32("smp.edges", B * K * edgeDim);
     const hVRow = a.f32("smp.hV", B * H);
     const hVOut = a.f32("smp.hVOut", B * H);
     const maskRow = a.f32("smp.mask", B);
+    const paRow = a.f32("smp.pa", B * H);
+    const projRow = a.f32("smp.proj", H);
     const totalLogits = new Float32Array(B * V);
     const logitsRow = new Float32Array(V);
     const vis = new Uint8Array(B * K);
+
+    // Running projections of the two things that change one row per step.
+    // Maintaining them incrementally costs one 128x128 product per step; doing
+    // it inside the neighbour loop instead would cost K of them.
+    //   psCache[b][l][j] = W1s_l · h_S[j]          (set when j is decoded)
+    //   pnCache[b][l][j] = W1n_l · h_V_stack[l][j]
+    const psCache = [];
+    const pnCache = [];
+    if (prep) {
+      for (let b = 0; b < B; b++) {
+        psCache.push(Array.from({ length: nLayers }, () => new Float32Array(L * H)));
+        const perLayer = [];
+        // Layer 0's stack starts as the encoder output everywhere, so its
+        // projection is the one already precomputed for the whole structure.
+        perLayer.push(Float32Array.from(prep.pnEnc[0]));
+        for (let l = 1; l < nLayers; l++) perLayer.push(new Float32Array(L * H));
+        pnCache.push(perLayer);
+      }
+    }
 
     for (let step = 0; step < nSteps; step++) {
       const groupSize = orders[0][step].length;
       totalLogits.fill(0);
 
       for (let g = 0; g < groupSize; g++) {
-        // --- edge tensor: [mask*h_E | bw*h_S(j) | third block, per layer] ---
         for (let b = 0; b < B; b++) {
           const t = orders[b][step][g];
           maskRow[b] = mask[t];
-          const hS = hSs[b];
           const seen = stepOf[b];
           for (let k = 0; k < K; k++) {
-            const j = EIdx[t * K + k];
-            const visible = seen[j] < step ? 1 : 0;
-            vis[b * K + k] = visible;
-            const bw = mask[t] * visible;
-            const dst = (b * K + k) * edgeDim;
-            const eo = (t * K + k) * H;
-            for (let d = 0; d < H; d++) {
-              edges[dst + d] = mask[t] * hE[eo + d];
-              edges[dst + H + d] = bw * hS[j * H + d];
-            }
+            vis[b * K + k] = seen[EIdx[t * K + k]] < step ? 1 : 0;
           }
         }
 
-        for (let l = 0; l < nLayers; l++) {
-          // Third block is bw*h_V_stack[l][j] + fw*h_V_enc[j]; only this part
-          // changes between layers.
+        if (prep) {
+          // Fused: no per-edge matmul at all, just gathers of the four
+          // precomputed or cached projections.
+          for (let l = 0; l < nLayers; l++) {
+            const [Wv] = this.decoderLayers[l].blocks;
+            const pe = prep.pe[l];
+            const pnEnc = prep.pnEnc[l];
+            for (let b = 0; b < B; b++) {
+              const t = orders[b][step][g];
+              const m = mask[t];
+              const stack = stacks[b][l];
+              const ps = psCache[b][l];
+              const pn = pnCache[b][l];
+              linear(
+                stack.subarray(t * H, (t + 1) * H), Wv, this.decoderLayers[l].bias,
+                1, H, H, paRow.subarray(b * H, (b + 1) * H),
+              );
+              for (let k = 0; k < K; k++) {
+                const j = EIdx[t * K + k];
+                const dst = (b * K + k) * H;
+                const eo = (t * K + k) * H;
+                const jo = j * H;
+                const visible = vis[b * K + k];
+                const bw = m * visible;
+                const fw = m * (1 - visible);
+                for (let d = 0; d < H; d++) {
+                  h1[dst + d] = m * pe[eo + d] + paRow[b * H + d]
+                    + bw * (ps[jo + d] + pn[jo + d]) + fw * pnEnc[jo + d];
+                }
+              }
+              hVRow.set(stack.subarray(t * H, (t + 1) * H), b * H);
+            }
+
+            this.decoderLayers[l].applyPre(hVRow, h1, maskRow, null, B, K, hVOut);
+
+            for (let b = 0; b < B; b++) {
+              const t = orders[b][step][g];
+              stacks[b][l + 1].set(hVOut.subarray(b * H, (b + 1) * H), t * H);
+              // The next layer reads h_V_stack[l+1] at this position, so its
+              // projection has to be refreshed now.
+              if (l + 1 < nLayers) {
+                const [, , , Wn] = this.decoderLayers[l + 1].blocks;
+                linear(hVOut.subarray(b * H, (b + 1) * H), Wn, null, 1, H, H, projRow);
+                pnCache[b][l + 1].set(projRow, t * H);
+              }
+            }
+          }
+        } else {
           for (let b = 0; b < B; b++) {
             const t = orders[b][step][g];
-            const stack = stacks[b][l];
-            const m = mask[t];
+            const hS = hSs[b];
             for (let k = 0; k < K; k++) {
               const j = EIdx[t * K + k];
-              const src = (vis[b * K + k] ? stack : enc.hV).subarray(j * H, (j + 1) * H);
-              const dst = (b * K + k) * edgeDim + 2 * H;
-              for (let d = 0; d < H; d++) edges[dst + d] = m * src[d];
+              const bw = mask[t] * vis[b * K + k];
+              const dst = (b * K + k) * edgeDim;
+              const eo = (t * K + k) * H;
+              for (let d = 0; d < H; d++) {
+                edges[dst + d] = mask[t] * hE[eo + d];
+                edges[dst + H + d] = bw * hS[j * H + d];
+              }
             }
-            hVRow.set(stacks[b][l].subarray(t * H, (t + 1) * H), b * H);
           }
-
-          this.decoderLayers[l](hVRow, edges, maskRow, null, B, K, hVOut);
-
-          for (let b = 0; b < B; b++) {
-            const t = orders[b][step][g];
-            stacks[b][l + 1].set(hVOut.subarray(b * H, (b + 1) * H), t * H);
+          for (let l = 0; l < nLayers; l++) {
+            for (let b = 0; b < B; b++) {
+              const t = orders[b][step][g];
+              const stack = stacks[b][l];
+              const m = mask[t];
+              for (let k = 0; k < K; k++) {
+                const j = EIdx[t * K + k];
+                const src = (vis[b * K + k] ? stack : enc.hV).subarray(j * H, (j + 1) * H);
+                const dst = (b * K + k) * edgeDim + 2 * H;
+                for (let d = 0; d < H; d++) edges[dst + d] = m * src[d];
+              }
+              hVRow.set(stack.subarray(t * H, (t + 1) * H), b * H);
+            }
+            this.decoderLayers[l](hVRow, edges, maskRow, null, B, K, hVOut);
+            for (let b = 0; b < B; b++) {
+              const t = orders[b][step][g];
+              stacks[b][l + 1].set(hVOut.subarray(b * H, (b + 1) * H), t * H);
+            }
           }
         }
 
@@ -544,6 +804,15 @@ export class Model {
           const aa = chainMask[t] > 0 ? best : startS[t];
           outS[b][t] = aa;
           hSs[b].set(table.subarray(aa * H, (aa + 1) * H), t * H);
+          if (prep) {
+            // W1s differs per layer, so every layer's cache needs the new row.
+            const row = table.subarray(aa * H, (aa + 1) * H);
+            for (let l = 0; l < nLayers; l++) {
+              const [, , Ws] = this.decoderLayers[l].blocks;
+              linear(row, Ws, null, 1, H, H, projRow);
+              psCache[b][l].set(projRow, t * H);
+            }
+          }
         }
       }
     }

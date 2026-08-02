@@ -36,8 +36,38 @@ export function tensor(shape, data) {
  * @param {Float32Array|null} b [cout]
  * @param {Float32Array} [out] destination, allocated if omitted
  */
+/**
+ * Optional accelerator. Set by `useAccelerator()`; when present, `linear`
+ * offers each call to it and falls back here if it declines (small shapes) or
+ * is absent entirely.
+ */
+let accel = null;
+
+/** @param {import("./accel.js").Accelerator|null} a */
+export function useAccelerator(a) {
+  accel = a;
+}
+
+export function acceleratorInUse() {
+  return accel !== null;
+}
+
+/**
+ * gelu -> W2 -> gelu -> W3 over [n, hidden], run in one accelerator call when
+ * one is available. Returns false if the caller must do it itself.
+ */
+export function tryTail2(h1, w2, b2, w3, b3, n, hidden, out) {
+  return accel !== null && accel.tail2(h1, w2, b2, w3, b3, n, hidden, out);
+}
+
+/** W_in -> gelu -> W_out, likewise. */
+export function tryFeedForward(x, wIn, bIn, wOut, bOut, n, hidden, ff, out) {
+  return accel !== null && accel.ff(x, wIn, bIn, wOut, bOut, n, hidden, ff, out);
+}
+
 export function linear(x, w, b, n, cin, cout, out) {
   out = out ?? new Float32Array(n * cout);
+  if (accel !== null && accel.linear(x, w, b, n, cin, cout, out)) return out;
   let i = 0;
   // Eight input rows share each pass over the weight matrix. Without this the
   // whole of W is streamed from L2 once per row and the kernel is bandwidth
@@ -125,14 +155,25 @@ export function erf(x) {
   return sign * (1 - poly * Math.exp(-ax * ax));
 }
 
+const [A0, A1, A2, A3, A4] = ERF_A;
+
 /**
  * Exact (erf-based) GELU, matching `torch.nn.GELU()`'s default -- *not* the
  * tanh approximation, which drifts by ~1e-3 and would show up in the logits.
+ *
+ * `erf` is inlined rather than called. This is the second hottest loop in the
+ * engine after the matmul, and at a few hundred thousand elements per call the
+ * call overhead was costing about as much as the arithmetic.
  */
 export function gelu(a, n = a.length) {
   for (let i = 0; i < n; i++) {
     const v = a[i];
-    a[i] = 0.5 * v * (1 + erf(v * Math.SQRT1_2));
+    const x = v * Math.SQRT1_2;
+    const ax = x < 0 ? -x : x;
+    const t = 1 / (1 + ERF_P * ax);
+    const poly = ((((A4 * t + A3) * t + A2) * t + A1) * t + A0) * t;
+    const e = 1 - poly * Math.exp(-ax * ax);
+    a[i] = 0.5 * v * (1 + (x < 0 ? -e : e));
   }
   return a;
 }

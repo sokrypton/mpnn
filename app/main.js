@@ -223,6 +223,10 @@ async function ensureEncoded() {
       if (token !== encodeToken) return false;
       state.modelName = name;
       state.modelType = info.modelType;
+      $("kernel-status").textContent = info.simd
+        ? "Running on the WebAssembly SIMD kernel."
+        : "Running on the JavaScript kernel — this browser has no WebAssembly SIMD, "
+          + "so expect roughly 5x slower.";
     }
 
     setStatus("model-status", "Encoding structure…", "busy");

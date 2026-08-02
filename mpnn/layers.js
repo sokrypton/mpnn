@@ -30,6 +30,8 @@ import {
   linear,
   maskRows,
   reduceMessages,
+  tryFeedForward,
+  tryTail2,
 } from "./ops.js";
 import { MESSAGE_SCALE } from "./constants.js";
 
@@ -59,6 +61,8 @@ function makeDense(w, arena, prefix, hidden, tag) {
   const wOut = w.linear(`${prefix}.W_out`);
   const ff = wIn.shape[0];
   return (x, out, rows) => {
+    if (tryFeedForward(x, wIn.weight, wIn.bias, wOut.weight, wOut.bias,
+      rows, hidden, ff, out)) return out;
     const h = arena.f32(`${tag}.ff`, rows * ff);
     linear(x, wIn.weight, wIn.bias, rows, hidden, ff, h);
     gelu(h);
@@ -72,6 +76,7 @@ function makeMessageTail(w, arena, prefix, names, hidden, tag) {
   const w2 = w.linear(`${prefix}.${names[1]}`);
   const w3 = w.linear(`${prefix}.${names[2]}`);
   return (h1, rows, out) => {
+    if (tryTail2(h1, w2.weight, w2.bias, w3.weight, w3.bias, rows, hidden, out)) return out;
     gelu(h1, rows * hidden);
     const h2 = arena.f32(`${tag}.h2`, rows * hidden);
     linear(h1, w2.weight, w2.bias, rows, hidden, hidden, h2);
@@ -188,7 +193,7 @@ export function makeDecoderLayer(w, arena, prefix, hidden, edgeDim, tag = "dec")
   const cin = hidden + edgeDim;
   const nBlocks = cin / hidden;
   const w1 = w.linear(`${prefix}.W1`);
-  const tail = makeMessageTail(w, arena, prefix, ["W1", "W2", "W3"], hidden, tag);
+  const tail_ = makeMessageTail(w, arena, prefix, ["W1", "W2", "W3"], hidden, tag);
   const dense = makeDense(w, arena, `${prefix}.dense`, hidden, tag);
   const norm1 = w.norm(`${prefix}.norm1`);
   const norm2 = w.norm(`${prefix}.norm2`);
@@ -203,7 +208,7 @@ export function makeDecoderLayer(w, arena, prefix, hidden, edgeDim, tag = "dec")
     const dh = arena.f32(`${tag}.dh`, rows * hidden);
     const tmp = arena.f32(`${tag}.tmp`, rows * hidden);
 
-    tail(h1, rows * k, msg);
+    tail_(h1, rows * k, msg);
     reduceMessages(msg, maskAttend, rows, k, hidden, MESSAGE_SCALE, dh);
     addInto(dh, hV, rows * hidden);
     layerNorm(dh, norm1.gamma, norm1.beta, rows, hidden, out);
@@ -224,9 +229,36 @@ export function makeDecoderLayer(w, arena, prefix, hidden, edgeDim, tag = "dec")
     return applyPre(hV, h1, mask, maskAttend, rows, k, out);
   };
 
+  /**
+   * The message MLP after W1: gelu -> W2 -> gelu -> W3, over an arbitrary row
+   * list. Callers that have deduplicated or compacted their rows use this
+   * directly instead of going through a [rows, k] edge tensor.
+   */
+  function tail(h1, rows, out) {
+    return makeTail(h1, rows, out);
+  }
+  const makeTail = tail_;
+
+  /**
+   * Everything after the neighbour sum: residual LayerNorm, feed-forward,
+   * residual LayerNorm, mask.
+   */
+  function finish(hV, dh, maskV, rows, out) {
+    const tmp = arena.f32(`${tag}.finTmp`, rows * hidden);
+    addInto(dh, hV, rows * hidden);
+    layerNorm(dh, norm1.gamma, norm1.beta, rows, hidden, out);
+    dense(out, tmp, rows);
+    addInto(tmp, out, rows * hidden);
+    layerNorm(tmp, norm2.gamma, norm2.beta, rows, hidden, out);
+    if (maskV !== null) maskRows(out, maskV, rows, hidden);
+    return out;
+  }
+
   layer.blocks = blocks;
   layer.bias = w1.bias;
   layer.applyPre = applyPre;
+  layer.tail = tail;
+  layer.finish = finish;
   layer.hidden = hidden;
   return layer;
 }
