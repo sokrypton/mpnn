@@ -6,6 +6,7 @@
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -449,6 +450,77 @@ if (!process.argv.includes("--no-ligand")) {
   if (shotPath) {
     await page.screenshot({ path: shotPath.replace(/\.png$/, "-ligand.png"), fullPage: true });
   }
+}
+
+// --- homo-oligomer tying ----------------------------------------------------
+{
+  console.log("\n-- homo-oligomer --");
+  // A two-chain assembly, built by translating ubiquitin rather than shipping
+  // another fixture. Both copies keep their original residue numbering, which
+  // is the case the reference's residue-number matching is written for.
+  const source = await readFile(join(ROOT, "assets", "1ubq.pdb"), "utf8");
+  const copy = source.split("\n")
+    .filter((line) => line.startsWith("ATOM  "))
+    .map((line) => {
+      const x = (parseFloat(line.slice(30, 38)) + 40).toFixed(3).padStart(8);
+      return `${line.slice(0, 21)}B${line.slice(22, 30)}${x}${line.slice(38)}`;
+    });
+  const dimerPath = join(tmpdir(), "mpnn-dimer.pdb");
+  await writeFile(dimerPath, `${source}\n${copy.join("\n")}\nEND\n`);
+
+  await page.goto(base, { waitUntil: "networkidle" });
+  await page.setInputFiles("#file-input", dimerPath);
+  await waitReady(152, 300000);
+  await page.evaluate(() => {
+    for (const d of document.querySelectorAll("details")) d.open = true;
+  });
+  await page.check("#homo-oligomer");
+  const note = (await page.textContent("#homo-summary")).trim();
+  console.log("homo-oligomer:", note);
+  if (!/76 group\(s\) of 2, matched by residue number/.test(note)) {
+    problems.push(`homo-oligomer grouping looks wrong: ${note}`);
+  }
+  if (!await page.evaluate(() => document.getElementById("symmetry").disabled)) {
+    problems.push("the manual symmetry field stayed editable while chains were tied");
+  }
+
+  // A warm temperature, so agreement between the chains is the tying and not
+  // just two confident argmaxes landing in the same place.
+  await page.fill("#batch", "2");
+  await page.evaluate(() => document.getElementById("batch").dispatchEvent(new Event("input")));
+  await page.fill("#temperature", "0.8");
+  await page.evaluate(() => document.getElementById("temperature")
+    .dispatchEvent(new Event("input")));
+  await page.click("#design-btn");
+  await page.waitForFunction(
+    () => /sequences in/.test(document.getElementById("design-status").textContent),
+    { timeout: 600000 },
+  );
+  const tied = await page.evaluate(() =>
+    [...document.querySelectorAll(".design .seq")].map((e) => e.textContent.trim()));
+  for (const seq of tied) {
+    const [a, b] = [seq.slice(0, 76), seq.slice(76)];
+    let same = 0;
+    for (let i = 0; i < 76; i++) if (a[i] === b[i]) same++;
+    console.log(`   chains agree at ${same}/76  ${a.slice(0, 40)}`);
+    if (same !== 76) problems.push(`tied chains disagree at ${76 - same} position(s)`);
+  }
+
+  // Untied, the same warm temperature should let them drift apart -- otherwise
+  // the check above proves nothing.
+  await page.uncheck("#homo-oligomer");
+  await page.click("#clear-results");
+  await page.click("#design-btn");
+  await page.waitForFunction(
+    () => /sequences in/.test(document.getElementById("design-status").textContent),
+    { timeout: 600000 },
+  );
+  const free = await page.evaluate(() =>
+    document.querySelector(".design .seq").textContent.trim());
+  let drift = 0;
+  for (let i = 0; i < 76; i++) if (free[i] !== free[76 + i]) drift++;
+  console.log(`   untied, chains differ at ${drift}/76`);
+  if (drift === 0) problems.push("untied chains came out identical, so the tying check is vacuous");
 }
 
 if (shotPath) {

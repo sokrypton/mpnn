@@ -26,6 +26,7 @@ first load.
   pseudo-likelihood or true autoregressive likelihood (see *Conditioning*).
 - **Feed LigandMPNN the side chains** of the residues you are not designing,
   as extra atom context.
+- **Tie a homo-oligomer** with one checkbox, or tie arbitrary positions by hand.
 - **Read a position profile** as a sequence logo -- bits on the y axis, glyphs
   stretched to their share of the column, the native residue underneath -- in
   three flavours (see *Conditioning* below). Hovering a column highlights that
@@ -201,6 +202,19 @@ everything fixed, the average residue keeps 1.2 of biotin's 16 atoms in context,
 against 16 with the flag off -- and the score gets *worse*, 1.31 to 1.84. So
 this is a tool for redesigning a pocket inside a fixed scaffold, not something
 to leave on.
+
+## Homo-oligomer tying
+
+One checkbox on the *Design* panel, LigandMPNN's `--homo_oligomer`. Tied
+positions are decoded in the same step and their logits averaged (weight
+1/chains), so every copy comes out with the same sequence.
+
+Like the reference, chains are matched by residue *number* rather than by
+position, so a complex whose chains share a numbering ties correctly even when
+one of them has a gap. Unlike the reference, chains with no numbers in common
+but equal length fall back to tying end to end rather than raising a KeyError,
+and the panel says which of the two ran — they disagree precisely when it
+matters.
 
 ## Correctness
 

@@ -186,6 +186,7 @@ async function loadStructureText(text, label) {
 
   viewer.setStructure(structure);
   $("color-mode").value = structure.chainList.length > 1 ? "chain" : "rainbow";
+  refreshHomoOligomer();
   renderChainToggles();
   renderSequenceTrack();
   renderResults();
@@ -674,7 +675,76 @@ function buildBias() {
   return bias;
 }
 
+/**
+ * Tie every chain to every other, LigandMPNN's `--homo_oligomer`.
+ *
+ * The reference matches residues by *number*, not by position in the chain, so
+ * a complex whose chains share a numbering ties correctly even when one of them
+ * has a gap. When the numbering does not line up at all -- chain B continuing
+ * where A left off, say -- that finds nothing, so equal-length chains fall back
+ * to tying by position. Which one ran is reported, because the two disagree
+ * exactly when it matters.
+ *
+ * Weights are 1/chains, so a group's members contribute the mean of their
+ * logits rather than the sum.
+ *
+ * @returns {{groups: {pos: number, weight: number}[][] | null, note: string}}
+ */
+function homoOligomerGroups() {
+  const s = state.structure;
+  const chains = s?.chainList ?? [];
+  if (chains.length < 2) {
+    return { groups: null, note: "Needs at least two chains." };
+  }
+  const weight = 1 / chains.length;
+
+  // By residue number: chain -> "resSeq+iCode" -> position.
+  const byChain = new Map(chains.map((c) => [c, new Map()]));
+  for (let i = 0; i < s.L; i++) {
+    byChain.get(s.chainIds[i]).set(`${s.resSeq[i]}${s.iCodes[i]}`, i);
+  }
+  const reference = byChain.get(chains[0]);
+  const byNumber = [];
+  let unmatched = 0;
+  for (const [key, pos] of reference) {
+    const group = [pos];
+    for (let c = 1; c < chains.length; c++) {
+      const other = byChain.get(chains[c]).get(key);
+      if (other === undefined) break;
+      group.push(other);
+    }
+    if (group.length === chains.length) byNumber.push(group);
+    else unmatched++;
+  }
+
+  const lengths = chains.map((c) => byChain.get(c).size);
+  const equalLength = lengths.every((n) => n === lengths[0]);
+
+  if (byNumber.length) {
+    const note = `${byNumber.length} group(s) of ${chains.length}, matched by residue number`
+      + (unmatched ? `; ${unmatched} residue(s) of chain ${chains[0]} have no counterpart` : "");
+    return { groups: byNumber.map((g) => g.map((pos) => ({ pos, weight }))), note };
+  }
+  if (!equalLength) {
+    return {
+      groups: null,
+      note: `Chains have different lengths (${lengths.join(", ")}) and no residue numbers `
+        + "in common, so there is nothing to tie.",
+    };
+  }
+  // Positional fallback: the i-th residue of every chain.
+  const perChain = chains.map(() => []);
+  for (let i = 0; i < s.L; i++) perChain[chains.indexOf(s.chainIds[i])].push(i);
+  const byPosition = perChain[0].map((_, i) => perChain.map((c) => ({ pos: c[i], weight })));
+  return {
+    groups: byPosition,
+    note: `${byPosition.length} group(s) of ${chains.length}, matched by position — the chains `
+      + "share no residue numbers, so this assumes they are aligned end to end.",
+  };
+}
+
 function parseSymmetry() {
+  if ($("homo-oligomer").checked) return homoOligomerGroups().groups;
   const text = $("symmetry").value.trim();
   if (!text) return null;
   const groups = [];
@@ -943,6 +1013,17 @@ $("use-side-chains").onchange = () => {
   state.encodedFor = null;
   if (state.structure) ensureEncoded();
 };
+
+function refreshHomoOligomer() {
+  const on = $("homo-oligomer").checked;
+  $("symmetry").disabled = on;
+  $("homo-summary").textContent = !on
+    ? ""
+    : state.structure
+      ? homoOligomerGroups().note
+      : "Load a structure first.";
+}
+$("homo-oligomer").onchange = refreshHomoOligomer;
 
 $("temperature").oninput = (event) => {
   $("temperature-out").textContent = Number(event.target.value).toFixed(2);

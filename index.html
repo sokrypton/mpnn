@@ -167,10 +167,17 @@
 
     <details class="control">
       <summary>Symmetry / tied positions</summary>
+      <div class="row">
+        <label class="check">
+          <input type="checkbox" id="homo-oligomer">
+          Homo-oligomer: tie every chain to every other
+        </label>
+      </div>
+      <p class="hint" id="homo-summary"></p>
       <p class="hint">
-        Comma-separated groups of 1-based positions that must share an identity,
-        e.g. <code>10+40, 11+41</code>. Tied positions are decoded together and
-        their logits averaged.
+        Or list comma-separated groups of 1-based positions that must share an
+        identity, e.g. <code>10+40, 11+41</code>. Tied positions are decoded
+        together and their logits averaged.
       </p>
       <input id="symmetry" type="text" placeholder="10+40, 11+41" spellcheck="false">
     </details>
