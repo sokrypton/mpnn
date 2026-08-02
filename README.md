@@ -217,44 +217,58 @@ the practical limit.
 ### Compared with the reference on CPU
 
 Same structures, same inputs, PyTorch 2.13 on the same machine
-(`tools/bench_reference.py`). Seconds; sampling is per sequence at batch 8.
+(`tools/bench_reference.py`). Both sides single threaded — this engine has no
+choice, and PyTorch is pinned with `torch.set_num_threads(1)` plus
+`OMP_NUM_THREADS=1`. Seconds; sampling is per sequence at batch 8. "Score" is
+one teacher-forced decoder pass over every position, which is the same work as
+this engine's `profile`.
 
-| | | this engine (1 thread) | PyTorch (1 thread) | PyTorch (4 threads) |
+| | | this engine | PyTorch | |
 | --- | --- | --- | --- | --- |
-| L = 76 | encode | 0.22 | 0.10 | 0.04 |
-| | sample | **0.060** | 0.08 | 0.04 |
-| L = 121 ligand | encode | **0.60** | 0.77 | 0.24 |
-| | sample | **0.060** | 0.17 | 0.09 |
-| L = 388 | encode | 0.93 | 0.53 | 0.16 |
-| | sample | **0.29** | 0.42 | 0.21 |
-| L = 574 | encode | 1.25 | 0.91 | 0.32 |
-| | sample | **0.41** | 0.61 | 0.32 |
-| L = 2916 | encode | **6.54** | 11.60 | 3.76 |
-| | sample | **2.09** | 7.02 | 2.45 |
-| L = 8015 | encode | **17.4** | — | 21.9 |
+| L = 76 | encode | 0.22 | **0.09** | 2.4x slower |
+| | sample | **0.060** | 0.08 | 1.3x faster |
+| | score | 0.12 | 0.12 | equal |
+| L = 121, ligand | encode | **0.60** | 0.72 | 1.2x faster |
+| | sample | **0.060** | 0.16 | 2.7x faster |
+| | score | **0.08** | 0.78 | 9.8x faster |
+| L = 388 | encode | 0.93 | **0.53** | 1.8x slower |
+| | sample | **0.29** | 0.41 | 1.4x faster |
+| | score | **0.34** | 0.77 | 2.3x faster |
+| L = 574 | encode | 1.25 | **0.89** | 1.4x slower |
+| | sample | **0.41** | 0.59 | 1.4x faster |
+| | score | **0.43** | 1.38 | 3.2x faster |
+| L = 2916 | encode | **6.54** | 10.98 | 1.7x faster |
+| | sample | **2.09** | 6.67 | 3.2x faster |
+| | score | **2.04** | 15.20 | 7.5x faster |
+| L = 8015 | encode | **17.4** | 74.8 | 4.3x faster |
 
-Sampling is faster than single-threaded PyTorch everywhere, by 1.3x at small L
-and 3.2x at large, and within 1.1-1.5x of PyTorch on four cores. That is not kernel throughput: the reference walks L
-autoregressive steps in Python and pays interpreter and tensor-dispatch overhead
-on each one, while this decoder's inner loop has no per-edge matmul left in it.
+On one thread this engine is **faster than the reference at everything except
+encoding small proteins**. Encoding is 2.4x behind at 76 residues, crosses over
+somewhere around a thousand, and is 4.3x ahead by eight thousand. Sampling and
+scoring are ahead at every size measured.
 
-Encoding crosses over, and the crossover is the interesting part. PyTorch is
-1.4-2.2x ahead up to a few hundred residues, level around L ≈ 1000, and behind
-by L ≈ 3000. At L = 8015 this engine on **one** thread beats PyTorch on **four**
-(17.4 s against 21.9 s).
+Three separate things produce that shape.
 
-The two implementations scale differently. The reference builds full `[L, L]`
-distance matrices for each of 25 atom pairs in `_get_rbf` — O(L²) — while this
-one evaluates distances only at the K neighbours it kept, and since the grid
-search that finds them is no longer O(L²) either, the whole encode is O(L·K).
-At L = 2916 that is 8.5 million pairs against 140 thousand. Between L = 574 and
-L = 2916, PyTorch's encode grows 12.7x for a 5.1x jump in size; this one grows
-4.9x, which is linear.
+**Encoding at small L** is the one real deficit, and it is the kernel: a dense
+sweep where AVX2 gives oneDNN 8 lanes with a fused multiply-add against wasm's 4
+lanes with neither. The matmul here already runs at ~90% of what that
+instruction set allows, so the remaining ~1.5x is hardware.
 
-So the honest summary is that the gap is a small-protein gap. On anything under
-a few hundred residues a native BLAS on four cores is 5-6x ahead and always will
-be; from about a thousand residues up, the asymptotics matter more than the
-kernel and this implementation is competitive or better.
+**Encoding at large L** inverts because the reference's featuriser builds full
+`[L, L]` distance matrices for each of 25 atom pairs, which is O(L²), while this
+one touches only the K neighbours it kept and finds them with a grid, which is
+O(L·K). PyTorch's encode grows 8.3x from L = 2916 to L = 8015; this one grows
+2.7x.
+
+**Sampling and scoring** are ahead everywhere because they are not throughput
+problems. The reference walks L autoregressive steps in Python and pays
+interpreter and dispatch overhead on each; the decoder here has no per-edge
+matmul left in that loop. The 9.8x on LigandMPNN's score is the atom-pair
+deduplication on top of that.
+
+For the record, PyTorch on four threads is 3-4x faster than PyTorch on one, so
+it stays ahead on encode until about L = 8000. Threads here would be worth the
+same factor and are the obvious next step.
 
 ### Why encoding is still slower at small and medium L
 
