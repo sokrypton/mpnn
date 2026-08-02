@@ -39,6 +39,8 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=0,
                     help="0 leaves PyTorch's default (all cores)")
     ap.add_argument("--batch", type=int, default=8)
+    ap.add_argument("--encode-only", action="store_true",
+                    help="skip sample/score, which build [L, L] masks")
     args = ap.parse_args()
 
     if args.threads:
@@ -57,6 +59,10 @@ def main() -> int:
 
         with torch.no_grad():
             encode = timed(lambda: model.encode(fd))
+            if args.encode_only:
+                print(f"\n{case['name']}  {model_type}  L={L}")
+                print(f"    encode          {encode:.2f} s")
+                continue
 
             # run.py shapes randn as [batch_size, L]; the decoding order is
             # derived from it per sample, so it has to match the decode batch.

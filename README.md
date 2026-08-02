@@ -217,36 +217,59 @@ around 8000 residues is close to the practical limit.
 ### Compared with the reference on CPU
 
 Same structures, same inputs, PyTorch 2.13 on the same machine
-(`tools/bench_reference.py`). Seconds, sampling per sequence at batch 8:
+(`tools/bench_reference.py`). Seconds; sampling is per sequence at batch 8.
 
 | | | this engine (1 thread) | PyTorch (1 thread) | PyTorch (4 threads) |
 | --- | --- | --- | --- | --- |
 | L = 76 | encode | 0.28 | 0.10 | 0.04 |
-| | sample | 0.059 | 0.08 | 0.04 |
-| L = 121 ligand | encode | 0.64 | 0.77 | 0.24 |
-| | sample | 0.060 | 0.17 | 0.09 |
+| | sample | **0.059** | 0.08 | 0.04 |
+| L = 121 ligand | encode | **0.64** | 0.77 | 0.24 |
+| | sample | **0.060** | 0.17 | 0.09 |
 | L = 388 | encode | 1.32 | 0.53 | 0.16 |
-| | sample | 0.34 | 0.42 | 0.21 |
+| | sample | **0.34** | 0.42 | 0.21 |
 | L = 574 | encode | 1.66 | 0.91 | 0.32 |
-| | sample | 0.43 | 0.61 | 0.32 |
+| | sample | **0.43** | 0.61 | 0.32 |
+| L = 2916 | encode | **8.92** | 11.60 | — |
+| | sample | **2.25** | 7.02 | — |
 
-Against single-threaded PyTorch this engine is **1.8-2.8x slower at encoding and
-1.2-2.8x faster at sampling**, and slightly faster at encoding LigandMPNN.
+Sampling is faster than single-threaded PyTorch everywhere, by 1.2x at small L
+and 3.1x at large. That is not kernel throughput: the reference walks L
+autoregressive steps in Python and pays interpreter and tensor-dispatch overhead
+on each one, while this decoder's inner loop has no per-edge matmul left in it.
 
-The split is not an accident. Encoding is one long sweep of dense products, and
-there a native BLAS wins on raw kernel throughput: AVX2 is 8 lanes wide with a
-fused multiply-add, wasm SIMD is 4 lanes with neither. That is a hardware
-ceiling, not something to optimise around — the kernel already runs at ~90% of
-what 128-bit SIMD without FMA can do, and relaxed-SIMD FMA measured only 5-8%
-better because the loop is load-bound rather than FLOP-bound.
+Encoding crosses over. PyTorch is ~2x ahead up to a few hundred residues and
+behind by L ≈ 3000, because the two implementations scale differently: the
+reference builds full `[L, L]` distance matrices for each of 25 atom pairs in
+`_get_rbf`, which is O(L²), whereas this one evaluates distances only at the K
+neighbours it kept, which is O(L·K). At L = 2916 that is 8.5 million pairs
+against 140 thousand. PyTorch's encode grows 12.7x between L = 574 and L = 2916,
+a 5.1x jump in size; this one grows 5.4x, which is linear.
 
-Sampling is the other way round because it is not a throughput problem. The
-reference walks L autoregressive steps in Python, paying interpreter and
-tensor-dispatch overhead on every one; this engine's decoder has no per-edge
-matmul left in that loop at all. Algorithms beat the kernel gap.
+### Why encoding is still slower at small and medium L
 
-Against 4-thread PyTorch everything is ~4x further behind, which is exactly the
-core count — see the note on threads below.
+Two reasons, in proportion. Measured at L = 574: 1.15 s inside the kernel and
+0.57 s outside it.
+
+**The kernel gap is hardware, and it is nearly exhausted.** In situ the matmul
+runs at 18-19 GFLOP/s, about 85% of what wasm SIMD can reach — 128-bit vectors,
+4 lanes, and *no fused multiply-add*, which caps a 3 GHz core near 24. AVX2
+gives oneDNN 8 lanes with FMA, so its ceiling is 2-4x higher, and it achieves
+~23 GFLOP/s on the same work. Roughly a 1.5x gap that no amount of tuning
+closes; relaxed-SIMD FMA, the one instruction that would help, measured 5-8%
+because the loop is load-bound rather than FLOP-bound.
+
+**A third of the encode is not in the kernel at all.** 33% at L = 574, 37% at
+L = 2916, and all of it plain scalar JavaScript against PyTorch's compiled C++:
+the neighbour search, the radial basis evaluation, LayerNorm, and the gathers
+that assemble each layer's edge tensor. This is the addressable part, roughly in
+order of size:
+
+- the neighbour search is O(L²·K) — a uniform grid would make it near-linear,
+  and it is the largest single item at L = 2916 (~0.9 s of 3.4)
+- the RBF evaluation, LayerNorm and the masked neighbour sum could join the
+  matmul behind one coarse entry point, the same trick that already absorbed
+  GELU. `layernorm_f32` is built and exported but not yet wired up
+- threads, which would move everything at once
 
 Between 5x and 17x depending on what you ask for. Five things got it there, and
 the order matters: every algorithmic change came before any kernel work, because
