@@ -61,6 +61,16 @@ jobs:
           node test/parity.mjs /tmp/reference.json /tmp/inputs.json /tmp/w32
           MPNN_NO_SIMD=1 node test/parity.mjs /tmp/reference.json /tmp/inputs.json /tmp/w32
 
+      - name: Sampling parity (bias, omissions, fixed, tied positions)
+        run: |
+          node test/make_sampling_cases.mjs /tmp/sample_cases.json
+          python tools/sample_reference.py \
+            --ref "${{ steps.ref.outputs.dir }}" \
+            --checkpoints "${{ steps.ref.outputs.dir }}/data/model_params" \
+            --inputs /tmp/sample_cases.json --out /tmp/sample_golden.json
+          node test/sampling.mjs /tmp/sample_golden.json /tmp/sample_cases.json /tmp/w32
+          MPNN_NO_SIMD=1 node test/sampling.mjs /tmp/sample_golden.json /tmp/sample_cases.json /tmp/w32
+
       - name: The committed kernel matches its source
         run: |
           sudo apt-get install -y --no-install-recommends clang lld

@@ -156,6 +156,31 @@ internal invariant rather than a comparison: autoregressive sampling and
 teacher-forced scoring of the resulting sequence under the same order must give
 identical logits, which catches decoder bugs the golden tensors would not.
 
+`test/sampling.mjs` covers what logits cannot reach — per-amino-acid bias,
+omissions, fixed residues, tied positions and the ligand-context switch all live
+in the sampler, which is stochastic. Both sides are pinned the same way: an
+explicit decoding order, and a temperature of 1e-6 that collapses the draw onto
+the argmax. The sequences then have to match *exactly*.
+
+### One deliberate divergence
+
+A tied group containing both fixed and designed positions is the single place
+this engine does not match the reference, on purpose.
+
+The reference reassigns its running `S_t` inside the per-group loop, so a fixed
+member overwrites it and every designed member after it in the list inherits the
+*fixed member's input residue* rather than the sampled one. On ubiquitin with
+group `[7, 27, 47, 60]` and 27 fixed, it emits position 7 = E and position 47 =
+A, where A is position 27's native residue. The group is not tied at all, and
+which member wins depends on the order they were listed in.
+
+This engine samples one identity per group and applies it to the designed
+members, leaving fixed ones alone. The test asserts that invariant, and reports
+the reference's drift rather than reproducing it. Everything else matches
+exactly, including the decoding-order construction — which does reproduce the
+reference's ordering rules, fixed residues pulled to the front and tied groups
+pulled forward to their first member.
+
 Two smaller guards worth mentioning, because both are places a port silently
 drifts:
 

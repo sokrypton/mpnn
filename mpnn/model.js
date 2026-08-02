@@ -601,6 +601,8 @@ export class Model {
    * @param {Float32Array} [opts.chainMask] [L] 1 = design, 0 = keep from S
    * @param {Float32Array} [opts.bias]      [L, 21] added to logits before sampling
    * @param {number[][]}  [opts.symmetry]   groups of positions forced to share an identity
+   * @param {Int32Array}  [opts.order]      explicit decoding order, for replay and tests;
+   *                                        symmetry groups are applied on top of it
    * @param {() => number} [opts.rng]       uniform [0,1); defaults to Math.random
    * @returns {{S: Int32Array[], logits: Float32Array[], score: number[], order: Int32Array[]}}
    */
@@ -628,10 +630,16 @@ export class Model {
     const groups = normaliseSymmetry(opts.symmetry, L);
     // With tied positions the batch shares one order, so every sample reaches
     // the same group at the same step and the per-step work stays rectangular.
-    const shared = groups.groups.length > 0;
+    const shared = groups.groups.length > 0 || opts.order !== undefined;
     const orders = [];
     for (let b = 0; b < B; b++) {
-      orders.push(shared && b > 0 ? orders[0] : decodingOrder(chainMask, groups, rng));
+      if (shared && b > 0) {
+        orders.push(orders[0]);
+      } else if (opts.order !== undefined) {
+        orders.push(groupSteps(opts.order, groups));
+      } else {
+        orders.push(decodingOrder(chainMask, groups, rng));
+      }
     }
     const nSteps = orders[0].length;
 
@@ -875,7 +883,7 @@ function flattenOrder(order) {
  * Symmetry groups, plus the per-position logit weights the reference applies
  * when several positions are tied.
  */
-function normaliseSymmetry(symmetry, L) {
+export function normaliseSymmetry(symmetry, L) {
   const groupOf = new Int32Array(L).fill(-1);
   const groups = [];
   const weights = new Float32Array(L).fill(1);
@@ -901,18 +909,16 @@ function normaliseSymmetry(symmetry, L) {
 }
 
 /**
- * A decoding order as a list of steps, each step a list of tied positions.
- * Fixed positions (chainMask 0) are decoded first so designed positions can see
- * them, matching `argsort((chain_mask + 1e-4) * |randn|)`.
+ * Collapse a flat position order into decoding steps, pulling each tied group
+ * forward to where its first member appears.
+ *
+ * This is the reference's `new_decoding_order` construction: walk the order, and
+ * the first time a position belonging to a symmetry group comes up, emit the
+ * whole group and skip its other members later.
  */
-function decodingOrder(chainMask, groups, rng) {
-  const L = chainMask.length;
-  const keys = new Float64Array(L);
-  for (let i = 0; i < L; i++) keys[i] = (chainMask[i] + 0.0001) * Math.abs(gaussian(rng));
-
-  const flat = Array.from({ length: L }, (_, i) => i).sort((x, y) => keys[x] - keys[y]);
+export function groupSteps(flat, groups) {
   const steps = [];
-  const placed = new Uint8Array(L);
+  const placed = new Uint8Array(groups.groupOf.length);
   for (const t of flat) {
     if (placed[t]) continue;
     const g = groups.groupOf[t];
@@ -921,6 +927,19 @@ function decodingOrder(chainMask, groups, rng) {
     steps.push(group);
   }
   return steps;
+}
+
+/**
+ * A decoding order as a list of steps, each step a list of tied positions.
+ * Fixed positions (chainMask 0) are decoded first so designed positions can see
+ * them, matching `argsort((chain_mask + 1e-4) * |randn|)`.
+ */
+function decodingOrder(chainMask, groups, rng) {
+  const L = chainMask.length;
+  const keys = new Float64Array(L);
+  for (let i = 0; i < L; i++) keys[i] = (chainMask[i] + 0.0001) * Math.abs(gaussian(rng));
+  const flat = Array.from({ length: L }, (_, i) => i).sort((x, y) => keys[x] - keys[y]);
+  return groupSteps(flat, groups);
 }
 
 /** Box-Muller, so decoding-order keys match the reference's |randn| shape. */
