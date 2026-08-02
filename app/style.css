@@ -343,48 +343,17 @@ details > summary {
 
 /* --- sequence logo ------------------------------------------------------ */
 
-.logo {
-  display: flex;
-  gap: 1px;
+.logo-wrap {
+  position: relative;
   overflow-x: auto;
-  align-items: flex-end;
-  height: 170px;
-  padding-bottom: 20px;
-  position: relative;
+  overflow-y: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  padding: 8px 0 4px 0;
 }
 
-.logo .col {
-  flex: 0 0 14px;
-  height: 150px;
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  position: relative;
-  cursor: pointer;
-}
-
-.logo .col:hover { background: var(--panel-2); }
-
-.logo .col .aa {
-  font-family: var(--mono);
-  font-size: 11px;
-  text-align: center;
-  line-height: 1;
-  overflow: hidden;
-  color: #04121e;
-  font-weight: 700;
-}
-
-.logo .col .tick {
-  position: absolute;
-  bottom: -18px;
-  left: 0;
-  right: 0;
-  text-align: center;
-  font-size: 9px;
-  color: var(--ink-dim);
-  font-family: var(--mono);
-}
+#logo { display: block; cursor: pointer; }
 
 /* --- amino-acid bias grid ---------------------------------------------- */
 

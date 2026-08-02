@@ -21,18 +21,57 @@ first load.
   within 6 Å of a ligand.
 - **Design** with a temperature, a batch size, per-amino-acid bias and
   omissions, tied/symmetric positions, and a seed that makes a run reproducible.
-- **Read a position profile** as a sequence logo, in three flavours (see
-  *Conditioning* below), and colour the structure by the model's confidence.
+- **Read a position profile** as a sequence logo -- bits on the y axis, glyphs
+  stretched to their share of the column, the native residue underneath -- in
+  three flavours (see *Conditioning* below). Hovering a column highlights that
+  residue in 3D and vice versa; clicking one toggles whether it is designed.
+  The structure can also be coloured by the model's confidence.
 
 Everything is plain ES modules. There is no bundler, no framework, and no
 runtime dependency — the only external resource the page ever fetches is a
 structure file, and only when you ask it to.
 
+## The renderer is vendored, not reimplemented
+
+`app/trace3d.js` and `app/sec.js` are copied **verbatim** from
+[CIRPIN-web](https://github.com/sokrypton/CIRPIN-web). Please do not rewrite
+them.
+
+There was a hand-written cartoon renderer here first and it was worse in ways
+that are not obvious until you look at a render: no background halo, so crossing
+elements blended into each other instead of occluding; whole elements sharing
+one depth, so a strand passing through a helix drew entirely in front of it;
+ribbon widths in screen units rather than angstroms, so a small domain looked
+chunky and a large one spindly; and a secondary-structure heuristic invented on
+the spot instead of TM-align's `make_sec`, which CIRPIN's parity suite already
+checks against the C++ to 5e-11. Every one of those is a comment in the vendored
+file explaining what the fix was for.
+
+The only modification is `setPaper()` at the bottom of `trace3d.js`, plus
+`PAPER_CSS` becoming `let` so it can follow. `shade()` expresses depth by
+blending toward the page background and returning an *opaque* colour, which only
+works if it knows what that background is; CIRPIN-web is a light page with a
+fixed paper colour and this one has a dark mode. `diff` against upstream shows
+exactly that one line changed.
+
+Everything else lives in `app/viewer.js`, which is an adapter: it decides
+colours, draws the ligand, and hit-tests residues (the renderer has no picking,
+and the design UI needs it). Its projection is copied line for line from
+`drawTraces` -- it has to be, or clicks land somewhere other than where the
+ribbon was drawn.
+
 ## Layout
 
 ```
 index.html          the page
-app/                UI: main.js, worker.js, viewer.js, style.css
+app/                UI
+  main.js             page controller: selection, worker, colour modes
+  worker.js           runs the engine off the main thread
+  trace3d.js          cartoon renderer -- VENDORED from CIRPIN-web
+  sec.js              C-alpha secondary structure -- VENDORED from CIRPIN-web
+  viewer.js           adapter: colours, ligand discs, residue picking
+  logo.js             sequence logo on a canvas
+  style.css
 mpnn/               the engine, usable on its own from Node or a browser
   constants.js        generated tables (see tools/gen_constants.py)
   ops.js              dense kernels: linear, GELU, LayerNorm, gathers

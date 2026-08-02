@@ -2,7 +2,8 @@
 
 import { ALPHABET } from "../mpnn/constants.js";
 import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
-import { Viewer, mix } from "./viewer.js";
+import { Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
+import { AA_COLORS, Logo } from "./logo.js";
 
 const WEIGHTS_BASE = new URL("../weights", import.meta.url).href;
 
@@ -66,21 +67,13 @@ const state = {
 let encodeToken = 0;
 
 const viewer = new Viewer($("viewer"));
+const logo = new Logo($("logo"));
 
 const CHAIN_COLORS = [
   "#38bdf8", "#f472b6", "#4ade80", "#fbbf24", "#a78bfa",
   "#fb923c", "#22d3ee", "#f87171", "#a3e635", "#c084fc",
 ];
 
-// Kyte-Doolittle-ish grouping, only used to colour the logo.
-const AA_COLORS = {
-  A: "#8ecae6", V: "#8ecae6", L: "#8ecae6", I: "#8ecae6", M: "#8ecae6", C: "#ffd166",
-  F: "#a78bfa", W: "#a78bfa", Y: "#a78bfa",
-  S: "#4ade80", T: "#4ade80", N: "#4ade80", Q: "#4ade80",
-  D: "#f87171", E: "#f87171",
-  K: "#60a5fa", R: "#60a5fa", H: "#60a5fa",
-  G: "#d4d4d8", P: "#fb923c", X: "#64748b",
-};
 
 // ---------------------------------------------------------------------------
 // Model list
@@ -174,6 +167,7 @@ async function loadStructureText(text, label) {
   $("profile-panel").hidden = true;
 
   viewer.setStructure(structure);
+  $("color-mode").value = structure.chainList.length > 1 ? "chain" : "rainbow";
   renderChainToggles();
   renderSequenceTrack();
   renderResults();
@@ -299,6 +293,7 @@ function renderChainToggles() {
 
 function refreshSelection() {
   renderSequenceTrack();
+  if (state.profile) renderLogo();
   redraw();
 }
 
@@ -333,64 +328,59 @@ function activeSequence() {
   return state.structure ? Array.from(state.structure.S) : null;
 }
 
-function colorFor(i) {
+/** Linear blend between two rgb triples. */
+function lerpRgb(a, b, t) {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+}
+
+/**
+ * Colour and weight for one residue.
+ *
+ * `dim` is the renderer's own mechanism for pushing something back, so fixed
+ * residues are dimmed through it rather than by pre-blending the colour --
+ * which keeps depth shading and selection dimming from compounding into mud.
+ */
+function colourFor(i) {
   const s = state.structure;
+  const dim = state.designMask[i] > 0 ? 1 : 0.42;
   const mode = $("color-mode").value;
+  let rgb;
   switch (mode) {
     case "design":
-      return state.designMask[i] ? "#38bdf8" : "#475569";
+      rgb = state.designMask[i] ? [56, 189, 248] : [100, 116, 139];
+      return { rgb, dim: 1 };
     case "confidence": {
-      if (!state.profile) return "#475569";
-      // Colour by 1 - normalised entropy over the 20 amino acids.
-      const h = state.profile.entropy[i];
-      const t = 1 - Math.min(h / Math.log(20), 1);
-      return mix("#1e3a8a", "#fbbf24", t);
+      if (!state.profile) return { rgb: [100, 116, 139], dim };
+      // 1 - normalised entropy over the 20 amino acids.
+      const t = 1 - Math.min(state.profile.entropy[i] / Math.log(20), 1);
+      rgb = lerpRgb([30, 58, 138], [251, 191, 36], t);
+      break;
     }
     case "identity": {
       const seq = activeSequence();
-      if (!seq) return "#475569";
-      return seq[i] === s.S[i] ? "#4ade80" : "#f87171";
+      if (!seq) { rgb = [100, 116, 139]; break; }
+      rgb = seq[i] === s.S[i] ? [74, 222, 128] : [248, 113, 113];
+      break;
     }
     case "rainbow":
-      return rainbow(i / Math.max(s.L - 1, 1));
+      rgb = spectrumRgb(i / Math.max(s.L - 1, 1));
+      break;
     case "chain":
     default:
-      return CHAIN_COLORS[s.chainLabels[i] % CHAIN_COLORS.length];
+      rgb = hexToRgb(CHAIN_COLORS[s.chainLabels[i] % CHAIN_COLORS.length]);
   }
-}
-
-function rainbow(t) {
-  const hue = (1 - t) * 250;
-  return `hsl(${hue}, 75%, 62%)`;
+  return { rgb, dim };
 }
 
 function redraw() {
   if (!state.structure) return;
-  viewer.colorAt = (i) => {
-    const c = colorFor(i);
-    return c.startsWith("hsl") ? hslToHex(c) : c;
-  };
-  viewer.dim = new Set();
-  if ($("color-mode").value !== "design") {
-    for (let i = 0; i < state.structure.L; i++) {
-      if (!state.designMask[i]) viewer.dim.add(i);
-    }
-  }
-  viewer.highlight = state.hover >= 0 ? new Set([state.hover]) : new Set();
-  viewer.background = getComputedStyle(document.body).backgroundColor.startsWith("rgb(246")
-    ? "#f6f8fc" : "#0b1220";
+  viewer.colourAt = colourFor;
+  viewer.highlight = state.hover;
   viewer.draw();
-}
-
-function hslToHex(hsl) {
-  const [h, s, l] = hsl.match(/[\d.]+/g).map(Number);
-  const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
-  const f = (n) => {
-    const k = (n + h / 30) % 12;
-    const v = l / 100 - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
-    return Math.round(255 * v).toString(16).padStart(2, "0");
-  };
-  return `#${f(0)}${f(8)}${f(4)}`;
+  if (state.profile && logo.hover !== state.hover) {
+    logo.hover = state.hover;
+    logo.draw();
+  }
 }
 
 function renderSequenceTrack() {
@@ -484,57 +474,20 @@ function renderResults() {
 // ---------------------------------------------------------------------------
 
 function renderLogo() {
-  const wrap = $("logo");
-  wrap.innerHTML = "";
-  const profile = state.profile;
-  if (!profile) return;
+  if (!state.profile) return;
   const s = state.structure;
-  const maxBits = Math.log2(20);
-
-  for (let i = 0; i < s.L; i++) {
-    const col = document.createElement("div");
-    col.className = "col";
-    // Standard sequence-logo height: total column height is the information
-    // content, each letter's share is its probability.
-    const bits = maxBits - profile.entropy[i] / Math.LN2;
-    const height = Math.max(0, Math.min(bits / maxBits, 1)) * 150;
-
-    const order = [];
-    for (let v = 0; v < 20; v++) order.push([v, profile.probs[i * 21 + v]]);
-    order.sort((a, b) => a[1] - b[1]);
-
-    for (const [v, p] of order) {
-      const h = p * height;
-      if (h < 1.2) continue;
-      const letter = document.createElement("div");
-      letter.className = "aa";
-      letter.style.height = `${h}px`;
-      letter.style.fontSize = `${Math.min(h * 1.25, 15)}px`;
-      letter.style.background = AA_COLORS[ALPHABET[v]] ?? "#64748b";
-      letter.textContent = ALPHABET[v];
-      col.appendChild(letter);
-    }
-
-    if (i % 10 === 0) {
-      const tick = document.createElement("div");
-      tick.className = "tick";
-      tick.textContent = String(s.resSeq[i]);
-      col.appendChild(tick);
-    }
-
-    col.title = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]} — `
-      + `${(bits).toFixed(2)} bits, top: ${topAAs(profile.probs, i)}`;
-    col.dataset.i = i;
-    col.onmouseenter = () => {
-      state.hover = i;
-      redraw();
-    };
-    col.onclick = () => {
-      state.designMask[i] = state.designMask[i] ? 0 : 1;
-      refreshSelection();
-    };
-    wrap.appendChild(col);
-  }
+  logo.readTheme(document.body);
+  logo.isDesigned = (i) => state.designMask[i] > 0;
+  logo.setData({
+    probs: state.profile.probs,
+    entropy: state.profile.entropy,
+    L: s.L,
+    native: s.S,
+    resSeq: s.resSeq,
+    chainIds: s.chainIds,
+  });
+  logo.hover = state.hover;
+  logo.draw();
 }
 
 function topAAs(probs, i, n = 3) {
@@ -858,42 +811,82 @@ $("download-fasta").onclick = () => {
 const canvas = $("viewer");
 const tooltip = $("tooltip");
 
-import("./viewer.js").then(({ attachControls }) => {
-  attachControls(canvas, viewer.camera, redraw, {
-    onHover: (point) => {
-      const i = viewer.pick(point);
-      if (i === state.hover) return;
-      state.hover = i;
-      if (i >= 0) {
-        const s = state.structure;
-        tooltip.hidden = false;
-        tooltip.textContent = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}\n`
-          + `${state.designMask[i] ? "designed" : "fixed"}`
-          + (state.profile ? `\n${topAAs(state.profile.probs, i)}` : "");
-        tooltip.style.left = `${point[0] + 14}px`;
-        tooltip.style.top = `${point[1] + 14}px`;
-      } else {
-        tooltip.hidden = true;
-      }
-      redraw();
-    },
-    onPick: (point) => {
-      const i = viewer.pick(point);
-      if (i < 0) return;
-      state.designMask[i] = state.designMask[i] ? 0 : 1;
-      refreshSelection();
-    },
-    onBoxSelect: (from, to, event) => {
-      const hits = viewer.pickBox(from, to);
-      for (const i of hits) state.designMask[i] = event.altKey ? 0 : 1;
-      viewer.box = null;
-      refreshSelection();
-    },
-  });
+function localPoint(event) {
+  const rect = canvas.getBoundingClientRect();
+  return [event.clientX - rect.left, event.clientY - rect.top];
+}
+
+// Shift-drag is box select. These listeners are registered BEFORE orbit()'s so
+// that, at the target, they run first and can claim the gesture with
+// stopImmediatePropagation -- otherwise the camera would rotate underneath the
+// selection rectangle.
+let boxing = null;
+
+canvas.addEventListener("pointerdown", (event) => {
+  if (!event.shiftKey) return;
+  event.stopImmediatePropagation();
+  event.preventDefault();
+  try {
+    canvas.setPointerCapture(event.pointerId);
+  } catch { /* not capturable */ }
+  const p = localPoint(event);
+  boxing = { from: p, to: p, subtract: event.altKey };
+  viewer.box = boxing;
 });
 
-canvas.addEventListener("boxupdate", (event) => {
-  viewer.box = { from: event.detail.from, to: event.detail.to };
+canvas.addEventListener("pointermove", (event) => {
+  if (!boxing) return;
+  event.stopImmediatePropagation();
+  boxing.to = localPoint(event);
+  viewer.box = boxing;
+  redraw();
+});
+
+function endBox(event) {
+  if (!boxing) return;
+  event.stopImmediatePropagation();
+  const hits = viewer.pickBox(boxing.from, boxing.to);
+  for (const i of hits) state.designMask[i] = boxing.subtract ? 0 : 1;
+  boxing = null;
+  viewer.box = null;
+  refreshSelection();
+}
+
+canvas.addEventListener("pointerup", endBox);
+canvas.addEventListener("pointercancel", endBox);
+
+orbit(canvas, viewer.camera, redraw, {
+  zoomMin: 0.4,
+  zoomMax: 12,
+  onClick: (event) => {
+    const i = viewer.pick(localPoint(event));
+    if (i < 0) return;
+    state.designMask[i] = state.designMask[i] ? 0 : 1;
+    refreshSelection();
+  },
+  onReset: () => viewer.resetCamera(),
+});
+
+// Hover, but only when nothing is being dragged.
+canvas.addEventListener("pointermove", (event) => {
+  if (boxing || event.buttons !== 0 || !state.structure) return;
+  const point = localPoint(event);
+  const i = viewer.pick(point);
+  if (i === state.hover) return;
+  state.hover = i;
+  if (i >= 0) {
+    const s = state.structure;
+    const ss = { H: "helix", E: "strand", T: "turn", C: "loop" }[viewer.sec[i]] ?? "loop";
+    tooltip.hidden = false;
+    tooltip.textContent = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}  ${ss}\n`
+      + `${state.designMask[i] ? "designed" : "fixed"}`
+      + (state.profile ? `\n${topAAs(state.profile.probs, i)}` : "");
+    tooltip.style.left = `${Math.min(point[0] + 14, canvas.clientWidth - 190)}px`;
+    tooltip.style.top = `${point[1] + 14}px`;
+  } else {
+    tooltip.hidden = true;
+  }
+  redraw();
 });
 
 canvas.addEventListener("pointerleave", () => {
@@ -904,6 +897,51 @@ canvas.addEventListener("pointerleave", () => {
 
 window.addEventListener("resize", redraw);
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", redraw);
+
+// --- logo interaction ------------------------------------------------------
+
+const logoCanvas = $("logo");
+const logoTooltip = $("logo-tooltip");
+
+logoCanvas.addEventListener("pointermove", (event) => {
+  const rect = logoCanvas.getBoundingClientRect();
+  const i = logo.pick(event.clientX - rect.left);
+  if (i !== state.hover) {
+    state.hover = i;
+    redraw();
+  }
+  if (i >= 0) {
+    logoTooltip.hidden = false;
+    logoTooltip.textContent = logo.describe(i);
+    logoTooltip.style.left = `${event.clientX - rect.left + 12}px`;
+    logoTooltip.style.top = "6px";
+  } else {
+    logoTooltip.hidden = true;
+  }
+});
+
+logoCanvas.addEventListener("pointerleave", () => {
+  logoTooltip.hidden = true;
+  state.hover = -1;
+  redraw();
+});
+
+logoCanvas.addEventListener("click", (event) => {
+  const rect = logoCanvas.getBoundingClientRect();
+  const i = logo.pick(event.clientX - rect.left);
+  if (i < 0) return;
+  state.designMask[i] = state.designMask[i] ? 0 : 1;
+  refreshSelection();
+});
+
+$("logo-wider").onclick = () => {
+  logo.columnWidth = Math.min(logo.columnWidth + 4, 48);
+  renderLogo();
+};
+$("logo-narrower").onclick = () => {
+  logo.columnWidth = Math.max(logo.columnWidth - 4, 5);
+  renderLogo();
+};
 
 // --- boot -----------------------------------------------------------------
 

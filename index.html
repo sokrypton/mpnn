@@ -164,10 +164,15 @@
           <option value="all-but-self">conditioned on the rest (1 pass, approximate)</option>
           <option value="exact">conditioned on the rest (L passes, exact)</option>
         </select>
+        <button id="logo-wider" title="wider columns">&plus;</button>
+        <button id="logo-narrower" title="narrower columns">&minus;</button>
       </div>
     </div>
     <p class="hint" id="profile-hint"></p>
-    <div id="logo" class="logo"></div>
+    <div class="logo-wrap">
+      <canvas id="logo"></canvas>
+      <div id="logo-tooltip" class="tooltip" hidden></div>
+    </div>
   </section>
 
 </main>

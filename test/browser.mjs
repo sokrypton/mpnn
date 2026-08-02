@@ -100,17 +100,20 @@ const canvasInk = await page.evaluate(() => {
   }
   return {
     painted, total: data.length / 4, w: c.width, h: c.height,
-    fillW: (x1 - x0) / c.width, fillH: (y1 - y0) / c.height,
+    side: Math.min(c.width, c.height),
+    fillW: (x1 - x0) / Math.min(c.width, c.height),
+    fillH: (y1 - y0) / Math.min(c.width, c.height),
   };
 });
 console.log(
   `viewer: ${canvasInk.painted} of ${canvasInk.total} px painted, `
   + `bounding box fills ${(canvasInk.fillW * 100).toFixed(0)}% x `
-  + `${(canvasInk.fillH * 100).toFixed(0)}% of the canvas`,
+  + `${(canvasInk.fillH * 100).toFixed(0)}% of the ${canvasInk.side}px draw box`,
 );
 if (canvasInk.painted < 1000) problems.push("viewer drew almost nothing");
-if (canvasInk.fillH < 0.55) {
-  problems.push(`structure only fills ${(canvasInk.fillH * 100).toFixed(0)}% of the canvas height`);
+if (Math.max(canvasInk.fillW, canvasInk.fillH) < 0.7) {
+  problems.push(
+    `structure only fills ${(canvasInk.fillH * 100).toFixed(0)}% of the draw box`);
 }
 
 const stillHidden = await page.evaluate(() =>
@@ -147,9 +150,40 @@ await page.waitForFunction(
   { timeout: 300000 },
 );
 console.log("profile:", (await page.textContent("#design-status")).trim());
-const columns = await page.evaluate(() => document.querySelectorAll("#logo .col").length);
-console.log(`logo: ${columns} columns`);
-if (columns === 0) problems.push("logo rendered no columns");
+// The logo is a canvas, so check what it painted rather than counting nodes:
+// how much ink, and how many distinct columns actually got glyphs.
+const logoInk = await page.evaluate(() => {
+  const c = document.getElementById("logo");
+  const ctx = c.getContext("2d");
+  const { data } = ctx.getImageData(0, 0, c.width, c.height);
+  let painted = 0;
+  const cols = new Set();
+  for (let i = 0; i < data.length; i += 4) {
+    if (data[i + 3] === 0) continue;
+    painted++;
+    cols.add(Math.floor(((i / 4) % c.width) / 8));
+  }
+  return { painted, cols: cols.size, w: c.width, h: c.height };
+});
+console.log(`logo: ${logoInk.w}x${logoInk.h}, ${logoInk.painted} px in ${logoInk.cols} bands`);
+if (logoInk.painted < 5000) problems.push("logo painted almost nothing");
+if (logoInk.cols < 20) problems.push("logo has too few distinct columns");
+
+// Hovering a logo column must drive the 3D highlight, and clicking must toggle
+// the same residue the sequence track shows.
+const designedBefore = await page.evaluate(() =>
+  document.querySelectorAll(".res.designed").length);
+await page.evaluate(() => {
+  const c = document.getElementById("logo");
+  const r = c.getBoundingClientRect();
+  c.dispatchEvent(new PointerEvent("click", {
+    clientX: r.left + 38 + 15 * 3 + 7, clientY: r.top + 20, bubbles: true,
+  }));
+});
+const designedAfter = await page.evaluate(() =>
+  document.querySelectorAll(".res.designed").length);
+console.log(`logo click: ${designedBefore} -> ${designedAfter} designed`);
+if (designedAfter !== designedBefore - 1) problems.push("clicking a logo column did nothing");
 
 // Selection round-trip: clicking a residue in the track toggles it.
 const before = await page.evaluate(() => document.querySelectorAll(".res.designed").length);
