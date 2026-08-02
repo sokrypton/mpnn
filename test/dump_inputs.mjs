@@ -44,6 +44,9 @@ for (const spec of structures) {
       ligandXyz: [...s.ligandXyz],
       ligandType: [...s.ligandType],
       ligandMask: [...s.ligandMask],
+      // 0 soluble, 1 interface, 2 buried -- a deterministic mix, so the
+      // membrane models are exercised with something other than all zeros.
+      membraneLabels: Array.from({ length: s.L }, (_, i) => (i * 7) % 11 < 3 ? 2 : (i % 5 === 0 ? 1 : 0)),
     },
   });
   console.log(

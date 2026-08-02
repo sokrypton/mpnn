@@ -43,13 +43,17 @@ jobs:
           python tools/gen_constants.py --ref "${{ steps.ref.outputs.dir }}" --out /tmp/constants.js
           diff /tmp/constants.js mpnn/constants.js
 
+      - name: Neighbour graph identical to the exact sweep
+        run: node test/neighbors.mjs assets/1ubq.pdb assets/1stp.pdb
+
       - name: Parity against PyTorch (both kernels)
         run: |
           node test/dump_inputs.mjs /tmp/inputs.json \
             "1ubq=assets/1ubq.pdb=proteinmpnn_v_48_020=protein_mpnn" \
             "1stp=assets/1stp.pdb=ligandmpnn_v_32_010_25=ligand_mpnn" \
             "1ubq_sol=assets/1ubq.pdb=solublempnn_v_48_020=soluble_mpnn" \
-            "1ubq_mem=assets/1ubq.pdb=per_residue_label_membrane_mpnn_v_48_020=per_residue_label_membrane_mpnn"
+            "1ubq_mem=assets/1ubq.pdb=per_residue_label_membrane_mpnn_v_48_020=per_residue_label_membrane_mpnn" \
+            "1stp_glob=assets/1stp.pdb=global_label_membrane_mpnn_v_48_020=global_label_membrane_mpnn"
           python tools/make_reference.py \
             --ref "${{ steps.ref.outputs.dir }}" \
             --checkpoints "${{ steps.ref.outputs.dir }}/data/model_params" \

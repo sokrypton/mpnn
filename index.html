@@ -57,6 +57,26 @@
         Use ligand atom context
       </label>
     </div>
+    <div id="membrane-global-row" hidden>
+      <div class="row">
+        <select id="membrane-global">
+          <option value="0">whole chain: soluble</option>
+          <option value="1">whole chain: transmembrane</option>
+        </select>
+      </div>
+    </div>
+    <div id="membrane-perres-row" hidden>
+      <p class="hint">
+        Label the residues selected in the viewer. Untouched residues stay
+        soluble.
+      </p>
+      <div class="row">
+        <button id="mem-soluble">Soluble</button>
+        <button id="mem-interface">Interface</button>
+        <button id="mem-buried">Buried</button>
+        <button id="mem-reset">Reset</button>
+      </div>
+    </div>
     <p class="status" id="model-status">No model loaded.</p>
     <p class="hint" id="kernel-status"></p>
   </section>
@@ -72,6 +92,7 @@
           <option value="confidence">colour: model confidence</option>
           <option value="identity">colour: identity to input</option>
           <option value="rainbow">colour: N → C</option>
+          <option value="membrane">colour: membrane label</option>
         </select>
         <button id="select-all">All</button>
         <button id="select-none">None</button>

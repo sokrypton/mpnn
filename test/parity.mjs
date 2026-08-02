@@ -80,7 +80,7 @@ for (const ref of reference) {
     ligandXyz: Float32Array.from(raw.ligandXyz),
     ligandType: Int32Array.from(raw.ligandType),
     ligandMask: Float32Array.from(raw.ligandMask),
-    membraneLabels: new Int32Array(raw.L),
+    membraneLabels: Int32Array.from(raw.membraneLabels ?? new Array(raw.L).fill(0)),
   };
 
   const t0 = performance.now();

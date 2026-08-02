@@ -203,6 +203,38 @@ for (const mode of ["chain", "design", "confidence", "identity", "rainbow"]) {
 }
 console.log("colour modes: ok");
 
+// --- membrane labels must reach the encoder ---------------------------------
+{
+  console.log("\n-- MembraneMPNN --");
+  await page.selectOption("#model-select", "per_residue_label_membrane_mpnn_v_48_020");
+  await waitReady(76, 300000);
+  const controlShown = await page.evaluate(() =>
+    !document.getElementById("membrane-perres-row").hidden);
+  if (!controlShown) problems.push("per-residue membrane control stayed hidden");
+
+  // Label half the chain buried, and check it forces a re-encode rather than
+  // silently reusing the all-soluble one.
+  await page.click("#select-none");
+  await page.evaluate(() => {
+    for (let i = 0; i < 38; i++) document.querySelector(`.res[data-i="${i}"]`).click();
+  });
+  const before = await page.textContent("#model-status");
+  await page.click("#mem-buried");
+  await page.waitForFunction(
+    (prev) => document.getElementById("model-status").textContent !== prev
+      && /encoded 76 residues/.test(document.getElementById("model-status").textContent),
+    before, { timeout: 300000 },
+  );
+  const labels = await page.evaluate(() => {
+    const c = document.getElementById("viewer");
+    return c.getContext("2d").getImageData(0, 0, c.width, c.height).data.length;
+  });
+  console.log("membrane: labelled 38 residues buried, re-encoded", labels > 0 ? "ok" : "");
+  await page.click("#mem-reset");
+  await waitReady(76, 300000);
+  await page.click("#select-all");
+}
+
 // --- second phase: LigandMPNN on a structure with a real ligand ------------
 if (!process.argv.includes("--no-ligand")) {
   console.log("\n-- LigandMPNN --");

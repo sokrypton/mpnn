@@ -59,6 +59,9 @@ const state = {
   encodedFor: null,
   /** Bumped on every structure load so a stale encode cannot be reused. */
   structureId: 0,
+  /** 0 soluble, 1 interface, 2 buried. Only the membrane models read it. */
+  membraneLabels: null,
+  membraneVersion: 0,
 };
 
 // Monotonic token for in-flight encodes. Changing the model and loading a new
@@ -132,6 +135,8 @@ function updateModelHint() {
     + `k=${model.k_neighbors} neighbours`
     + (model.atom_context_num ? `, ${model.atom_context_num} ligand atoms per residue` : "");
   $("atom-context-row").hidden = type !== "ligand_mpnn";
+  $("membrane-global-row").hidden = type !== "global_label_membrane_mpnn";
+  $("membrane-perres-row").hidden = type !== "per_residue_label_membrane_mpnn";
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +165,8 @@ async function loadStructureText(text, label) {
   state.structure = structure;
   state.structureId += 1;
   state.designMask = new Float32Array(structure.L).fill(1);
+  state.membraneLabels = new Int32Array(structure.L);
+  state.membraneVersion += 1;
   state.designs = [];
   state.activeDesign = -1;
   state.profile = null;
@@ -204,7 +211,7 @@ async function ensureEncoded() {
   if (!structure) return false;
   const name = $("model-select").value;
   const useAtomContext = $("use-atom-context").checked;
-  const key = `${name}|${useAtomContext}|${state.structureId}`;
+  const key = `${name}|${useAtomContext}|${state.structureId}|${state.membraneVersion}`;
   if (state.encodedFor === key) return true;
   const token = ++encodeToken;
 
@@ -237,7 +244,7 @@ async function ensureEncoded() {
         residueIdx: structure.residueIdx, chainLabels: structure.chainLabels,
         ligandXyz: structure.ligandXyz, ligandType: structure.ligandType,
         ligandMask: structure.ligandMask,
-        membraneLabels: null,
+        membraneLabels: state.membraneLabels ? Array.from(state.membraneLabels) : null,
         useAtomContext,
       },
     });
@@ -369,6 +376,11 @@ function colourFor(i) {
     case "rainbow":
       rgb = spectrumRgb(i / Math.max(s.L - 1, 1));
       break;
+    case "membrane": {
+      const label = state.membraneLabels ? state.membraneLabels[i] : 0;
+      rgb = [[100, 116, 139], [251, 191, 36], [56, 189, 248]][label] ?? [100, 116, 139];
+      return { rgb, dim: 1 };
+    }
     case "chain":
     default:
       rgb = hexToRgb(CHAIN_COLORS[s.chainLabels[i] % CHAIN_COLORS.length]);
@@ -775,6 +787,36 @@ $("select-interface").onclick = () => {
   state.designMask.fill(0);
   for (const i of hits) state.designMask[i] = 1;
   refreshSelection();
+};
+
+function paintMembrane(label) {
+  if (!state.structure) return;
+  for (let i = 0; i < state.structure.L; i++) {
+    if (state.designMask[i] > 0) state.membraneLabels[i] = label;
+  }
+  state.membraneVersion += 1;
+  state.encodedFor = null;
+  $("color-mode").value = "membrane";
+  refreshSelection();
+  ensureEncoded();
+}
+
+$("mem-soluble").onclick = () => paintMembrane(0);
+$("mem-interface").onclick = () => paintMembrane(1);
+$("mem-buried").onclick = () => paintMembrane(2);
+$("mem-reset").onclick = () => {
+  state.membraneLabels.fill(0);
+  state.membraneVersion += 1;
+  state.encodedFor = null;
+  refreshSelection();
+  ensureEncoded();
+};
+
+$("membrane-global").onchange = (event) => {
+  state.membraneLabels.fill(Number(event.target.value));
+  state.membraneVersion += 1;
+  state.encodedFor = null;
+  ensureEncoded();
 };
 
 $("design-btn").onclick = runDesign;
