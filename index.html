@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LigandMPNN in the browser</title>
+<meta name="description" content="ProteinMPNN, SolubleMPNN, LigandMPNN and MembraneMPNN running entirely client side. Nothing is uploaded.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🧬</text></svg>">
+<link rel="stylesheet" href="app/style.css">
+</head>
+<body>
+
+<header>
+  <h1>mpnn<span class="dot">.</span>web</h1>
+  <p class="tagline">
+    ProteinMPNN &middot; SolubleMPNN &middot; LigandMPNN &middot; MembraneMPNN,
+    running in this tab. Nothing is uploaded &mdash; the weights come down once and
+    every forward pass happens on your machine.
+  </p>
+</header>
+
+<main>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="panel" id="load-panel">
+    <h2>1 &middot; Structure</h2>
+    <div class="row">
+      <input id="pdb-id" type="text" placeholder="PDB ID (1UBQ) or UniProt (P69905)" spellcheck="false">
+      <button id="fetch-btn" class="primary">Fetch</button>
+    </div>
+    <div class="row">
+      <label class="file-drop" id="file-drop">
+        <input type="file" id="file-input" accept=".pdb,.cif,.ent,.mmcif,.txt" hidden>
+        <span>Drop a PDB / mmCIF file, or click to browse</span>
+      </label>
+    </div>
+    <div class="examples">
+      Try:
+      <button class="link" data-example="1UBQ">1UBQ ubiquitin</button>
+      <button class="link" data-example="1STP">1STP streptavidin + biotin</button>
+      <button class="link" data-example="4KT0">4KT0 with ligand</button>
+      <button class="link" data-example="1BL8">1BL8 K⁺ channel</button>
+    </div>
+    <p class="status" id="load-status">No structure loaded.</p>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="panel" id="model-panel">
+    <h2>2 &middot; Model</h2>
+    <div class="row">
+      <select id="model-select"></select>
+    </div>
+    <p class="hint" id="model-hint"></p>
+    <div class="row" id="atom-context-row" hidden>
+      <label class="check">
+        <input type="checkbox" id="use-atom-context" checked>
+        Use ligand atom context
+      </label>
+    </div>
+    <p class="status" id="model-status">No model loaded.</p>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="panel wide" id="viewer-panel">
+    <div class="viewer-head">
+      <h2>3 &middot; Pick what to design</h2>
+      <div class="viewer-tools">
+        <select id="color-mode">
+          <option value="chain">colour: chain</option>
+          <option value="design">colour: designed / fixed</option>
+          <option value="confidence">colour: model confidence</option>
+          <option value="identity">colour: identity to input</option>
+          <option value="rainbow">colour: N → C</option>
+        </select>
+        <button id="select-all">All</button>
+        <button id="select-none">None</button>
+        <button id="select-invert">Invert</button>
+        <button id="select-interface">Near ligand</button>
+      </div>
+    </div>
+    <div class="viewer-wrap">
+      <canvas id="viewer"></canvas>
+      <div class="viewer-hint">drag rotate &middot; wheel zoom &middot; click residue &middot; shift-drag box select &middot; double-click reset</div>
+      <div id="tooltip" class="tooltip" hidden></div>
+    </div>
+    <div id="chain-toggles" class="chain-toggles"></div>
+    <div id="sequence-track" class="sequence-track"></div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="panel" id="design-panel">
+    <h2>4 &middot; Design</h2>
+    <div class="control">
+      <label for="temperature">Temperature <output id="temperature-out">0.10</output></label>
+      <input type="range" id="temperature" min="0.01" max="1.0" step="0.01" value="0.1">
+      <p class="hint">Low is conservative and repeatable; high explores.</p>
+    </div>
+    <div class="control">
+      <label for="batch">Sequences per run <output id="batch-out">8</output></label>
+      <input type="range" id="batch" min="1" max="64" step="1" value="8">
+    </div>
+    <div class="control">
+      <label for="seed">Seed</label>
+      <div class="row">
+        <input type="number" id="seed" value="0" min="0" step="1">
+        <label class="check"><input type="checkbox" id="random-seed" checked> random</label>
+      </div>
+    </div>
+
+    <details class="control">
+      <summary>Amino-acid bias &amp; omissions</summary>
+      <p class="hint">
+        Bias is added to the logits before sampling, so +2 makes a residue
+        roughly e² times more likely. Omit removes it entirely.
+      </p>
+      <div id="aa-bias" class="aa-bias"></div>
+      <div class="row">
+        <button id="bias-reset">Reset bias</button>
+        <button id="omit-cys">Omit C</button>
+        <button id="omit-met">Omit M</button>
+      </div>
+    </details>
+
+    <details class="control">
+      <summary>Symmetry / tied positions</summary>
+      <p class="hint">
+        Comma-separated groups of 1-based positions that must share an identity,
+        e.g. <code>10+40, 11+41</code>. Tied positions are decoded together and
+        their logits averaged.
+      </p>
+      <input id="symmetry" type="text" placeholder="10+40, 11+41" spellcheck="false">
+    </details>
+
+    <div class="row">
+      <button id="design-btn" class="primary" disabled>Design</button>
+      <button id="profile-btn" disabled>Position profile</button>
+    </div>
+    <p class="status" id="design-status"></p>
+    <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="panel" id="results-panel">
+    <div class="viewer-head">
+      <h2>Results</h2>
+      <div class="viewer-tools">
+        <button id="copy-fasta" disabled>Copy FASTA</button>
+        <button id="download-fasta" disabled>Download</button>
+        <button id="clear-results" disabled>Clear</button>
+      </div>
+    </div>
+    <div id="results" class="results">
+      <p class="empty">Designs will appear here. Click one to paint it onto the structure.</p>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------------------ -->
+  <section class="panel wide" id="profile-panel" hidden>
+    <div class="viewer-head">
+      <h2>Position profile</h2>
+      <div class="viewer-tools">
+        <select id="profile-mode">
+          <option value="none">backbone only (1 pass)</option>
+          <option value="all-but-self">conditioned on the rest (1 pass, approximate)</option>
+          <option value="exact">conditioned on the rest (L passes, exact)</option>
+        </select>
+      </div>
+    </div>
+    <p class="hint" id="profile-hint"></p>
+    <div id="logo" class="logo"></div>
+  </section>
+
+</main>
+
+<footer>
+  <p>
+    Weights and model architecture from
+    <a href="https://github.com/dauparas/LigandMPNN">dauparas/LigandMPNN</a>
+    (MIT). Speed and API ideas from
+    <a href="https://github.com/sokrypton/ColabDesign">ColabDesign</a>;
+    page structure after
+    <a href="https://github.com/sokrypton/CIRPIN-web">CIRPIN-web</a>.
+    Structures fetched from <a href="https://www.rcsb.org">RCSB</a> and the
+    <a href="https://alphafold.ebi.ac.uk">AlphaFold DB</a>.
+  </p>
+  <p><a href="https://github.com/sokrypton/mpnn">source</a></p>
+</footer>
+
+<script type="module" src="app/main.js"></script>
+</body>
+</html>

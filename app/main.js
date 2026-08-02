@@ -1,0 +1,922 @@
+// Page controller: owns the DOM, the selection state, and the worker.
+
+import { ALPHABET } from "../mpnn/constants.js";
+import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
+import { Viewer, mix } from "./viewer.js";
+
+const WEIGHTS_BASE = new URL("../weights", import.meta.url).href;
+
+const $ = (id) => document.getElementById(id);
+
+// ---------------------------------------------------------------------------
+// Worker plumbing
+// ---------------------------------------------------------------------------
+
+const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+const pending = new Map();
+let nextId = 1;
+let onProgress = null;
+
+worker.onmessage = (event) => {
+  const message = event.data;
+  if (message.type === "progress") {
+    if (onProgress) onProgress(message);
+    return;
+  }
+  const entry = pending.get(message.id);
+  if (!entry) return;
+  pending.delete(message.id);
+  if (message.ok) entry.resolve(message);
+  else entry.reject(new Error(message.error));
+};
+
+function call(type, payload = {}, transfer = []) {
+  const id = nextId++;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    worker.postMessage({ id, type, ...payload }, transfer);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const state = {
+  structure: null,
+  models: [],
+  modelName: null,
+  modelType: null,
+  /** 1 = design this position, 0 = keep it. */
+  designMask: null,
+  bias: new Float32Array(21),
+  omitted: new Set(),
+  designs: [],
+  activeDesign: -1,
+  profile: null,
+  hover: -1,
+  encodedFor: null,
+  /** Bumped on every structure load so a stale encode cannot be reused. */
+  structureId: 0,
+};
+
+// Monotonic token for in-flight encodes. Changing the model and loading a new
+// structure in quick succession queues two encodes; only the newest may claim
+// the cache, or the page ends up designing against the previous structure.
+let encodeToken = 0;
+
+const viewer = new Viewer($("viewer"));
+
+const CHAIN_COLORS = [
+  "#38bdf8", "#f472b6", "#4ade80", "#fbbf24", "#a78bfa",
+  "#fb923c", "#22d3ee", "#f87171", "#a3e635", "#c084fc",
+];
+
+// Kyte-Doolittle-ish grouping, only used to colour the logo.
+const AA_COLORS = {
+  A: "#8ecae6", V: "#8ecae6", L: "#8ecae6", I: "#8ecae6", M: "#8ecae6", C: "#ffd166",
+  F: "#a78bfa", W: "#a78bfa", Y: "#a78bfa",
+  S: "#4ade80", T: "#4ade80", N: "#4ade80", Q: "#4ade80",
+  D: "#f87171", E: "#f87171",
+  K: "#60a5fa", R: "#60a5fa", H: "#60a5fa",
+  G: "#d4d4d8", P: "#fb923c", X: "#64748b",
+};
+
+// ---------------------------------------------------------------------------
+// Model list
+// ---------------------------------------------------------------------------
+
+const MODEL_LABELS = {
+  protein_mpnn: "ProteinMPNN",
+  soluble_mpnn: "SolubleMPNN",
+  ligand_mpnn: "LigandMPNN",
+  per_residue_label_membrane_mpnn: "MembraneMPNN (per residue)",
+  global_label_membrane_mpnn: "MembraneMPNN (global)",
+};
+
+const MODEL_NOTES = {
+  protein_mpnn: "The original. Backbone only.",
+  soluble_mpnn: "Trained without membrane proteins; avoids hydrophobic surfaces.",
+  ligand_mpnn: "Sees heteroatoms — ligands, cofactors, metals, nucleic acids.",
+  per_residue_label_membrane_mpnn: "Takes a per-residue buried/interface/soluble label.",
+  global_label_membrane_mpnn: "Takes one label for the whole chain.",
+};
+
+async function loadModelList() {
+  const response = await fetch(`${WEIGHTS_BASE}/models.json`);
+  state.models = await response.json();
+  const select = $("model-select");
+  select.innerHTML = "";
+
+  const byType = new Map();
+  for (const model of state.models) {
+    if (!byType.has(model.model_type)) byType.set(model.model_type, []);
+    byType.get(model.model_type).push(model);
+  }
+  for (const [type, group] of byType) {
+    const optgroup = document.createElement("optgroup");
+    optgroup.label = MODEL_LABELS[type] ?? type;
+    for (const model of group) {
+      const option = document.createElement("option");
+      option.value = model.name;
+      option.dataset.type = type;
+      const noise = model.noise_level.toFixed(2);
+      option.textContent = `${model.name}  —  ${noise} Å training noise, ${(model.bytes / 1e6).toFixed(1)} MB`;
+      optgroup.appendChild(option);
+    }
+    select.appendChild(optgroup);
+  }
+  select.value = "proteinmpnn_v_48_020";
+  updateModelHint();
+}
+
+function updateModelHint() {
+  const option = $("model-select").selectedOptions[0];
+  if (!option) return;
+  const type = option.dataset.type;
+  const model = state.models.find((m) => m.name === option.value);
+  $("model-hint").textContent = `${MODEL_NOTES[type] ?? ""} `
+    + `k=${model.k_neighbors} neighbours`
+    + (model.atom_context_num ? `, ${model.atom_context_num} ligand atoms per residue` : "");
+  $("atom-context-row").hidden = type !== "ligand_mpnn";
+}
+
+// ---------------------------------------------------------------------------
+// Structure loading
+// ---------------------------------------------------------------------------
+
+function setStatus(id, text, kind = "") {
+  const el = $(id);
+  el.textContent = text;
+  el.className = `status ${kind}`;
+}
+
+async function loadStructureText(text, label) {
+  let structure;
+  try {
+    structure = structureFromText(text);
+  } catch (error) {
+    setStatus("load-status", `Could not parse: ${error.message}`, "error");
+    return;
+  }
+  if (structure.L === 0) {
+    setStatus("load-status", "No protein residues with a C-alpha found.", "error");
+    return;
+  }
+
+  state.structure = structure;
+  state.structureId += 1;
+  state.designMask = new Float32Array(structure.L).fill(1);
+  state.designs = [];
+  state.activeDesign = -1;
+  state.profile = null;
+  state.encodedFor = null;
+  $("profile-panel").hidden = true;
+
+  viewer.setStructure(structure);
+  renderChainToggles();
+  renderSequenceTrack();
+  renderResults();
+  redraw();
+
+  const ligand = structure.ligandType.length;
+  setStatus(
+    "load-status",
+    `${label}: ${structure.L} residues, ${structure.chainList.length} chain(s)`
+    + (ligand ? `, ${ligand} ligand/heteroatom atoms` : ", no heteroatoms"),
+  );
+  if (ligand && !$("model-select").value.startsWith("ligandmpnn")) {
+    setStatus("model-status", "This structure has heteroatoms — LigandMPNN will use them.", "");
+  }
+  await ensureEncoded();
+}
+
+async function fetchStructure(id) {
+  setStatus("load-status", `Fetching ${id}…`, "busy");
+  try {
+    const text = await fetchPDB(id);
+    await loadStructureText(text, id.toUpperCase());
+  } catch (error) {
+    setStatus("load-status", `Fetch failed: ${error.message}`, "error");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Encoding
+// ---------------------------------------------------------------------------
+
+async function ensureEncoded() {
+  const structure = state.structure;
+  if (!structure) return false;
+  const name = $("model-select").value;
+  const useAtomContext = $("use-atom-context").checked;
+  const key = `${name}|${useAtomContext}|${state.structureId}`;
+  if (state.encodedFor === key) return true;
+  const token = ++encodeToken;
+
+  try {
+    if (state.modelName !== name) {
+      setStatus("model-status", `Loading ${name}…`, "busy");
+      showProgress(0);
+      onProgress = (message) => {
+        if (message.stage === "download" && message.total) {
+          showProgress(message.received / message.total);
+        }
+      };
+      const info = await call("load", { name, baseUrl: WEIGHTS_BASE });
+      onProgress = null;
+      hideProgress();
+      if (token !== encodeToken) return false;
+      state.modelName = name;
+      state.modelType = info.modelType;
+    }
+
+    setStatus("model-status", "Encoding structure…", "busy");
+    const t0 = performance.now();
+    const info = await call("encode", {
+      inputs: {
+        X: structure.X, mask: structure.mask,
+        residueIdx: structure.residueIdx, chainLabels: structure.chainLabels,
+        ligandXyz: structure.ligandXyz, ligandType: structure.ligandType,
+        ligandMask: structure.ligandMask,
+        membraneLabels: null,
+        useAtomContext,
+      },
+    });
+    // A newer request has superseded us; its encoding is the one the worker
+    // now holds, so do not claim the cache or report readiness.
+    if (token !== encodeToken) return false;
+    state.encodedFor = key;
+    setStatus(
+      "model-status",
+      `${state.modelName} ready — encoded ${info.L} residues in `
+      + `${(info.ms / 1000).toFixed(2)} s (${((performance.now() - t0) / 1000).toFixed(2)} s total)`,
+    );
+    $("design-btn").disabled = false;
+    $("profile-btn").disabled = false;
+    return true;
+  } catch (error) {
+    onProgress = null;
+    hideProgress();
+    if (token === encodeToken) setStatus("model-status", `Failed: ${error.message}`, "error");
+    return false;
+  }
+}
+
+function showProgress(fraction) {
+  $("progress").hidden = false;
+  $("progress-bar").style.width = `${Math.round(fraction * 100)}%`;
+}
+
+function hideProgress() {
+  $("progress").hidden = true;
+  $("progress-bar").style.width = "0%";
+}
+
+// ---------------------------------------------------------------------------
+// Selection
+// ---------------------------------------------------------------------------
+
+function renderChainToggles() {
+  const wrap = $("chain-toggles");
+  wrap.innerHTML = "";
+  if (!state.structure) return;
+  for (const chain of state.structure.chainList) {
+    const button = document.createElement("button");
+    button.textContent = `chain ${chain}`;
+    button.onclick = () => {
+      const positions = [];
+      for (let i = 0; i < state.structure.L; i++) {
+        if (state.structure.chainIds[i] === chain) positions.push(i);
+      }
+      const allOn = positions.every((i) => state.designMask[i] === 1);
+      for (const i of positions) state.designMask[i] = allOn ? 0 : 1;
+      refreshSelection();
+    };
+    wrap.appendChild(button);
+  }
+}
+
+function refreshSelection() {
+  renderSequenceTrack();
+  redraw();
+}
+
+/** Residues with any backbone atom within `cutoff` of a heteroatom. */
+function nearLigand(cutoff = 6.0) {
+  const s = state.structure;
+  const hits = new Set();
+  if (!s || !s.ligandType.length) return hits;
+  for (let i = 0; i < s.L; i++) {
+    const cx = s.X[i * 12 + 3];
+    const cy = s.X[i * 12 + 4];
+    const cz = s.X[i * 12 + 5];
+    for (let a = 0; a < s.ligandType.length; a++) {
+      const dx = cx - s.ligandXyz[a * 3];
+      const dy = cy - s.ligandXyz[a * 3 + 1];
+      const dz = cz - s.ligandXyz[a * 3 + 2];
+      if (dx * dx + dy * dy + dz * dz <= cutoff * cutoff) {
+        hits.add(i);
+        break;
+      }
+    }
+  }
+  return hits;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+function activeSequence() {
+  if (state.activeDesign >= 0) return state.designs[state.activeDesign].S;
+  return state.structure ? Array.from(state.structure.S) : null;
+}
+
+function colorFor(i) {
+  const s = state.structure;
+  const mode = $("color-mode").value;
+  switch (mode) {
+    case "design":
+      return state.designMask[i] ? "#38bdf8" : "#475569";
+    case "confidence": {
+      if (!state.profile) return "#475569";
+      // Colour by 1 - normalised entropy over the 20 amino acids.
+      const h = state.profile.entropy[i];
+      const t = 1 - Math.min(h / Math.log(20), 1);
+      return mix("#1e3a8a", "#fbbf24", t);
+    }
+    case "identity": {
+      const seq = activeSequence();
+      if (!seq) return "#475569";
+      return seq[i] === s.S[i] ? "#4ade80" : "#f87171";
+    }
+    case "rainbow":
+      return rainbow(i / Math.max(s.L - 1, 1));
+    case "chain":
+    default:
+      return CHAIN_COLORS[s.chainLabels[i] % CHAIN_COLORS.length];
+  }
+}
+
+function rainbow(t) {
+  const hue = (1 - t) * 250;
+  return `hsl(${hue}, 75%, 62%)`;
+}
+
+function redraw() {
+  if (!state.structure) return;
+  viewer.colorAt = (i) => {
+    const c = colorFor(i);
+    return c.startsWith("hsl") ? hslToHex(c) : c;
+  };
+  viewer.dim = new Set();
+  if ($("color-mode").value !== "design") {
+    for (let i = 0; i < state.structure.L; i++) {
+      if (!state.designMask[i]) viewer.dim.add(i);
+    }
+  }
+  viewer.highlight = state.hover >= 0 ? new Set([state.hover]) : new Set();
+  viewer.background = getComputedStyle(document.body).backgroundColor.startsWith("rgb(246")
+    ? "#f6f8fc" : "#0b1220";
+  viewer.draw();
+}
+
+function hslToHex(hsl) {
+  const [h, s, l] = hsl.match(/[\d.]+/g).map(Number);
+  const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
+  const f = (n) => {
+    const k = (n + h / 30) % 12;
+    const v = l / 100 - a * Math.max(Math.min(k - 3, 9 - k, 1), -1);
+    return Math.round(255 * v).toString(16).padStart(2, "0");
+  };
+  return `#${f(0)}${f(8)}${f(4)}`;
+}
+
+function renderSequenceTrack() {
+  const track = $("sequence-track");
+  track.innerHTML = "";
+  const s = state.structure;
+  if (!s) return;
+  const seq = activeSequence();
+  let lastChain = null;
+
+  for (let i = 0; i < s.L; i++) {
+    if (s.chainIds[i] !== lastChain) {
+      const label = document.createElement("span");
+      label.className = "chain-label";
+      label.textContent = `${lastChain === null ? "" : " "}${s.chainIds[i]}:`;
+      track.appendChild(label);
+      lastChain = s.chainIds[i];
+    }
+    const span = document.createElement("span");
+    span.className = "res " + (state.designMask[i] ? "designed" : "fixed");
+    if (seq && seq[i] !== s.S[i]) span.classList.add("changed");
+    span.textContent = ALPHABET[seq ? seq[i] : s.S[i]] ?? "X";
+    span.dataset.i = i;
+    span.title = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}`;
+    track.appendChild(span);
+  }
+
+  track.onclick = (event) => {
+    const i = event.target?.dataset?.i;
+    if (i === undefined) return;
+    state.designMask[+i] = state.designMask[+i] ? 0 : 1;
+    refreshSelection();
+  };
+  track.onmousemove = (event) => {
+    const i = event.target?.dataset?.i;
+    state.hover = i === undefined ? -1 : +i;
+    redraw();
+  };
+  track.onmouseleave = () => {
+    state.hover = -1;
+    redraw();
+  };
+}
+
+function renderResults() {
+  const wrap = $("results");
+  wrap.innerHTML = "";
+  const has = state.designs.length > 0;
+  $("copy-fasta").disabled = !has;
+  $("download-fasta").disabled = !has;
+  $("clear-results").disabled = !has;
+  if (!has) {
+    wrap.innerHTML = '<p class="empty">Designs will appear here. '
+      + "Click one to paint it onto the structure.</p>";
+    return;
+  }
+
+  const native = state.structure.S;
+  state.designs.forEach((design, index) => {
+    const row = document.createElement("div");
+    row.className = "design" + (index === state.activeDesign ? " active" : "");
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `#${index + 1}  nll ${design.score.toFixed(3)}  `
+      + `id ${(design.identity * 100).toFixed(0)}%`;
+
+    const seq = document.createElement("div");
+    seq.className = "seq";
+    let html = "";
+    for (let i = 0; i < design.S.length; i++) {
+      const same = design.S[i] === native[i];
+      html += `<span class="${same ? "same" : "diff"}">${ALPHABET[design.S[i]]}</span>`;
+    }
+    seq.innerHTML = html;
+
+    row.appendChild(meta);
+    row.appendChild(seq);
+    row.onclick = () => {
+      state.activeDesign = state.activeDesign === index ? -1 : index;
+      renderResults();
+      renderSequenceTrack();
+      redraw();
+    };
+    wrap.appendChild(row);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Sequence logo
+// ---------------------------------------------------------------------------
+
+function renderLogo() {
+  const wrap = $("logo");
+  wrap.innerHTML = "";
+  const profile = state.profile;
+  if (!profile) return;
+  const s = state.structure;
+  const maxBits = Math.log2(20);
+
+  for (let i = 0; i < s.L; i++) {
+    const col = document.createElement("div");
+    col.className = "col";
+    // Standard sequence-logo height: total column height is the information
+    // content, each letter's share is its probability.
+    const bits = maxBits - profile.entropy[i] / Math.LN2;
+    const height = Math.max(0, Math.min(bits / maxBits, 1)) * 150;
+
+    const order = [];
+    for (let v = 0; v < 20; v++) order.push([v, profile.probs[i * 21 + v]]);
+    order.sort((a, b) => a[1] - b[1]);
+
+    for (const [v, p] of order) {
+      const h = p * height;
+      if (h < 1.2) continue;
+      const letter = document.createElement("div");
+      letter.className = "aa";
+      letter.style.height = `${h}px`;
+      letter.style.fontSize = `${Math.min(h * 1.25, 15)}px`;
+      letter.style.background = AA_COLORS[ALPHABET[v]] ?? "#64748b";
+      letter.textContent = ALPHABET[v];
+      col.appendChild(letter);
+    }
+
+    if (i % 10 === 0) {
+      const tick = document.createElement("div");
+      tick.className = "tick";
+      tick.textContent = String(s.resSeq[i]);
+      col.appendChild(tick);
+    }
+
+    col.title = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]} — `
+      + `${(bits).toFixed(2)} bits, top: ${topAAs(profile.probs, i)}`;
+    col.dataset.i = i;
+    col.onmouseenter = () => {
+      state.hover = i;
+      redraw();
+    };
+    col.onclick = () => {
+      state.designMask[i] = state.designMask[i] ? 0 : 1;
+      refreshSelection();
+    };
+    wrap.appendChild(col);
+  }
+}
+
+function topAAs(probs, i, n = 3) {
+  const order = [];
+  for (let v = 0; v < 20; v++) order.push([ALPHABET[v], probs[i * 21 + v]]);
+  order.sort((a, b) => b[1] - a[1]);
+  return order.slice(0, n).map(([aa, p]) => `${aa} ${(p * 100).toFixed(0)}%`).join(", ");
+}
+
+// ---------------------------------------------------------------------------
+// Amino-acid bias grid
+// ---------------------------------------------------------------------------
+
+function renderBiasGrid() {
+  const wrap = $("aa-bias");
+  wrap.innerHTML = "";
+  for (let v = 0; v < 20; v++) {
+    const aa = ALPHABET[v];
+    const cell = document.createElement("div");
+    cell.className = "cell" + (state.omitted.has(v) ? " omitted" : "");
+
+    const letter = document.createElement("span");
+    letter.className = "letter";
+    letter.textContent = aa;
+    letter.style.color = AA_COLORS[aa];
+    letter.title = "click to omit";
+    letter.onclick = () => {
+      if (state.omitted.has(v)) state.omitted.delete(v);
+      else state.omitted.add(v);
+      renderBiasGrid();
+    };
+
+    const input = document.createElement("input");
+    input.type = "number";
+    input.step = "0.5";
+    input.value = String(state.bias[v]);
+    input.oninput = () => {
+      state.bias[v] = parseFloat(input.value) || 0;
+    };
+
+    cell.appendChild(letter);
+    cell.appendChild(input);
+    wrap.appendChild(cell);
+  }
+}
+
+/** Expand the per-amino-acid bias into the [L, 21] array the model wants. */
+function buildBias() {
+  const L = state.structure.L;
+  const bias = new Float32Array(L * 21);
+  for (let i = 0; i < L; i++) {
+    for (let v = 0; v < 20; v++) {
+      bias[i * 21 + v] = state.omitted.has(v) ? -1e9 : state.bias[v];
+    }
+    bias[i * 21 + 20] = -1e9; // never emit X
+  }
+  return bias;
+}
+
+function parseSymmetry() {
+  const text = $("symmetry").value.trim();
+  if (!text) return null;
+  const groups = [];
+  for (const chunk of text.split(",")) {
+    const positions = chunk.split("+")
+      .map((p) => parseInt(p.trim(), 10) - 1)
+      .filter((p) => Number.isInteger(p) && p >= 0 && p < state.structure.L);
+    if (positions.length > 1) groups.push(positions);
+  }
+  return groups.length ? groups : null;
+}
+
+// ---------------------------------------------------------------------------
+// Actions
+// ---------------------------------------------------------------------------
+
+async function runDesign() {
+  if (!await ensureEncoded()) return;
+  const button = $("design-btn");
+  button.disabled = true;
+  setStatus("design-status", "Designing…", "busy");
+
+  try {
+    const seed = $("random-seed").checked
+      ? (Math.random() * 2 ** 31) | 0
+      : parseInt($("seed").value, 10) || 0;
+    const result = await call("design", {
+      batch: parseInt($("batch").value, 10),
+      temperature: parseFloat($("temperature").value),
+      S: Array.from(state.structure.S),
+      chainMask: Array.from(state.designMask),
+      bias: Array.from(buildBias()),
+      symmetry: parseSymmetry(),
+      seed,
+    });
+
+    const native = state.structure.S;
+    for (let b = 0; b < result.seqs.length; b++) {
+      const S = result.S[b];
+      let same = 0;
+      let counted = 0;
+      for (let i = 0; i < S.length; i++) {
+        if (!state.designMask[i]) continue;
+        counted++;
+        if (S[i] === native[i]) same++;
+      }
+      state.designs.push({
+        S,
+        seq: result.seqs[b],
+        score: result.scores[b],
+        identity: counted ? same / counted : 0,
+        seed,
+      });
+    }
+    state.designs.sort((a, b) => a.score - b.score);
+    renderResults();
+    setStatus(
+      "design-status",
+      `${result.seqs.length} sequences in ${(result.ms / 1000).toFixed(2)} s `
+      + `(${(result.ms / result.seqs.length).toFixed(0)} ms each), seed ${seed}`,
+    );
+  } catch (error) {
+    setStatus("design-status", `Failed: ${error.message}`, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function runProfile() {
+  if (!await ensureEncoded()) return;
+  const button = $("profile-btn");
+  button.disabled = true;
+  const mode = $("profile-mode").value;
+  setStatus("design-status", "Computing profile…", "busy");
+  if (mode === "exact") showProgress(0);
+  onProgress = (message) => {
+    if (message.stage === "profile") showProgress(message.received / message.total);
+  };
+
+  try {
+    const seq = activeSequence();
+    const result = await call("profile", {
+      S: seq ? Array.from(seq) : null,
+      mode: mode === "exact" ? "order" : mode,
+      exact: mode === "exact",
+    });
+    const probs = new Float32Array(result.probs);
+    const L = state.structure.L;
+    const entropy = new Float32Array(L);
+    for (let i = 0; i < L; i++) {
+      let h = 0;
+      let z = 0;
+      for (let v = 0; v < 20; v++) z += probs[i * 21 + v];
+      for (let v = 0; v < 20; v++) {
+        const p = probs[i * 21 + v] / (z || 1);
+        if (p > 0) h -= p * Math.log(p);
+      }
+      entropy[i] = h;
+    }
+    state.profile = { probs, entropy };
+    $("profile-panel").hidden = false;
+    $("profile-hint").textContent = describeProfileMode(mode);
+    renderLogo();
+    redraw();
+    setStatus("design-status", `Profile in ${(result.ms / 1000).toFixed(2)} s`);
+  } catch (error) {
+    setStatus("design-status", `Failed: ${error.message}`, "error");
+  } finally {
+    onProgress = null;
+    hideProgress();
+    button.disabled = false;
+  }
+}
+
+function describeProfileMode(mode) {
+  if (mode === "none") {
+    return "No position sees any amino acid — this is what the backbone alone implies. "
+      + "One decoder pass, exact.";
+  }
+  if (mode === "all-but-self") {
+    return "Every position sees all the others in one pass. Fast, but because the decoder is "
+      + "three layers deep a residue's own identity leaks back through two-hop paths, so treat "
+      + "this as an approximation of the conditional profile.";
+  }
+  return "Each position is decoded last in its own pass, so it genuinely sees every other "
+    + "residue and nothing of itself. Exact, and costs one decoder pass per position.";
+}
+
+function fastaText() {
+  const name = $("pdb-id").value.trim() || "design";
+  return state.designs.map((d, i) =>
+    `>${name}_${i + 1} score=${d.score.toFixed(4)} identity=${d.identity.toFixed(3)}\n${d.seq}`,
+  ).join("\n") + "\n";
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+$("fetch-btn").onclick = () => {
+  const id = $("pdb-id").value.trim();
+  if (id) fetchStructure(id);
+};
+
+$("pdb-id").onkeydown = (event) => {
+  if (event.key === "Enter") $("fetch-btn").click();
+};
+
+for (const button of document.querySelectorAll("[data-example]")) {
+  button.onclick = () => {
+    $("pdb-id").value = button.dataset.example;
+    if (button.dataset.example === "1STP" || button.dataset.example === "4KT0") {
+      $("model-select").value = "ligandmpnn_v_32_010_25";
+      updateModelHint();
+    }
+    fetchStructure(button.dataset.example);
+  };
+}
+
+$("file-input").onchange = async (event) => {
+  const file = event.target.files[0];
+  if (file) await loadStructureText(await file.text(), file.name);
+};
+
+const drop = $("file-drop");
+drop.ondragover = (event) => {
+  event.preventDefault();
+  drop.classList.add("over");
+};
+drop.ondragleave = () => drop.classList.remove("over");
+drop.ondrop = async (event) => {
+  event.preventDefault();
+  drop.classList.remove("over");
+  const file = event.dataTransfer.files[0];
+  if (file) await loadStructureText(await file.text(), file.name);
+};
+
+$("model-select").onchange = () => {
+  updateModelHint();
+  state.encodedFor = null;
+  if (state.structure) ensureEncoded();
+};
+
+$("use-atom-context").onchange = () => {
+  state.encodedFor = null;
+  if (state.structure) ensureEncoded();
+};
+
+$("temperature").oninput = (event) => {
+  $("temperature-out").textContent = Number(event.target.value).toFixed(2);
+};
+$("batch").oninput = (event) => {
+  $("batch-out").textContent = event.target.value;
+};
+
+$("color-mode").onchange = redraw;
+$("profile-mode").onchange = () => {
+  if (state.profile) runProfile();
+};
+
+$("select-all").onclick = () => {
+  state.designMask.fill(1);
+  refreshSelection();
+};
+$("select-none").onclick = () => {
+  state.designMask.fill(0);
+  refreshSelection();
+};
+$("select-invert").onclick = () => {
+  for (let i = 0; i < state.designMask.length; i++) {
+    state.designMask[i] = state.designMask[i] ? 0 : 1;
+  }
+  refreshSelection();
+};
+$("select-interface").onclick = () => {
+  const hits = nearLigand();
+  if (!hits.size) {
+    setStatus("load-status", "No heteroatoms in this structure.", "error");
+    return;
+  }
+  state.designMask.fill(0);
+  for (const i of hits) state.designMask[i] = 1;
+  refreshSelection();
+};
+
+$("design-btn").onclick = runDesign;
+$("profile-btn").onclick = runProfile;
+$("bias-reset").onclick = () => {
+  state.bias.fill(0);
+  state.omitted.clear();
+  renderBiasGrid();
+};
+$("omit-cys").onclick = () => {
+  state.omitted.add(ALPHABET.indexOf("C"));
+  renderBiasGrid();
+};
+$("omit-met").onclick = () => {
+  state.omitted.add(ALPHABET.indexOf("M"));
+  renderBiasGrid();
+};
+
+$("clear-results").onclick = () => {
+  state.designs = [];
+  state.activeDesign = -1;
+  renderResults();
+  renderSequenceTrack();
+  redraw();
+};
+$("copy-fasta").onclick = () => navigator.clipboard.writeText(fastaText());
+$("download-fasta").onclick = () => {
+  const blob = new Blob([fastaText()], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${$("pdb-id").value.trim() || "designs"}.fasta`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
+// --- viewer interaction ---------------------------------------------------
+
+const canvas = $("viewer");
+const tooltip = $("tooltip");
+
+import("./viewer.js").then(({ attachControls }) => {
+  attachControls(canvas, viewer.camera, redraw, {
+    onHover: (point) => {
+      const i = viewer.pick(point);
+      if (i === state.hover) return;
+      state.hover = i;
+      if (i >= 0) {
+        const s = state.structure;
+        tooltip.hidden = false;
+        tooltip.textContent = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}\n`
+          + `${state.designMask[i] ? "designed" : "fixed"}`
+          + (state.profile ? `\n${topAAs(state.profile.probs, i)}` : "");
+        tooltip.style.left = `${point[0] + 14}px`;
+        tooltip.style.top = `${point[1] + 14}px`;
+      } else {
+        tooltip.hidden = true;
+      }
+      redraw();
+    },
+    onPick: (point) => {
+      const i = viewer.pick(point);
+      if (i < 0) return;
+      state.designMask[i] = state.designMask[i] ? 0 : 1;
+      refreshSelection();
+    },
+    onBoxSelect: (from, to, event) => {
+      const hits = viewer.pickBox(from, to);
+      for (const i of hits) state.designMask[i] = event.altKey ? 0 : 1;
+      viewer.box = null;
+      refreshSelection();
+    },
+  });
+});
+
+canvas.addEventListener("boxupdate", (event) => {
+  viewer.box = { from: event.detail.from, to: event.detail.to };
+});
+
+canvas.addEventListener("pointerleave", () => {
+  tooltip.hidden = true;
+  state.hover = -1;
+  redraw();
+});
+
+window.addEventListener("resize", redraw);
+window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", redraw);
+
+// --- boot -----------------------------------------------------------------
+
+renderBiasGrid();
+loadModelList().then(() => {
+  const params = new URLSearchParams(location.search);
+  const pdb = params.get("pdb");
+  if (params.get("model")) {
+    $("model-select").value = params.get("model");
+    updateModelHint();
+  }
+  if (pdb) {
+    $("pdb-id").value = pdb;
+    fetchStructure(pdb);
+  }
+});

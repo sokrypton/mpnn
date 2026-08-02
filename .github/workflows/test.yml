@@ -1,0 +1,68 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install reference implementation
+        run: pip install --quiet ligandmpnn numpy "torch~=2.0" --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+
+      - name: Locate the reference package
+        id: ref
+        run: echo "dir=$(python -c 'import ligandmpnn,pathlib;print(pathlib.Path(ligandmpnn.__file__).parent)')" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild float32 weights for the parity test
+        run: |
+          python tools/convert_weights.py \
+            --src "${{ steps.ref.outputs.dir }}/data/model_params" \
+            --out /tmp/w32 --dtype float32
+
+      - name: Check the committed weights match the checkpoints
+        run: |
+          python tools/convert_weights.py \
+            --src "${{ steps.ref.outputs.dir }}/data/model_params" \
+            --out /tmp/w16 --dtype float16 --manifest
+          diff -r /tmp/w16 weights
+
+      - name: Check the generated constants are up to date
+        run: |
+          python tools/gen_constants.py --ref "${{ steps.ref.outputs.dir }}" --out /tmp/constants.js
+          diff /tmp/constants.js mpnn/constants.js
+
+      - name: Parity against PyTorch
+        run: |
+          node test/dump_inputs.mjs /tmp/inputs.json \
+            "1ubq=assets/1ubq.pdb=proteinmpnn_v_48_020=protein_mpnn" \
+            "1stp=assets/1stp.pdb=ligandmpnn_v_32_010_25=ligand_mpnn" \
+            "1ubq_sol=assets/1ubq.pdb=solublempnn_v_48_020=soluble_mpnn" \
+            "1ubq_mem=assets/1ubq.pdb=per_residue_label_membrane_mpnn_v_48_020=per_residue_label_membrane_mpnn"
+          python tools/make_reference.py \
+            --ref "${{ steps.ref.outputs.dir }}" \
+            --checkpoints "${{ steps.ref.outputs.dir }}/data/model_params" \
+            --inputs /tmp/inputs.json --out /tmp/reference.json
+          node test/parity.mjs /tmp/reference.json /tmp/inputs.json /tmp/w32
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-save playwright
+      - run: npx playwright install --with-deps chromium
+      - run: node test/browser.mjs
