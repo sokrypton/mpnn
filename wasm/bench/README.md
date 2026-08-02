@@ -50,3 +50,55 @@ build is one command in a 12-line shell script with no package manager, no
 lockfile, and no extra target to install. Rust would work exactly as well. If
 you switch, keep the explicit `core::arch::wasm32` intrinsics — a safe idiomatic
 port would be 5-6x slower and barely ahead of the JavaScript it replaced.
+
+
+# One-hot times a matrix, or a gather?
+
+```
+node wasm/bench/onehot.mjs
+```
+
+ColabDesign's `EmbedToken` turns every embedding lookup into a dense product:
+
+```python
+if jnp.issubdtype(arr.dtype, jnp.integer):
+    one_hot = jax.nn.one_hot(arr, self.vocab_size)
+else:
+    one_hot = arr                       # already a soft distribution
+return jnp.tensordot(one_hot, self.embeddings, 1)
+```
+
+That is the right call there for two reasons, and only one of them is speed.
+The `else` branch is the real one: `arr` may be a *continuous* distribution over
+amino acids, because ColabDesign optimises sequences by gradient descent and you
+cannot backpropagate through an integer index. The dense form also happens to
+suit a TPU, where a gather is slow and a matmul is nearly free.
+
+Neither applies to this engine. It only runs inference, so nothing needs to be
+differentiable, and it runs on one wasm thread, where a gather is a memory read
+and a matmul is multiply-adds you pay for. LigandMPNN's atom-type encoding makes
+the gap plain: the one-hot is 147 wide — `[type 120 | group 19 | period 8]` —
+with exactly **three** non-zeros, so 98% of the products are against zero.
+
+Over L·M = 3025 residue-atom slots:
+
+| form | time |
+| --- | --- |
+| one-hot @ matrix, the ColabDesign form | 6.31 ms |
+| three column reads plus the bias | 1.30 ms |
+| deduplicate by element first, then gather rows | **0.25 ms** |
+
+So the engine goes the other way in three places: the atom-type encodings
+(147→64 and 147→128) and the relative-position encoding (66→16) are all column
+reads rather than products, and the atom-type table is then built once per
+*element* (120 rows) instead of once per residue-atom slot.
+
+The inverse is not available anywhere that matters. The remaining gathers are
+neighbour lookups, `pc[EIdx[i, k]]`; expressing one as a matmul would need an
+`[L·K, L]` selection matrix, which is L times *more* work, not less. Those cost
+about 10% of runtime now and the way to reduce them is to move them into wasm
+alongside the matmul, not to turn them into matmuls.
+
+One thing to keep in mind if the page ever grows gradient-based design — a
+ColabDesign-style hallucination or binder mode over soft sequences — the dense
+form stops being a choice and becomes a requirement, at least for `W_s`.

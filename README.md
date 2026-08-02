@@ -262,6 +262,14 @@ this: still ~1e-5 on the logits, on both kernels.
 Rebuild with `./wasm/build.sh` (needs clang with the wasm32 target). The
 committed `kernels.wasm` is 10 KB, so most people never will.
 
+**Gathers, not one-hot products.** ColabDesign turns every embedding lookup
+into a dense `one_hot @ W`, primarily so a *soft* sequence can flow through it
+under a gradient, and secondarily because that suits a TPU. Neither holds here —
+inference only, one wasm thread — so this engine goes the other way. LigandMPNN's
+atom-type one-hot is 147 wide with three non-zeros, and reading three columns
+beats multiplying by it 5x; deduplicating by element first makes it 26x. Details
+and the reverse case in [`wasm/bench/`](wasm/bench/).
+
 **Why C and not Rust?** Only that clang and wasm-ld ship with LLVM and were
 already there, so the build is one command with no package manager and no extra
 target to install. It is not a performance argument:
