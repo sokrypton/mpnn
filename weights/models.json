@@ -7,6 +7,7 @@
     "k_neighbors": 48,
     "noise_level": 0.2,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1677637,
     "bytes": 3364554
   },
@@ -18,6 +19,7 @@
     "k_neighbors": 32,
     "noise_level": 0.05,
     "atom_context_num": 25,
+    "num_letters": 21,
     "params": 2618693,
     "bytes": 5252490
   },
@@ -29,6 +31,7 @@
     "k_neighbors": 32,
     "noise_level": 0.1,
     "atom_context_num": 25,
+    "num_letters": 21,
     "params": 2618693,
     "bytes": 5252490
   },
@@ -40,6 +43,7 @@
     "k_neighbors": 32,
     "noise_level": 0.2,
     "atom_context_num": 25,
+    "num_letters": 21,
     "params": 2618693,
     "bytes": 5252490
   },
@@ -51,8 +55,21 @@
     "k_neighbors": 32,
     "noise_level": 0.3,
     "atom_context_num": 25,
+    "num_letters": 21,
     "params": 2618693,
     "bytes": 5252490
+  },
+  {
+    "file": "na_mpnn_design.mpnn",
+    "name": "na_mpnn_design",
+    "model_type": "na_mpnn",
+    "dtype": "float16",
+    "k_neighbors": 32,
+    "noise_level": 0.0,
+    "atom_context_num": 0,
+    "num_letters": 33,
+    "params": 2293457,
+    "bytes": 4596194
   },
   {
     "file": "per_residue_label_membrane_mpnn_v_48_020.mpnn",
@@ -62,6 +79,7 @@
     "k_neighbors": 48,
     "noise_level": 0.2,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1677637,
     "bytes": 3364554
   },
@@ -73,6 +91,7 @@
     "k_neighbors": 48,
     "noise_level": 0.02,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   },
@@ -84,6 +103,7 @@
     "k_neighbors": 48,
     "noise_level": 0.1,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   },
@@ -95,6 +115,7 @@
     "k_neighbors": 48,
     "noise_level": 0.2,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   },
@@ -106,6 +127,7 @@
     "k_neighbors": 48,
     "noise_level": 0.3,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   },
@@ -117,6 +139,7 @@
     "k_neighbors": 48,
     "noise_level": 0.02,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   },
@@ -128,6 +151,7 @@
     "k_neighbors": 48,
     "noise_level": 0.1,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   },
@@ -139,6 +163,7 @@
     "k_neighbors": 48,
     "noise_level": 0.2,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   },
@@ -150,6 +175,7 @@
     "k_neighbors": 48,
     "noise_level": 0.3,
     "atom_context_num": 0,
+    "num_letters": 21,
     "params": 1660485,
     "bytes": 3329866
   }

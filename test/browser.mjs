@@ -452,6 +452,86 @@ if (!process.argv.includes("--no-ligand")) {
   }
 }
 
+// --- NA-MPNN ----------------------------------------------------------------
+{
+  console.log("\n-- NA-MPNN --");
+  await page.goto(base, { waitUntil: "networkidle" });
+  await page.selectOption("#model-select", "na_mpnn_design");
+  // 4oqu is 97 nucleotides of RNA. Selecting NA-MPNN re-parses the structure,
+  // because nucleic acids are model positions for this model and ligand atoms
+  // for every other one.
+  await page.setInputFiles("#file-input", join(ROOT, "assets", "4oqu.pdb"));
+  await waitReady(97, 600000);
+  const naLoad = (await page.textContent("#load-status")).trim();
+  console.log("load :", naLoad);
+  const naModel = (await page.textContent("#model-status")).trim();
+  console.log("model:", naModel);
+  if (!/na_mpnn_design/.test(naModel)) {
+    problems.push(`NA-MPNN was not the model that encoded: ${naModel}`);
+  }
+  if (!/97 RNA/.test(naLoad)) problems.push(`nucleic acids not read as residues: ${naLoad}`);
+
+  // The input sequence must come back in RNA letters, not protein ones.
+  const track = await page.evaluate(() =>
+    [...document.querySelectorAll(".res")].map((e) => e.textContent).join(""));
+  // RNA, so every letter must be an RNA base -- b/d/h/u. Seeing DNA letters
+  // here would mean a uracil was being reported as a thymine.
+  if (!/^[bdhuy]+$/.test(track)) {
+    problems.push(`RNA sequence track is not RNA letters: ${track.slice(0, 40)}`);
+  }
+  console.log(`native: ${track.slice(0, 60)}`);
+
+  await page.fill("#batch", "2");
+  await page.evaluate(() => document.getElementById("batch").dispatchEvent(new Event("input")));
+  await page.fill("#temperature", "0.3");
+  await page.evaluate(() => document.getElementById("temperature")
+    .dispatchEvent(new Event("input")));
+  await page.click("#design-btn");
+  await page.waitForFunction(
+    () => /sequences in|Failed/.test(document.getElementById("design-status").textContent),
+    { timeout: 900000 },
+  );
+  console.log("design:", (await page.textContent("#design-status")).trim());
+  const naSeqs = await page.evaluate(() =>
+    [...document.querySelectorAll(".design .seq")].map((e) => e.textContent.trim()));
+  for (const seq of naSeqs) console.log(`   ${seq.slice(0, 60)}`);
+  // The bug this catches: the sampler used to consider only the first 20
+  // letters, so a 33-letter model could never emit a nucleotide at all.
+  if (!naSeqs.length) problems.push("NA-MPNN produced no designs");
+  for (const seq of naSeqs) {
+    if (!/^[bdhuy]+$/.test(seq)) {
+      problems.push(`NA-MPNN designed an RNA chain with non-RNA letters: ${seq.slice(0, 40)}`);
+    }
+  }
+
+  // A profile exercises the 33-wide logo path. The mode selector lives inside
+  // the profile panel, which stays hidden until the first profile exists.
+  await page.click("#profile-btn");
+  await page.waitForFunction(
+    () => /Profile in|Failed/.test(document.getElementById("design-status").textContent),
+    { timeout: 900000 },
+  );
+  console.log("profile:", (await page.textContent("#design-status")).trim());
+  const logoInk = await page.evaluate(() => {
+    const c = document.getElementById("logo");
+    const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+    let n = 0;
+    for (let i = 3; i < d.length; i += 4) if (d[i] > 8) n++;
+    return n;
+  });
+  console.log(`logo: ${logoInk} px painted`);
+  if (logoInk === 0) problems.push("NA-MPNN profile drew an empty logo");
+
+  // Switching back to a protein model must re-parse: 4oqu has no protein, so
+  // the load has to fail cleanly rather than encode a 0-residue structure.
+  await page.selectOption("#model-select", "proteinmpnn_v_48_020");
+  await page.waitForFunction(
+    () => /No protein residues/.test(document.getElementById("load-status").textContent),
+    { timeout: 60000 },
+  );
+  console.log("switch back:", (await page.textContent("#load-status")).trim());
+}
+
 // --- homo-oligomer tying ----------------------------------------------------
 {
   console.log("\n-- homo-oligomer --");

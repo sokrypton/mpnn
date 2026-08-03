@@ -25,6 +25,10 @@ import {
   sideChainContext,
 } from "./features.js";
 import { makeDecoderLayer, makeEncoderLayer } from "./layers.js";
+import {
+  naBackbone, naEdgeFeatures, naNodeFeatures,
+  NA_OMIT_LEGACY_RNA, NA_OMIT_UNK, POLYTYPE,
+} from "./na.js";
 import { gatherNodes, layerNorm, linear, logSoftmax, softmax } from "./ops.js";
 
 const LIGAND_CHUNK = 32;
@@ -120,6 +124,34 @@ export class Model {
       || this.modelType === "global_label_membrane_mpnn";
   }
 
+  /** NA-MPNN: protein, DNA and RNA positions in one graph. See na.js. */
+  get isNA() {
+    return this.modelType === "na_mpnn";
+  }
+
+  /**
+   * Letters the sampler may draw when the caller supplies no bias.
+   *
+   * The reference expresses this as `bias = -1e8·omit_AA + bias_AA` and leaves
+   * the sampler itself unrestricted, so this reproduces each model's default
+   * `--omit_AA`: "X" everywhere, plus NA-MPNN's legacy RNA tokens, which its
+   * `--na_shared_tokens` default folds onto the DNA ones.
+   *
+   * @returns {Float32Array} [numLetters] of 0 or -1e9
+   */
+  defaultOmit() {
+    if (this._defaultOmit) return this._defaultOmit;
+    const V = this.numLetters;
+    const omit = new Float32Array(V);
+    if (this.isNA) {
+      for (const i of [NA_OMIT_UNK, ...NA_OMIT_LEGACY_RNA]) omit[i] = -1e9;
+    } else {
+      omit[V - 1] = -1e9; // "X"
+    }
+    this._defaultOmit = omit;
+    return omit;
+  }
+
   /**
    * Run the structure encoder.
    *
@@ -147,17 +179,37 @@ export class Model {
     const w = this.w;
     const H = this.hidden;
 
-    const bb = computeBackbone(X, L);
-    const { EIdx, DNeighbors, K } = neighborGraph(bb.CA, mask, L, this.K);
-    const E = edgeFeatures(w, bb, EIdx, DNeighbors, residueIdx, chainLabels, L, K);
+    // NA-MPNN graphs 18 atom slots over protein and nucleic residues alike and
+    // centres its neighbour search on CA + C1'; everything else graphs 5 atoms
+    // over C-alpha. Both then run the identical encoder.
+    let bb;
+    let EIdx;
+    let DNeighbors;
+    let K;
+    let E;
+    if (this.isNA) {
+      const polytype = inputs.polytype ?? new Int32Array(L).fill(POLYTYPE.PP);
+      bb = naBackbone(inputs.X16, inputs.X16Mask, polytype, L);
+      ({ EIdx, DNeighbors, K } = neighborGraph(bb.centre, mask, L, this.K));
+      E = naEdgeFeatures(w, bb, EIdx, residueIdx, chainLabels, L, K);
+    } else {
+      bb = computeBackbone(X, L);
+      ({ EIdx, DNeighbors, K } = neighborGraph(bb.CA, mask, L, this.K));
+      E = edgeFeatures(w, bb, EIdx, DNeighbors, residueIdx, chainLabels, L, K);
+    }
 
     const wE = w.linear("W_e");
     const hE = linear(E, wE.weight, wE.bias, L * K, wE.shape[1], H);
     let hV = new Float32Array(L * H);
 
-    // Membrane models seed the node state from the per-residue label; the
-    // others start from zero.
-    if (this.isMembrane) {
+    if (this.isNA) {
+      const polytype = inputs.polytype ?? new Int32Array(L).fill(POLYTYPE.PP);
+      const V = naNodeFeatures(w, polytype, L, H);
+      const wV = w.linear("W_v");
+      hV = linear(V, wV.weight, wV.bias, L, H, H);
+    } else if (this.isMembrane) {
+      // Membrane models seed the node state from the per-residue label; the
+      // others start from zero.
       const labels = inputs.membraneLabels ?? new Int32Array(L);
       const nodeEmbed = w.linear("features.node_embedding");
       const normNodes = w.norm("features.norm_nodes");
@@ -655,6 +707,10 @@ export class Model {
     const temperature = Math.max(opts.temperature ?? 0.1, 1e-6);
     const rng = opts.rng ?? Math.random;
     const bias = opts.bias ?? null;
+    // A caller-supplied bias carries its own omissions, exactly as the
+    // reference's `-1e8·omit_AA + bias_AA` does; only fall back to the model's
+    // defaults when there is none.
+    const omit = bias ? new Float32Array(this.numLetters) : this.defaultOmit();
     const table = this.w.get("W_s.weight");
     const wOut = this.w.linear("W_out");
 
@@ -862,8 +918,13 @@ export class Model {
         const t0 = orders[b][step][0];
         let best = 0;
         let bestVal = -Infinity;
-        for (let v = 0; v < 20; v++) {
-          let x = totalLogits[b * V + v];
+        // Every letter is a candidate, as in the reference; what may not be
+        // drawn is expressed as bias, either the caller's or the model's
+        // default omissions. Restricting the loop instead was a latent bug --
+        // it silently capped NA-MPNN's 33 letters at the 20 amino acids, so a
+        // nucleotide could never be sampled.
+        for (let v = 0; v < V; v++) {
+          let x = totalLogits[b * V + v] + omit[v];
           if (bias) x += bias[t0 * V + v];
           // Gumbel-max draw: same distribution as softmax(x / T) sampling,
           // without building the distribution.

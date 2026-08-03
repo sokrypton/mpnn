@@ -37,7 +37,11 @@ jobs:
         run: |
           python tools/convert_weights.py \
             --src "${{ steps.ref.outputs.dir }}/data/model_params" \
-            --out /tmp/w16 --dtype float16 --manifest
+            --out /tmp/w16 --dtype float16
+          git clone --depth 1 https://github.com/baker-laboratory/NA-MPNN /tmp/na-mpnn
+          python tools/convert_weights.py \
+            --src /tmp/na-mpnn/models/design_model/s_19137.pt \
+            --out /tmp/w16 --dtype float16 --name na_mpnn_design --manifest
           diff -r /tmp/w16 weights
 
       - name: Check the generated constants are up to date
@@ -76,6 +80,21 @@ jobs:
 
       - name: Pseudo-likelihood behaves as the README says
         run: node test/pseudolikelihood.mjs /tmp/w32 3
+
+      - name: NA-MPNN parity against PyTorch
+        run: |
+          pip install --quiet prody
+          python tools/convert_weights.py \
+            --src /tmp/na-mpnn/models/design_model/s_19137.pt \
+            --out /tmp/w32 --dtype float32 --name na_mpnn_design
+          python tools/na_reference.py \
+            --ref /tmp/na-mpnn \
+            --checkpoint /tmp/na-mpnn/models/design_model/s_19137.pt \
+            --pdb /tmp/na-mpnn/inference/examples/4oqu.pdb \
+                  /tmp/na-mpnn/inference/examples/1am9.pdb \
+            --out /tmp/na_golden.json
+          node test/na.mjs /tmp/na_golden.json /tmp/w32 /tmp/na-mpnn/inference/examples
+          MPNN_NO_SIMD=1 node test/na.mjs /tmp/na_golden.json /tmp/w32
 
       - name: The committed kernel matches its source
         run: |

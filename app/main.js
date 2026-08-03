@@ -1,6 +1,10 @@
 // Page controller: owns the DOM, the selection state, and the worker.
 
 import { ALPHABET } from "../mpnn/constants.js";
+import { naDisplaySequence, NA_ALPHABET, NA_DNA_TO_RNA, POLYTYPE } from "../mpnn/na.js";
+
+/** RNA letter index -> the DNA token that stands in for it. */
+const NA_DNA_TO_RNA_INVERSE = new Map([...NA_DNA_TO_RNA].map(([d, r]) => [r, d]));
 import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
 import { Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
 import { AA_COLORS, Logo } from "./logo.js";
@@ -50,10 +54,18 @@ const state = {
   modelType: null,
   /** 1 = design this position, 0 = keep it. */
   designMask: null,
-  bias: new Float32Array(21),
+  /**
+   * Per-letter bias, sized for the widest alphabet (NA-MPNN's 33).
+   *
+   * It must not be sized to the *current* model: a short array reads
+   * `undefined` past its end, writing that into a Float32Array gives NaN, and
+   * a NaN bias loses every comparison in the sampler -- which showed up as
+   * NA-MPNN quietly designing amino acids into an RNA chain.
+   */
+  bias: new Float32Array(33),
   omitted: new Set(),
   /**
-   * Position -> Float32Array(21) of bias values that replace the global table
+   * Position -> Float32Array of bias values that replace the global table
    * there, and Position -> Set of omitted amino acids. Sparse: only positions
    * the user actually touched appear.
    */
@@ -70,7 +82,54 @@ const state = {
   /** 0 soluble, 1 interface, 2 buried. Only the membrane models read it. */
   membraneLabels: null,
   membraneVersion: 0,
+  /** The text the current structure was parsed from, so a change of model
+   *  family can re-parse it -- NA-MPNN turns nucleic acids into positions. */
+  structureText: null,
+  structureLabel: "",
 };
+
+/**
+ * The current alphabet. NA-MPNN has 33 letters, everything else 21.
+ *
+ * Keyed on the parsed structure, not on `state.modelType`: the structure is
+ * re-parsed the moment the model family changes, whereas `modelType` only
+ * catches up once the weights have downloaded. Getting this wrong made
+ * `buildBias` omit every nucleotide, which quietly forced an RNA design to
+ * come out as protein.
+ */
+function alphabet() {
+  return state.structure?.nucleicAsResidues ? NA_ALPHABET : ALPHABET;
+}
+function numLetters() {
+  return alphabet().length;
+}
+/** True when the selected model treats nucleic acids as model positions. */
+function wantsNucleic() {
+  return ($("model-select").selectedOptions[0]?.dataset.type ?? state.modelType) === "na_mpnn";
+}
+/**
+ * One residue's letter, in the current alphabet.
+ *
+ * NA-MPNN stores an RNA base as the corresponding DNA token -- that is what
+ * `--na_shared_tokens` means -- so a uracil is held as DT and has to be turned
+ * back into a "u" for display, or an RNA chain reads as though it contained
+ * thymine. The reference decides by the presence of an O2', not by the token.
+ */
+function displayLetter(i, v) {
+  const s = state.structure;
+  if (s?.nucleicAsResidues && s.isRNA[i]) {
+    return NA_ALPHABET[NA_DNA_TO_RNA.get(v) ?? v] ?? "X";
+  }
+  return alphabet()[v] ?? "X";
+}
+
+/** The same, over a whole sequence. */
+function showSequence(S) {
+  const s = state.structure;
+  return s?.nucleicAsResidues
+    ? naDisplaySequence(S, s.isRNA)
+    : [...S].map((v) => alphabet()[v] ?? "X").join("");
+}
 
 // Monotonic token for in-flight encodes. Changing the model and loading a new
 // structure in quick succession queues two encodes; only the newest may claim
@@ -96,6 +155,7 @@ const MODEL_LABELS = {
   ligand_mpnn: "LigandMPNN",
   per_residue_label_membrane_mpnn: "MembraneMPNN (per residue)",
   global_label_membrane_mpnn: "MembraneMPNN (global)",
+  na_mpnn: "NA-MPNN",
 };
 
 const MODEL_NOTES = {
@@ -104,6 +164,8 @@ const MODEL_NOTES = {
   ligand_mpnn: "Sees heteroatoms — ligands, cofactors, metals, nucleic acids.",
   per_residue_label_membrane_mpnn: "Takes a per-residue buried/interface/soluble label.",
   global_label_membrane_mpnn: "Takes one label for the whole chain.",
+  na_mpnn: "Designs RNA and protein–DNA together; nucleic acids become "
+    + "positions rather than ligand context.",
 };
 
 async function loadModelList() {
@@ -125,7 +187,12 @@ async function loadModelList() {
       option.value = model.name;
       option.dataset.type = type;
       const noise = model.noise_level.toFixed(2);
-      option.textContent = `${model.name}  —  ${noise} Å training noise, ${(model.bytes / 1e6).toFixed(1)} MB`;
+      // NA-MPNN's checkpoint records no training noise, so saying "0.00 Å"
+      // would be a claim rather than a blank.
+      const size = `${(model.bytes / 1e6).toFixed(1)} MB`;
+      option.textContent = type === "na_mpnn"
+        ? `${model.name}  —  ${size}`
+        : `${model.name}  —  ${noise} Å training noise, ${size}`;
       optgroup.appendChild(option);
     }
     select.appendChild(optgroup);
@@ -160,17 +227,24 @@ function setStatus(id, text, kind = "") {
 
 async function loadStructureText(text, label) {
   let structure;
+  const nucleic = wantsNucleic();
   try {
-    structure = structureFromText(text);
+    structure = structureFromText(text, { nucleicAsResidues: nucleic });
   } catch (error) {
     setStatus("load-status", `Could not parse: ${error.message}`, "error");
     return;
   }
   if (structure.L === 0) {
-    setStatus("load-status", "No protein residues with a C-alpha found.", "error");
+    setStatus("load-status", nucleic
+      ? "No protein or nucleic-acid residues found."
+      : "No protein residues with a C-alpha found.", "error");
     return;
   }
 
+  // Kept so a change of model family can re-parse: NA-MPNN turns nucleic acids
+  // into model positions, which changes L and the alphabet.
+  state.structureText = text;
+  state.structureLabel = label;
   state.structure = structure;
   state.structureId += 1;
   state.designMask = new Float32Array(structure.L).fill(1);
@@ -193,9 +267,24 @@ async function loadStructureText(text, label) {
   redraw();
 
   const ligand = structure.ligandType.length;
+  let composition = "";
+  if (structure.nucleicAsResidues) {
+    const n = { pp: 0, dna: 0, rna: 0, unk: 0 };
+    for (let i = 0; i < structure.L; i++) {
+      const p = structure.polytype[i];
+      if (p === POLYTYPE.PP) n.pp++;
+      else if (p === POLYTYPE.DNA) n.dna++;
+      else if (p === POLYTYPE.RNA) n.rna++;
+      else n.unk++;
+    }
+    composition = " ("
+      + [[n.pp, "protein"], [n.dna, "DNA"], [n.rna, "RNA"], [n.unk, "unknown"]]
+        .filter(([c]) => c).map(([c, name]) => `${c} ${name}`).join(", ")
+      + ")";
+  }
   setStatus(
     "load-status",
-    `${label}: ${structure.L} residues, ${structure.chainList.length} chain(s)`
+    `${label}: ${structure.L} residues${composition}, ${structure.chainList.length} chain(s)`
     + (ligand ? `, ${ligand} ligand/heteroatom atoms` : ", no heteroatoms"),
   );
   if (ligand && !$("model-select").value.startsWith("ligandmpnn")) {
@@ -264,6 +353,13 @@ async function ensureEncoded() {
         ligandXyz: structure.ligandXyz, ligandType: structure.ligandType,
         ligandMask: structure.ligandMask,
         membraneLabels: state.membraneLabels ? Array.from(state.membraneLabels) : null,
+        ...(structure.nucleicAsResidues
+          ? {
+            X16: structure.X16,
+            X16Mask: structure.X16Mask,
+            polytype: Array.from(structure.polytype),
+          }
+          : {}),
         useAtomContext,
         useSideChains,
         ...(useSideChains
@@ -459,7 +555,7 @@ function renderSequenceTrack() {
     const span = document.createElement("span");
     span.className = "res " + (state.designMask[i] ? "designed" : "fixed");
     if (seq && seq[i] !== s.S[i]) span.classList.add("changed");
-    span.textContent = ALPHABET[seq ? seq[i] : s.S[i]] ?? "X";
+    span.textContent = displayLetter(i, seq ? seq[i] : s.S[i]);
     span.dataset.i = i;
     span.title = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}`;
     track.appendChild(span);
@@ -510,7 +606,7 @@ function renderResults() {
     let html = "";
     for (let i = 0; i < design.S.length; i++) {
       const same = design.S[i] === native[i];
-      html += `<span class="${same ? "same" : "diff"}">${ALPHABET[design.S[i]]}</span>`;
+      html += `<span class="${same ? "same" : "diff"}">${displayLetter(i, design.S[i])}</span>`;
     }
     seq.innerHTML = html;
 
@@ -533,6 +629,7 @@ function renderResults() {
 function renderLogo() {
   if (!state.profile) return;
   const s = state.structure;
+  logo.setAlphabet(alphabet(), biasLetters());
   logo.readTheme(document.body);
   logo.isDesigned = (i) => state.designMask[i] > 0;
   logo.setData({
@@ -549,7 +646,8 @@ function renderLogo() {
 
 function topAAs(probs, i, n = 3) {
   const order = [];
-  for (let v = 0; v < 20; v++) order.push([ALPHABET[v], probs[i * 21 + v]]);
+  const V = numLetters();
+  for (let v = 0; v < V; v++) order.push([alphabet()[v], probs[i * V + v]]);
   order.sort((a, b) => b[1] - a[1]);
   return order.slice(0, n).map(([aa, p]) => `${aa} ${(p * 100).toFixed(0)}%`).join(", ");
 }
@@ -613,14 +711,28 @@ function toggleOmit(v) {
   }
 }
 
+/**
+ * Letters the bias grid offers and the sampler may draw.
+ *
+ * The 20 amino acids everywhere, plus NA-MPNN's DNA tokens -- which stand in
+ * for the RNA bases too, since its `--na_shared_tokens` default aliases them.
+ * Everything else (UNK, the legacy RNA letters, MAS, PAD) is omitted, matching
+ * the reference's default `--omit_AA`.
+ */
+function biasLetters() {
+  if (!state.structure?.nucleicAsResidues) return [...Array(20).keys()];
+  // 0..19 amino acids, 21..25 DA DC DG DT DX.
+  return [...Array(20).keys(), 21, 22, 23, 24, 25];
+}
+
 function renderBiasGrid() {
   const wrap = $("aa-bias");
   wrap.innerHTML = "";
   const scoped = $("bias-scope").value === "selected";
   const nSelected = selectedPositions().length;
 
-  for (let v = 0; v < 20; v++) {
-    const aa = ALPHABET[v];
+  for (const v of biasLetters()) {
+    const aa = alphabet()[v];
     const shown = shownBias(v);
     const cell = document.createElement("div");
     cell.className = "cell" + (shown.omitted ? " omitted" : "")
@@ -660,17 +772,23 @@ function renderBiasGrid() {
       : "");
 }
 
-/** Expand the per-amino-acid bias into the [L, 21] array the model wants. */
+/** Expand the per-letter bias into the [L, numLetters] array the model wants. */
 function buildBias() {
   const L = state.structure.L;
-  const bias = new Float32Array(L * 21);
+  const V = numLetters();
+  const allowed = new Set(biasLetters());
+  const bias = new Float32Array(L * V);
   for (let i = 0; i < L; i++) {
     const local = state.biasOverrides.get(i);
     const omit = state.omitOverrides.get(i) ?? state.omitted;
-    for (let v = 0; v < 20; v++) {
-      bias[i * 21 + v] = omit.has(v) ? -1e9 : (local ? local[v] : state.bias[v]);
+    for (let v = 0; v < V; v++) {
+      // Anything outside the offered letters is omitted outright: "X" for the
+      // protein models, and for NA-MPNN also the legacy RNA tokens and the
+      // MAS/PAD placeholders that never name a real residue.
+      bias[i * V + v] = !allowed.has(v) || omit.has(v)
+        ? -1e9
+        : (local ? local[v] : state.bias[v]);
     }
-    bias[i * 21 + 20] = -1e9; // never emit X
   }
   return bias;
 }
@@ -793,7 +911,9 @@ async function runDesign() {
       }
       state.designs.push({
         S,
-        seq: result.seqs[b],
+        // Rendered here rather than in the worker: `sequenceToString` only
+        // knows the 21-letter alphabet, and FASTA has to carry the RNA letters.
+        seq: showSequence(S),
         score: result.scores[b],
         identity: counted ? same / counted : 0,
         seed,
@@ -861,14 +981,26 @@ async function runProfile() {
 
 /** Parse a pasted sequence: one letter per residue, separators ignored. */
 function parseSequence(text, L) {
-  const letters = text.toUpperCase().replace(/[^A-Z]/g, "");
+  // NA-MPNN's alphabet is case sensitive -- lower case is a nucleotide -- so
+  // only the protein models may upper-case the input.
+  const na = Boolean(state.structure?.nucleicAsResidues);
+  const letters = (na ? text : text.toUpperCase()).replace(/[^A-Za-z]/g, "");
   if (letters.length !== L) {
     throw new Error(`expected ${L} residues, got ${letters.length}`);
   }
+  const allowed = new Set(biasLetters());
   const S = new Int32Array(L);
   for (let i = 0; i < L; i++) {
-    const v = ALPHABET.indexOf(letters[i]);
-    if (v < 0 || v === 20) throw new Error(`unknown amino acid "${letters[i]}" at position ${i + 1}`);
+    let v = alphabet().indexOf(letters[i]);
+    // Under shared tokens an RNA base is stored as the DNA one, so accept both
+    // spellings of the same base.
+    if (na && !allowed.has(v)) {
+      const dna = NA_DNA_TO_RNA_INVERSE.get(v);
+      if (dna !== undefined) v = dna;
+    }
+    if (v < 0 || !allowed.has(v)) {
+      throw new Error(`unusable residue "${letters[i]}" at position ${i + 1}`);
+    }
     S[i] = v;
   }
   return S;
@@ -998,10 +1130,18 @@ drop.ondrop = async (event) => {
   if (file) await loadStructureText(await file.text(), file.name);
 };
 
-$("model-select").onchange = () => {
+$("model-select").onchange = async () => {
   updateModelHint();
   state.encodedFor = null;
-  if (state.structure) ensureEncoded();
+  if (!state.structure) return;
+  // NA-MPNN makes nucleic acids into model positions, so switching to or from
+  // it changes L, the alphabet and the selection -- the structure has to be
+  // read again rather than reinterpreted.
+  if (state.structureText && wantsNucleic() !== state.structure.nucleicAsResidues) {
+    await loadStructureText(state.structureText, state.structureLabel);
+    return;
+  }
+  ensureEncoded();
 };
 
 $("use-atom-context").onchange = () => {

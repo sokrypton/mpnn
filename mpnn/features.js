@@ -43,7 +43,7 @@ const RBF_INV_SIGMA = 1 / RBF_SIGMA;
 const RBF_FLUSH = 1e-30;
 
 /** Write the 16-channel radial basis expansion of `d` at `out[off..off+16]`. */
-function rbfInto(out, off, d) {
+export function rbfInto(out, off, d) {
   for (let c = 0; c < RBF.count; c++) {
     const z = (d - RBF_MU[c]) * RBF_INV_SIGMA;
     const v = Math.exp(-z * z);
@@ -51,7 +51,7 @@ function rbfInto(out, off, d) {
   }
 }
 
-function dist(a, ai, b, bi) {
+export function dist(a, ai, b, bi) {
   const dx = a[ai] - b[bi];
   const dy = a[ai + 1] - b[bi + 1];
   const dz = a[ai + 2] - b[bi + 2];

@@ -19,6 +19,13 @@ export const AA_COLORS = {
   D: "#f87171", E: "#f87171",
   K: "#60a5fa", R: "#60a5fa", H: "#60a5fa",
   G: "#d4d4d8", P: "#fb923c", X: "#64748b",
+  // NA-MPNN's nucleotides. Lower case is DNA, and under shared tokens the RNA
+  // bases render as b/d/h/u/y. Purine/pyrimidine pairs share a hue.
+  a: "#22d3ee", b: "#22d3ee",
+  t: "#f472b6", u: "#f472b6",
+  g: "#facc15", h: "#facc15",
+  c: "#34d399", d: "#34d399",
+  x: "#64748b", y: "#64748b",
 };
 
 const MAX_BITS = Math.log2(20);
@@ -40,6 +47,22 @@ export class Logo {
     this.isDesigned = () => true;
     this.theme = { ink: "#e6edf7", dim: "#93a4c0", line: "#24324f", bg: "#111a2e" };
     this._ascent = new Map();
+    /** The model's alphabet, its width, and which letters get a glyph. */
+    this.alphabet = ALPHABET;
+    this.V = ALPHABET.length;
+    this.letters = [...Array(20).keys()];
+  }
+
+  /**
+   * Point the logo at a different alphabet -- NA-MPNN's 33 letters rather than
+   * the usual 21. `letters` are the indices worth drawing: the placeholders
+   * (UNK, MAS, PAD) carry no probability mass worth a column.
+   */
+  setAlphabet(alphabet, letters) {
+    this.alphabet = alphabet;
+    this.V = alphabet.length;
+    this.letters = letters;
+    this._ascent.clear();
   }
 
   /**
@@ -106,15 +129,15 @@ export class Logo {
       // Least probable at the top, so the dominant letter sits on the baseline.
       const order = [];
       let z = 0;
-      for (let v = 0; v < 20; v++) z += d.probs[i * 21 + v];
-      for (let v = 0; v < 20; v++) order.push([v, d.probs[i * 21 + v] / (z || 1)]);
+      for (const v of this.letters) z += d.probs[i * this.V + v];
+      for (const v of this.letters) order.push([v, d.probs[i * this.V + v] / (z || 1)]);
       order.sort((a, b) => a[1] - b[1]);
 
       let y = LOGO_H;
       for (const [v, p] of order) {
         const h = p * height;
         if (h < 0.7) continue;
-        const letter = ALPHABET[v];
+        const letter = this.alphabet[v];
         ctx.save();
         ctx.globalAlpha = designed ? 1 : 0.4;
         ctx.fillStyle = AA_COLORS[letter] ?? "#64748b";
@@ -133,7 +156,8 @@ export class Logo {
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillStyle = designed ? this.theme.ink : this.theme.dim;
-      ctx.fillText(ALPHABET[d.native[i]] ?? "X", x + this.columnWidth / 2, LOGO_H + NATIVE_H / 2);
+      ctx.fillText(this.alphabet[d.native[i]] ?? "X",
+        x + this.columnWidth / 2, LOGO_H + NATIVE_H / 2);
 
       // A tick under every position the design is allowed to change.
       if (designed) {
@@ -193,10 +217,10 @@ export class Logo {
   describe(i, n = 4) {
     const d = this.data;
     const order = [];
-    for (let v = 0; v < 20; v++) order.push([ALPHABET[v], d.probs[i * 21 + v]]);
+    for (const v of this.letters) order.push([this.alphabet[v], d.probs[i * this.V + v]]);
     order.sort((a, b) => b[1] - a[1]);
     const bits = Math.max(0, MAX_BITS - d.entropy[i] / Math.LN2);
-    return `${d.chainIds[i]}${d.resSeq[i]} ${ALPHABET[d.native[i]]} — ${bits.toFixed(2)} bits\n`
+    return `${d.chainIds[i]}${d.resSeq[i]} ${this.alphabet[d.native[i]]} — ${bits.toFixed(2)} bits\n`
       + order.slice(0, n).map(([aa, p]) => `${aa} ${(p * 100).toFixed(0)}%`).join("  ");
   }
 }
