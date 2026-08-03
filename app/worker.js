@@ -55,6 +55,18 @@ function reviveInputs(raw) {
   };
 }
 
+/** Fisher-Yates over 0..L-1, in place. */
+function shuffleInto(order, rng) {
+  for (let i = 0; i < order.length; i++) order[i] = i;
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = order[i];
+    order[i] = order[j];
+    order[j] = t;
+  }
+  return order;
+}
+
 /** Deterministic PRNG so a given seed reproduces a design run exactly. */
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -122,7 +134,6 @@ const handlers = {
     });
     return {
       ms: performance.now() - t0,
-      seqs: out.seq,
       scores: out.score,
       S: out.S.map((s) => Array.from(s)),
     };
@@ -152,22 +163,13 @@ const handlers = {
     const step = new Float32Array(L);
     const order = new Int32Array(L);
     const runs = [];
+    const ar = { type: mode, order };
     const t0 = performance.now();
 
     for (let r = 0; r < nRuns; r++) {
-      let ar;
-      if (mode === AR.ORDER) {
-        for (let i = 0; i < L; i++) order[i] = i;
-        for (let i = L - 1; i > 0; i--) {
-          const j = Math.floor(rng() * (i + 1));
-          const t = order[i];
-          order[i] = order[j];
-          order[j] = t;
-        }
-        ar = { type: AR.ORDER, order };
-      } else {
-        ar = { type: mode };
-      }
+      // `order` is ignored unless the mode is ORDER, so one object serves the
+      // whole loop.
+      if (mode === AR.ORDER) shuffleInto(order, rng);
       perPositionNLL(current.score(encoded, seq, ar), seq, L, V, step);
       let total = 0;
       let n = 0;

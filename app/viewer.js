@@ -22,6 +22,12 @@ import {
   shade,
   spectrumRgb,
 } from "./trace3d.js";
+import { POLYTYPE } from "../mpnn/na.js";
+
+/** Heavy atoms this close are bonded, as py2Dmol's `ligand_bond` cutoff has it. */
+const BOND_A2 = 2.0 * 2.0;
+/** Bonds take one neutral colour; the atoms carry the element colouring. */
+const BOND_RGB = [130, 140, 155];
 import { makeSec, smoothSec } from "./sec.js";
 
 export { hexToRgb, spectrumRgb, makeCamera, orbit };
@@ -55,6 +61,12 @@ export class Viewer {
     /** (residueIndex) => {rgb: [r, g, b], dim: number} | null */
     this.colourAt = () => ({ rgb: [125, 211, 252], dim: 1 });
     this.highlight = -1;
+    /**
+     * Only LigandMPNN reads heteroatoms -- `Model.encode` gates the whole
+     * atom-context path on its model type. Drawing a cofactor the model is
+     * blind to invites you to design a pocket around something it cannot see,
+     * so the page turns this off for every other family.
+     */
     this.showLigand = true;
     this.box = null;
     this._projected = null;
@@ -72,7 +84,16 @@ export class Viewer {
       ca[i * 3 + 2] = structure.X[i * 12 + 5];
     }
     this.ca = ca;
-    this.sec = smoothSec(makeSec(ca, L));
+    // `makeSec` classifies helix/strand from C-alpha spacing, which means
+    // nothing on a C1' trace -- left to itself it invents helices in a duplex.
+    // Nucleotides are coil, and the renderer draws them as a fatter tube.
+    this.nucleic = structure.nucleicAsResidues
+      ? Uint8Array.from(structure.polytype, (p) => (p === POLYTYPE.PP ? 0 : 1))
+      : null;
+    const sec = smoothSec(makeSec(ca, L));
+    this.sec = this.nucleic
+      ? [...sec].map((c, i) => (this.nucleic[i] ? "C" : c)).join("")
+      : sec;
 
     // Fit over the ligand too, so a cofactor sticking out of the pocket is not
     // cropped. pct < 1 keeps a single stray residue from shrinking everything.
@@ -125,7 +146,12 @@ export class Viewer {
 
     drawTraces(
       this.canvas,
-      [{ coords: this.ca, sec: this.sec, colourAt: (i) => this.colourAt(i) }],
+      [{
+        coords: this.ca,
+        sec: this.sec,
+        nucleic: this.nucleic,
+        colourAt: (i) => this.colourAt(i),
+      }],
       { into: p, box, fit: this.fit, rot: this.camera.rot, zoom: this.camera.zoom, inset: INSET },
     );
 
@@ -181,12 +207,45 @@ export class Viewer {
       const q = this._project(s.ligandXyz[i * 3], s.ligandXyz[i * 3 + 1], s.ligandXyz[i * 3 + 2]);
       discs.push({ q, rgb: ELEMENT_RGB[s.ligandElements[i]] ?? ELEMENT_FALLBACK });
     }
-    discs.sort((a, b) => a.q[2] - b.q[2]);
 
+    // Bonds first, so the discs cap them. Inferred by distance the way py2Dmol
+    // does it -- any two heavy atoms within 2 A -- because a PDB's CONECT
+    // records are optional and usually absent for the ligands that matter.
+    const bonds = [];
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        const dx = s.ligandXyz[i * 3] - s.ligandXyz[j * 3];
+        const dy = s.ligandXyz[i * 3 + 1] - s.ligandXyz[j * 3 + 1];
+        const dz = s.ligandXyz[i * 3 + 2] - s.ligandXyz[j * 3 + 2];
+        if (dx * dx + dy * dy + dz * dz <= BOND_A2) bonds.push([i, j]);
+      }
+    }
+    bonds.sort((a, b) => (discs[a[0]].q[2] + discs[a[1]].q[2])
+      - (discs[b[0]].q[2] + discs[b[1]].q[2]));
+    for (const [i, j] of bonds) {
+      const a = discs[i].q;
+      const b = discs[j].q;
+      const near = Math.min(Math.max(((a[2] + b[2]) / 2 + 1) / 2, 0), 1);
+      const width = Math.max(1.4, (0.36 / this.fit.r) * a[4] * a[3]);
+      // Halo then fill, matching how the cartoon separates crossing strands.
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(a[0], a[1]);
+      ctx.lineTo(b[0], b[1]);
+      ctx.strokeStyle = `rgb(${PAPER[0]},${PAPER[1]},${PAPER[2]})`;
+      ctx.lineWidth = width + 3;
+      ctx.stroke();
+      ctx.strokeStyle = shade(BOND_RGB, near, 1);
+      ctx.lineWidth = width;
+      ctx.stroke();
+    }
+
+    discs.sort((a, b) => a.q[2] - b.q[2]);
     for (const { q, rgb } of discs) {
       const near = Math.min(Math.max((q[2] + 1) / 2, 0), 1);
-      // 1.55 Å is a reasonable heavy-atom radius on a cartoon's scale.
-      const radius = Math.max(2, (1.55 / this.fit.r) * q[4] * q[3]);
+      // Small enough to read as an atom on a bonded skeleton rather than a
+      // space-filling blob that hides the fold it sits in.
+      const radius = Math.max(1.2, (0.42 / this.fit.r) * q[4] * q[3]);
       ctx.beginPath();
       ctx.arc(q[0], q[1], radius + 1.6, 0, Math.PI * 2);
       ctx.fillStyle = `rgb(${PAPER[0]},${PAPER[1]},${PAPER[2]})`;

@@ -160,6 +160,25 @@ export const PE_MAX = 1 / (1.9 - 0.55);
  */
 const SS_HALF_A = { H: 1.3, E: 1.1 };     // ribbon half-width, angstroms
 const SS_TUBE_A = 0.27;                   // loop tube radius, angstroms
+
+// --- nucleic acids -------------------------------------------------------
+// Added for NA-MPNN; everything above is CIRPIN-web verbatim and a layer that
+// does not set `nucleic` renders exactly as it did before.
+//
+// A nucleotide trace is stepped along C1', which sits 5.5-6.5 A from its
+// neighbour where a C-alpha sits 3.8 A. That is past BREAK_A2 below, so every
+// nucleotide became its own run and a nucleic chain drew nothing at all. And a
+// 0.27 A tube is right for a protein loop but invisible next to a duplex.
+const BREAK_A2 = 25;                      // protein: split past 5 A
+const NA_BREAK_A2 = 64;                   // nucleic: split past 8 A
+const NA_TUBE_A = 1.0;                    // fatter backbone, angstroms
+// Samples per residue interval for a nucleic tube. A C1' step is 45% longer
+// than a C-alpha one, so SUB=4 leaves segments long enough that consecutive
+// ones land far apart in the depth sort -- and then a nearer segment's
+// butt-capped halo cuts into its neighbour's fill and the backbone reads as
+// dashes. That notch is invisible on a 0.27 A protein loop and obvious on a
+// 1.0 A one, so sample the coarser geometry more finely instead.
+const NA_SUB = 10;
 // 0.85, not 0.70. Loops should recede, but most of a trace IS loop, so this multiplies almost
 // everything on screen — and stacked on the depth shading it was the largest part of why the render
 // looked washed out. Enough to let a helix or a strand come forward, not enough to bleach the rest.
@@ -262,6 +281,8 @@ export function drawTraces(canvas, layers, opts = {}) {
   for (const layer of layers) {
     const arr = layer.coords;
     const n = arr.length / 3;
+    // Optional [n] flags marking nucleotides; absent means all protein.
+    const nucleic = layer.nucleic || null;
 
     // rotate into view space once
     const P = new Float64Array(n * 3);
@@ -282,7 +303,9 @@ export function drawTraces(canvas, layers, opts = {}) {
       const dx = arr[(i + 1) * 3] - arr[i * 3];
       const dy = arr[(i + 1) * 3 + 1] - arr[i * 3 + 1];
       const dz = arr[(i + 1) * 3 + 2] - arr[i * 3 + 2];
-      if (dx * dx + dy * dy + dz * dz > 25) { runs.push([start, i]); start = i + 1; }
+      // A step touching a nucleotide gets the wider allowance.
+      const limit = nucleic && (nucleic[i] || nucleic[i + 1]) ? NA_BREAK_A2 : BREAK_A2;
+      if (dx * dx + dy * dy + dz * dz > limit) { runs.push([start, i]); start = i + 1; }
     }
     runs.push([start, n - 1]);
 
@@ -417,13 +440,16 @@ export function drawTraces(canvas, layers, opts = {}) {
           const p1 = at(i);
           const p2 = at(i + 1);
           const p3 = at(Math.min(hi, i + 2));
-          for (let k = 0; k <= SUB; k++) {
-            catmull(p0, p1, p2, p3, k / SUB, q0);
+          const na = nucleic ? Boolean(nucleic[i]) : false;
+          const sub = na ? NA_SUB : SUB;
+          for (let k = 0; k <= sub; k++) {
+            catmull(p0, p1, p2, p3, k / sub, q0);
             const A = project(q0);
             if (prevTube) {
               segs.push({
                 x1: prevTube[0], y1: prevTube[1], x2: A[0], y2: A[1],
                 z: (prevTube[2] + A[2]) / 2, pe: (prevTube[3] + A[3]) / 2, c, ss: 'C',
+                na,
               });
             }
             prevTube = A;
@@ -497,7 +523,8 @@ export function drawTraces(canvas, layers, opts = {}) {
       ctx.stroke();
       ctx.lineCap = 'round';
     } else {
-      const lw = Math.max(1.5, (SS_TUBE_A / r) * 2 * R * g.pe);
+      const tube = g.na ? NA_TUBE_A : SS_TUBE_A;
+      const lw = Math.max(1.5, (tube / r) * 2 * R * g.pe);
       ctx.beginPath();
       ctx.moveTo(g.x1, g.y1);
       ctx.lineTo(g.x2, g.y2);

@@ -1,10 +1,9 @@
 // Page controller: owns the DOM, the selection state, and the worker.
 
 import { ALPHABET } from "../mpnn/constants.js";
-import { naDisplaySequence, NA_ALPHABET, NA_DNA_TO_RNA, POLYTYPE } from "../mpnn/na.js";
-
-/** RNA letter index -> the DNA token that stands in for it. */
-const NA_DNA_TO_RNA_INVERSE = new Map([...NA_DNA_TO_RNA].map(([d, r]) => [r, d]));
+import {
+  naDisplaySequence, NA_ALPHABET, NA_DNA_TO_RNA, NA_NUCLEOTIDES, NA_RNA_TO_DNA, POLYTYPE,
+} from "../mpnn/na.js";
 import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
 import { Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
 import { AA_COLORS, Logo } from "./logo.js";
@@ -209,6 +208,10 @@ function updateModelHint() {
   $("model-hint").textContent = `${MODEL_NOTES[type] ?? ""} `
     + `k=${model.k_neighbors} neighbours`
     + (model.atom_context_num ? `, ${model.atom_context_num} ligand atoms per residue` : "");
+  // Only LigandMPNN reads heteroatoms; every other family's encoder never
+  // looks at them, so showing a cofactor would imply context that is not there.
+  viewer.showLigand = type === "ligand_mpnn";
+  if (state.structure) redraw();
   $("atom-context-row").hidden = type !== "ligand_mpnn";
   $("side-chain-row").hidden = type !== "ligand_mpnn";
   $("membrane-global-row").hidden = type !== "global_label_membrane_mpnn";
@@ -721,8 +724,7 @@ function toggleOmit(v) {
  */
 function biasLetters() {
   if (!state.structure?.nucleicAsResidues) return [...Array(20).keys()];
-  // 0..19 amino acids, 21..25 DA DC DG DT DX.
-  return [...Array(20).keys(), 21, 22, 23, 24, 25];
+  return [...Array(20).keys(), ...NA_NUCLEOTIDES];
 }
 
 function renderBiasGrid() {
@@ -852,7 +854,7 @@ function homoOligomerGroups() {
   }
   // Positional fallback: the i-th residue of every chain.
   const perChain = chains.map(() => []);
-  for (let i = 0; i < s.L; i++) perChain[chains.indexOf(s.chainIds[i])].push(i);
+  for (let i = 0; i < s.L; i++) perChain[s.chainLabels[i]].push(i);
   const byPosition = perChain[0].map((_, i) => perChain.map((c) => ({ pos: c[i], weight })));
   return {
     groups: byPosition,
@@ -900,7 +902,7 @@ async function runDesign() {
     });
 
     const native = state.structure.S;
-    for (let b = 0; b < result.seqs.length; b++) {
+    for (let b = 0; b < result.S.length; b++) {
       const S = result.S[b];
       let same = 0;
       let counted = 0;
@@ -923,8 +925,8 @@ async function runDesign() {
     renderResults();
     setStatus(
       "design-status",
-      `${result.seqs.length} sequences in ${(result.ms / 1000).toFixed(2)} s `
-      + `(${(result.ms / result.seqs.length).toFixed(0)} ms each), seed ${seed}`,
+      `${result.S.length} sequences in ${(result.ms / 1000).toFixed(2)} s `
+      + `(${(result.ms / result.S.length).toFixed(0)} ms each), seed ${seed}`,
     );
   } catch (error) {
     setStatus("design-status", `Failed: ${error.message}`, "error");
@@ -953,20 +955,24 @@ async function runProfile() {
     });
     const probs = new Float32Array(result.probs);
     const L = state.structure.L;
+    // Over the model's own alphabet: NA-MPNN's profile is [L, 33], and reading
+    // it at stride 21 silently mixes neighbouring positions together.
+    const V = numLetters();
+    const letters = biasLetters();
     const entropy = new Float32Array(L);
     for (let i = 0; i < L; i++) {
       let h = 0;
       let z = 0;
-      for (let v = 0; v < 20; v++) z += probs[i * 21 + v];
-      for (let v = 0; v < 20; v++) {
-        const p = probs[i * 21 + v] / (z || 1);
+      for (const v of letters) z += probs[i * V + v];
+      for (const v of letters) {
+        const p = probs[i * V + v] / (z || 1);
         if (p > 0) h -= p * Math.log(p);
       }
       entropy[i] = h;
     }
     state.profile = { probs, entropy };
     $("profile-panel").hidden = false;
-    $("profile-hint").textContent = describeProfileMode(mode);
+    $("profile-hint").textContent = MODE_TEXT[mode] ?? "";
     renderLogo();
     redraw();
     setStatus("design-status", `Profile in ${(result.ms / 1000).toFixed(2)} s`);
@@ -995,7 +1001,7 @@ function parseSequence(text, L) {
     // Under shared tokens an RNA base is stored as the DNA one, so accept both
     // spellings of the same base.
     if (na && !allowed.has(v)) {
-      const dna = NA_DNA_TO_RNA_INVERSE.get(v);
+      const dna = NA_RNA_TO_DNA.get(v);
       if (dna !== undefined) v = dna;
     }
     if (v < 0 || !allowed.has(v)) {
@@ -1068,10 +1074,6 @@ const MODE_TEXT = {
   exact: "One decoder pass per position, each putting that position last. L times the cost, and "
     + "still order-dependent: the other L−1 positions have to be decoded in some order too.",
 };
-
-function describeProfileMode(mode) {
-  return MODE_TEXT[mode] ?? "";
-}
 
 function describeScoreMode() {
   const mode = $("score-mode").value;
@@ -1157,10 +1159,8 @@ $("use-side-chains").onchange = () => {
 function refreshHomoOligomer() {
   const on = $("homo-oligomer").checked;
   $("symmetry").disabled = on;
-  $("homo-summary").textContent = !on
-    ? ""
-    : state.structure
-      ? homoOligomerGroups().note
+  $("homo-summary").textContent = !on ? ""
+    : state.structure ? homoOligomerGroups().note
       : "Load a structure first.";
 }
 $("homo-oligomer").onchange = refreshHomoOligomer;
@@ -1254,14 +1254,14 @@ $("bias-clear-overrides").onclick = () => {
   state.omitOverrides.clear();
   renderBiasGrid();
 };
-$("omit-cys").onclick = () => {
-  toggleOmit(ALPHABET.indexOf("C"));
+// Resolved against the *current* alphabet: NA-MPNN orders amino acids
+// ARNDC..., so ALPHABET's index for "C" is arginine's index over there.
+const omitShortcut = (letter) => () => {
+  toggleOmit(alphabet().indexOf(letter));
   renderBiasGrid();
 };
-$("omit-met").onclick = () => {
-  toggleOmit(ALPHABET.indexOf("M"));
-  renderBiasGrid();
-};
+$("omit-cys").onclick = omitShortcut("C");
+$("omit-met").onclick = omitShortcut("M");
 
 $("clear-results").onclick = () => {
   state.designs = [];

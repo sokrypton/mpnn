@@ -13,7 +13,9 @@ first load.
 ## What it does
 
 - **Load a structure** by PDB ID, UniProt accession (AlphaFold DB), file drop,
-  or drag-and-drop. PDB and mmCIF both parse.
+  or drag-and-drop. PDB and mmCIF both parse, including modified residues that
+  the file declares via `MODRES` or `_chem_comp` — without which a
+  pseudouridine drops out of an RNA chain and the graph bridges the hole.
 - **Pick any of 15 checkpoints** — the four ProteinMPNN and four SolubleMPNN
   noise levels, four LigandMPNN variants, the two membrane models, and NA-MPNN
   for RNA and protein–DNA.
@@ -26,7 +28,8 @@ first load.
 - **Score a sequence** you paste in, per position and averaged, by
   pseudo-likelihood or true autoregressive likelihood (see *Conditioning*).
 - **Feed LigandMPNN the side chains** of the residues you are not designing,
-  as extra atom context.
+  as extra atom context. Heteroatoms are drawn only for LigandMPNN, because it
+  is the only family whose encoder reads them.
 - **Tie a homo-oligomer** with one checkbox, or tie arbitrary positions by hand.
 - **Read a position profile** as a sequence logo -- bits on the y axis, glyphs
   stretched to their share of the column, the native residue underneath -- in
@@ -54,15 +57,28 @@ the spot instead of TM-align's `make_sec`, which CIRPIN's parity suite already
 checks against the C++ to 5e-11. Every one of those is a comment in the vendored
 file explaining what the fix was for.
 
-The only modification is `setPaper()` at the bottom of `trace3d.js`, plus
+There are two modifications. `setPaper()` at the bottom of `trace3d.js`, plus
 `PAPER_CSS` becoming `let` so it can follow. `shade()` expresses depth by
 blending toward the page background and returning an *opaque* colour, which only
 works if it knows what that background is; CIRPIN-web is a light page with a
 fixed paper colour and this one has a dark mode. `diff` against upstream shows
 exactly that one line changed.
 
+And a nucleic-acid block, for NA-MPNN. A nucleotide trace steps along C1',
+which sits 5.5-6.5 Å from its neighbour where a C-alpha sits 3.8 Å — past the
+5 Å chain-break threshold, so a nucleic chain was split into one run per
+residue and drew *nothing*. Measured on 4oqu, 94 of 96 steps. A layer may now
+carry a `nucleic` flag array, which widens the break allowance to 8 Å for any
+step touching a nucleotide and thickens the tube from 0.27 Å — right for a
+protein loop, invisible beside a duplex — to 1.0 Å. `viewer.js` also forces
+those positions to coil, because `make_sec` reads C1' spacing as helix. A layer
+that sets no `nucleic` renders exactly as before: verified byte-identical
+screenshots for ubiquitin and for streptavidin + biotin.
+
 Everything else lives in `app/viewer.js`, which is an adapter: it decides
-colours, draws the ligand, and hit-tests residues (the renderer has no picking,
+colours, draws the ligand as ball-and-stick (bonds inferred at py2Dmol's 2 Å
+heavy-atom cutoff, since CONECT records are usually absent for the ligands that
+matter) and hit-tests residues (the renderer has no picking,
 and the design UI needs it). Its projection is copied line for line from
 `drawTraces` -- it has to be, or clicks land somewhere other than where the
 ribbon was drawn.
@@ -258,9 +274,12 @@ agrees with ProDy on residue count, polymer type, sequence, numbering and
 coordinates exactly.
 
 Two notes. Encoding costs about 2x ProteinMPNN at the same length (2.5 s at
-L = 389), because of the wider edge features; grouping edges by polymer-type
-pair would compact the matmul back to 416 columns for protein–protein edges and
-is the obvious next step. And 1am9 has four residues with no complete backbone
+L = 389) and scales worse: at L = 1000 the edge-embedding matmul alone is 3.1 s,
+running at 13.8 GFLOP/s of which only 8% is useful work — the other 92% is
+multiplying the structural zeros left by the masked-out blocks. Bucketing edges
+by atom-mask pattern and compacting the weight matrix per bucket would fix it
+and is bit-identical (every dropped run is a multiple of four columns, so each
+SIMD lane's addend sequence is unchanged). And 1am9 has four residues with no complete backbone
 of any kind, whose `D_adjust` row is all zeros — the reference's `topk` breaks
 that tie arbitrarily, so the neighbour-graph assertion covers unmasked rows and
 reports the rest.

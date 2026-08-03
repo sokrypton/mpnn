@@ -20,36 +20,18 @@
 
 import { readFileSync } from "node:fs";
 
-import { enableAcceleration } from "../mpnn/accel.js";
-import { AR, Model, perPositionNLL } from "../mpnn/model.js";
+import { AR, perPositionNLL } from "../mpnn/model.js";
 import { structureFromText } from "../mpnn/pdb.js";
-import { Weights } from "../mpnn/weights.js";
+import { loadModel, mulberry32, startKernel } from "./harness.mjs";
 
 const [, , weightsDir, repsArg] = process.argv;
 const REPS = parseInt(repsArg, 10) || 3;
-
-const wasmPath = new URL("../wasm/kernels.wasm", import.meta.url);
-const simd = process.env.MPNN_NO_SIMD
-  ? null
-  : await enableAcceleration(readFileSync(wasmPath).buffer);
-console.log(`kernel: ${simd ? "wasm simd" : "javascript"}`);
+await startKernel();
 
 const CASES = [
   ["assets/1ubq.pdb", "proteinmpnn_v_48_020"],
   ["assets/1stp.pdb", "ligandmpnn_v_32_010_25"],
 ];
-
-/** Deterministic PRNG, so the numbers quoted in the README are reproducible. */
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 function shuffled(L, rng) {
   const out = Int32Array.from({ length: L }, (_, i) => i);
@@ -86,10 +68,7 @@ function compare(a, b, L, V, S) {
 let failures = 0;
 for (const [path, modelName] of CASES) {
   const s = structureFromText(readFileSync(path, "utf8"));
-  const buf = readFileSync(`${weightsDir}/${modelName}.mpnn`);
-  const model = new Model(Weights.fromArrayBuffer(
-    buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
-  ));
+  const model = loadModel(weightsDir, modelName);
   const enc = model.encode(s);
   const { L } = enc;
   const V = model.numLetters;

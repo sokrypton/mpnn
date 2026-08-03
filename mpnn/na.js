@@ -17,12 +17,12 @@
 //
 //   * Edge features are *all 324 ordered pairs* of those slots, not the 25
 //     hand-listed ones, so the edge embedding takes 16 + 16·18·18 = 5200
-//     inputs against 416. That sounds ruinous and is not, because each block is
-//     masked by both endpoints' atom masks: a protein residue has no C1', a
-//     nucleotide has no CA. A protein-protein edge therefore has 5x5 = 25 live
-//     blocks -- exactly today's cost -- and a nucleotide-nucleotide edge 13x13.
-//     `naEdgeFeatures` walks only the live blocks, so the fat embedding costs
-//     what the geometry actually contains.
+//     inputs against 416. Each block is masked by both endpoints' atom masks --
+//     a protein residue has no C1', a nucleotide has no CA -- so a
+//     protein-protein edge has only 5x5 = 25 live blocks and a
+//     nucleotide-nucleotide edge 13x13. Only the live ones are written, but the
+//     matmul is still dense over all 5200 columns and that is the dominant
+//     cost; see `naEdgeFeatures` for the measurement and the fix.
 //
 //   * Nodes carry a polymer-type one-hot instead of nothing, which is the same
 //     shape as the membrane models' per-residue label.
@@ -66,16 +66,27 @@ export const NA_UNKNOWN = { PP: NA_RESTYPE_TO_INT.UNK, DNA: NA_RESTYPE_TO_INT.DX
  * and is converted back for display; see `naDisplaySequence`.
  */
 export const NA_OMIT_UNK = NA_RESTYPE_TO_INT.UNK;
-export const NA_OMIT_LEGACY_RNA = ["A", "C", "G", "U", "RX"].map((n) => NA_RESTYPE_TO_INT[n]);
 
-/** DNA token -> the RNA token it stands in for under shared tokens. */
-export const NA_DNA_TO_RNA = new Map([
-  [NA_RESTYPE_TO_INT.DA, NA_RESTYPE_TO_INT.A],
-  [NA_RESTYPE_TO_INT.DC, NA_RESTYPE_TO_INT.C],
-  [NA_RESTYPE_TO_INT.DG, NA_RESTYPE_TO_INT.G],
-  [NA_RESTYPE_TO_INT.DT, NA_RESTYPE_TO_INT.U],
-  [NA_RESTYPE_TO_INT.DX, NA_RESTYPE_TO_INT.RX],
-]);
+/**
+ * DNA token -> the RNA token it stands in for under shared tokens.
+ *
+ * This is the single statement of the correspondence; the omitted legacy RNA
+ * letters, the parser's residue-name aliasing and the UI's list of drawable
+ * nucleotides are all derived from it below rather than restated.
+ */
+export const NA_DNA_TO_RNA = new Map(
+  [["DA", "A"], ["DC", "C"], ["DG", "G"], ["DT", "U"], ["DX", "RX"]]
+    .map(([dna, rna]) => [NA_RESTYPE_TO_INT[dna], NA_RESTYPE_TO_INT[rna]]),
+);
+
+/** The reverse, for reading a pasted RNA letter back to the token stored. */
+export const NA_RNA_TO_DNA = new Map([...NA_DNA_TO_RNA].map(([d, r]) => [r, d]));
+
+/** The legacy RNA tokens, which shared tokens alias away and omit. */
+export const NA_OMIT_LEGACY_RNA = [...NA_DNA_TO_RNA.values()];
+
+/** The nucleotide tokens a design may actually use. */
+export const NA_NUCLEOTIDES = [...NA_DNA_TO_RNA.keys()];
 
 /**
  * Render a sequence, converting DNA tokens back to RNA letters wherever the
@@ -190,13 +201,22 @@ export function naBackbone(X16, X16Mask, polytype, L) {
   return { xyz, xyzMask, centre };
 }
 
-/** Polymer-type one-hot pushed through node_embedding and norm_nodes. */
-export function naNodeFeatures(w, polytype, L, hidden) {
+/**
+ * A per-residue integer label, one-hot through `node_embedding` and
+ * `norm_nodes`.
+ *
+ * Shared with the membrane models, which seed their node state the same way
+ * from a 3-class buried/interface/soluble label; NA-MPNN uses 6 polymer types.
+ *
+ * @param {Int32Array} labels [L]
+ * @param {number} classes one-hot width
+ */
+export function labelNodeFeatures(w, labels, classes, L, hidden) {
   const embed = w.linear(`${w.featurePrefix}.node_embedding`);
   const norm = w.norm(`${w.featurePrefix}.norm_nodes`);
-  const oneHot = new Float32Array(L * N_POLYTYPES);
-  for (let i = 0; i < L; i++) oneHot[i * N_POLYTYPES + polytype[i]] = 1;
-  const V = linear(oneHot, embed.weight, embed.bias, L, N_POLYTYPES, hidden);
+  const oneHot = new Float32Array(L * classes);
+  for (let i = 0; i < L; i++) oneHot[i * classes + labels[i]] = 1;
+  const V = linear(oneHot, embed.weight, embed.bias, L, classes, hidden);
   layerNorm(V, norm.gamma, norm.beta, L, hidden, V);
   return V;
 }
@@ -213,10 +233,23 @@ export function naNodeFeatures(w, polytype, L, hidden) {
  * And only the live (a, b) blocks are written. Each block is masked by both
  * endpoints' atom masks, so a protein-protein edge fills 5x5 of the 324 and a
  * nucleotide-nucleotide edge 13x13; the rest of the row is left at zero from
- * the clear. The matmul that follows is dense over all 5200 columns, which
- * sounds wasteful and is not -- it is the SIMD kernel at ~22 GFLOP/s against
- * roughly 0.9 for a scalar walk over just the live blocks, and multiplying by
- * a zero that is already in a register costs nothing extra.
+ * the clear.
+ *
+ * The matmul that follows is dense over all 5200 columns, and that *is*
+ * wasteful -- an earlier version of this comment claimed otherwise on the
+ * strength of the kernel's headline throughput, which was the wrong thing to
+ * compare. Measured at L = 1000, K = 32, all protein: the call issues 42.6
+ * GFLOP in 3.08 s, so 13.8 GFLOP/s of which 8% is useful -- 1.1 useful
+ * GFLOP/s, no better than the scalar walk over live blocks it replaced. It
+ * also stages 668 MB of mostly-zero scratch into wasm memory per encode.
+ *
+ * The fix is to bucket edges by the pair of atom-mask patterns -- a real
+ * structure has a handful -- and multiply by a column-compacted copy of
+ * `edge_embedding.weight` per bucket, which is bit-identical because every
+ * dropped run is a multiple of four columns and so leaves each SIMD lane's
+ * addend sequence unchanged. That would put protein-protein edges back at 416
+ * columns. Not done yet; the chunking below is what makes the dense version
+ * merely slow rather than a 666 MB allocation.
  *
  * @returns {Float32Array} [L, K, hidden]
  */

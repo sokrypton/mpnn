@@ -15,52 +15,19 @@
 
 import { readFileSync } from "node:fs";
 
-import { enableAcceleration } from "../mpnn/accel.js";
-import { AR, Model } from "../mpnn/model.js";
+import { AR } from "../mpnn/model.js";
 import { NA_ALPHABET } from "../mpnn/na.js";
 import { structureFromText } from "../mpnn/pdb.js";
-import { Weights } from "../mpnn/weights.js";
+import { loadModel, mulberry32, Report, startKernel } from "./harness.mjs";
 
 const [, , goldenPath, weightsDir, pdbDir] = process.argv;
-const wasmPath = new URL("../wasm/kernels.wasm", import.meta.url);
-const simd = process.env.MPNN_NO_SIMD
-  ? null
-  : await enableAcceleration(readFileSync(wasmPath).buffer);
-console.log(`kernel: ${simd ? "wasm simd" : "javascript"}`);
+await startKernel();
 
 const golden = JSON.parse(readFileSync(goldenPath, "utf8"));
-const buffer = readFileSync(`${weightsDir}/na_mpnn_design.mpnn`);
-const weights = Weights.fromArrayBuffer(
-  buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
-);
-if (weights.dtype !== "float32") {
-  console.log(`${weightsDir} holds ${weights.dtype} weights; parity needs float32.`);
-  process.exit(2);
-}
-const model = new Model(weights);
-
-let failures = 0;
-function check(label, got, want, tol = { maxAbs: 5e-4, rel: 5e-5 }) {
-  let maxAbs = 0;
-  let sumSq = 0;
-  let refSq = 0;
-  for (let i = 0; i < want.length; i++) {
-    const d = Math.abs(got[i] - want[i]);
-    if (d > maxAbs) maxAbs = d;
-    sumSq += d * d;
-    refSq += want[i] * want[i];
-  }
-  const rel = Math.sqrt(sumSq / (refSq || 1));
-  const ok = maxAbs <= tol.maxAbs && rel <= tol.rel;
-  if (!ok) failures++;
-  console.log(`    ${ok ? "PASS" : "FAIL"}  ${label.padEnd(28)} `
-    + `maxAbs=${maxAbs.toExponential(2)} rel=${rel.toExponential(2)}`);
-}
-
-function checkEqual(label, ok, detail = "") {
-  if (!ok) failures++;
-  console.log(`    ${ok ? "PASS" : "FAIL"}  ${label.padEnd(28)} ${detail}`);
-}
+const model = loadModel(weightsDir, "na_mpnn_design");
+const report = new Report();
+const check = (label, got, want, tol) => report.close(label, got, want, tol);
+const checkEqual = (label, ok, detail) => report.ok(label, ok, detail);
 
 for (const ref of golden) {
   const raw = ref.inputs;
@@ -178,16 +145,4 @@ for (const ref of golden) {
     Float32Array.from(ref.logits.none));
 }
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-console.log(failures === 0 ? "\nNA-MPNN parity holds" : `\n${failures} check(s) failed`);
-process.exit(failures === 0 ? 0 : 1);
+report.finish("NA-MPNN parity holds");
