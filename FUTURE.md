@@ -35,21 +35,22 @@ was worth doing on its own but does not save these two.
 per ordered pair. The reduction is bounded by the chunk size, not by the
 structure.
 
-### 1.2 The selection re-encode is not debounced
+### 1.2 The selection re-encode is not debounced — *fixed*
 
-With side-chain context on, `refreshSelection()` posts a full encode on every
-residue click — undebounced and uncancellable. `encodeToken` suppresses
-*reporting* of superseded results, but the worker still runs each one to
-completion and queues Design/Score behind them.
+Was: with side-chain context on, `refreshSelection()` posted a full encode on
+every residue click. Measured in the page on 1STP with
+`ligandmpnn_v_32_020_25`, side chains on: six clicks 30 ms apart posted six
+encodes, and the last one landed 14.91 s after it was asked for. Now one encode,
+against the final selection, and Design flushes the pending debounce rather than
+racing it.
 
-Measured 8.22 s per encode at L = 574, so refining a selection with ten clicks
-blocks the worker for ~82 s. Box-select and the chain toggles already batch
-correctly; only the per-residue click paths are affected (canvas, logo, and
-sequence track).
-
-**Fix:** a trailing debounce (~300–500 ms), plus a generation counter checked in
-the worker's `onmessage` so a superseded encode is dropped *before*
-`Model.encode` rather than after.
+The fix is a trailing 350 ms debounce plus a promise chain that serialises what
+does get posted, both on the page side — not the worker-side generation counter
+this section originally proposed. For the worker to drop a superseded encode it
+would have to see the newer generation while blocked inside `Model.encode`,
+which means shared memory, and `SharedArrayBuffer` needs the COOP/COEP headers
+GitHub Pages does not send (§2.2). Coalescing before the post costs nothing and
+needs no headers.
 
 ---
 

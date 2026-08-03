@@ -135,6 +135,28 @@ function showSequence(S) {
 // the cache, or the page ends up designing against the previous structure.
 let encodeToken = 0;
 
+/**
+ * Encodes run one at a time, and clicks coalesce into the last one.
+ *
+ * With side-chain context on the selection is an encoder input, so every
+ * residue click needs a re-encode -- 8.2 s of worker time at L = 574. Posting
+ * one per click queued them all: ten clicks blocked the worker for ~80 s and
+ * Design waited behind every one of them.
+ *
+ * Two things fix it. `scheduleEncode` is a trailing debounce, so a burst of
+ * clicks posts once. `encodeChain` serialises what does get posted, so by the
+ * time a queued call runs, `encodedFor` usually already matches the current
+ * selection and it returns without touching the worker.
+ *
+ * Cancelling from the worker side would need it to see the newest generation
+ * while blocked inside `Model.encode`, which means shared memory -- and
+ * `SharedArrayBuffer` needs COOP/COEP headers GitHub Pages does not send. So
+ * the coalescing lives here, where it costs nothing.
+ */
+let encodeChain = Promise.resolve(false);
+let encodeTimer = null;
+const ENCODE_DEBOUNCE_MS = 350;
+
 const viewer = new Viewer($("viewer"));
 const logo = new Logo($("logo"));
 
@@ -312,7 +334,33 @@ async function fetchStructure(id) {
 // Encoding
 // ---------------------------------------------------------------------------
 
-async function ensureEncoded() {
+/**
+ * Encode now, after anything already queued. Awaiting this is what Design,
+ * Score and Profile do, so it also flushes a pending debounce rather than
+ * running against a selection the user has already moved past.
+ */
+function ensureEncoded() {
+  if (encodeTimer !== null) {
+    clearTimeout(encodeTimer);
+    encodeTimer = null;
+  }
+  const next = encodeChain.then(runEncode);
+  // The chain must survive a rejection, or every later encode inherits it.
+  // Callers still see `next` itself, so a failure is not swallowed twice.
+  encodeChain = next.then(() => {}, () => {});
+  return next;
+}
+
+/** Encode once the page has been quiet for a moment. Not awaited. */
+function scheduleEncode() {
+  if (encodeTimer !== null) clearTimeout(encodeTimer);
+  encodeTimer = setTimeout(() => {
+    encodeTimer = null;
+    ensureEncoded();
+  }, ENCODE_DEBOUNCE_MS);
+}
+
+async function runEncode() {
   const structure = state.structure;
   if (!structure) return false;
   const name = $("model-select").value;
@@ -474,7 +522,7 @@ function refreshSelection() {
   // With side-chain context on, the selection is an encoder input. Everywhere
   // else it is only read at sampling time.
   if ($("use-side-chains").checked && !$("side-chain-row").hidden && state.structure) {
-    ensureEncoded();
+    scheduleEncode();
   }
 }
 
@@ -1251,7 +1299,7 @@ function paintMembrane(label) {
   state.encodedFor = null;
   $("color-mode").value = "membrane";
   refreshSelection();
-  ensureEncoded();
+  scheduleEncode();
 }
 
 $("mem-soluble").onclick = () => paintMembrane(0);
@@ -1262,7 +1310,7 @@ $("mem-reset").onclick = () => {
   state.membraneVersion += 1;
   state.encodedFor = null;
   refreshSelection();
-  ensureEncoded();
+  scheduleEncode();
 };
 
 $("membrane-global").onchange = (event) => {

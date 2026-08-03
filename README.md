@@ -211,8 +211,10 @@ Two things follow from the design that are easy to trip over.
 **The encoder now depends on the selection.** Everywhere else `chainMask` is a
 sampling-time argument and one encoding serves every run; here it is an encoder
 input, so clicking a residue re-encodes. The page does that automatically and
-says so in the hint. With *nothing* fixed the result is bit-identical to leaving
-the flag off, which is the natural check and the one the browser test makes.
+says so in the hint -- on a trailing 350 ms debounce, so refining a selection
+posts one encode rather than one per click, and Design flushes the debounce
+before it runs. With *nothing* fixed the result is bit-identical to leaving the
+flag off, which is the natural check and the one the browser test makes.
 
 **Side chains crowd out the ligand.** The context is capped at M atoms, and
 side-chain atoms are much closer to C-beta than the ligand is. On 1STP with
