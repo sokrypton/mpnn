@@ -13,7 +13,9 @@ first load.
 ## What it does
 
 - **Load a structure** by PDB ID, UniProt accession (AlphaFold DB), file drop,
-  or drag-and-drop. PDB and mmCIF both parse.
+  or drag-and-drop. PDB and mmCIF both parse, including modified residues that
+  the file declares via `MODRES` or `_chem_comp` — without which a
+  pseudouridine drops out of an RNA chain and the graph bridges the hole.
 - **Pick any of 15 checkpoints** — the four ProteinMPNN and four SolubleMPNN
   noise levels, four LigandMPNN variants, the two membrane models, and NA-MPNN
   for RNA and protein–DNA.

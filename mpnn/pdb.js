@@ -177,9 +177,82 @@ export function parseCIFAtoms(text) {
   return atoms;
 }
 
+/**
+ * Modified residue -> the standard residue it stands for.
+ *
+ * A structure declares its own modifications, and taking that declaration is
+ * far more robust than any whitelist: `MODRES` in PDB, and in mmCIF either
+ * `_pdbx_struct_mod_residue.parent_comp_id` or `_chem_comp`'s
+ * `mon_nstd_parent_comp_id`. Without it a pseudouridine or a
+ * 2'-O-methylcytidine -- two of the commonest tRNA and rRNA modifications --
+ * simply vanishes from the chain and the neighbour graph bridges the hole.
+ *
+ * @returns {Map<string, string>}
+ */
+export function parsePDBModres(text) {
+  const out = new Map();
+  for (const line of text.split("\n")) {
+    // MODRES idCode resName chainID seqNum iCode stdRes comment
+    if (!line.startsWith("MODRES")) continue;
+    const resName = line.slice(12, 15).trim().toUpperCase();
+    const std = line.slice(24, 27).trim().toUpperCase();
+    if (resName && std) out.set(resName, std);
+  }
+  return out;
+}
+
+/** The same, from mmCIF. Handles both the loop and the key-value spelling. */
+export function parseCIFModres(text) {
+  const out = new Map();
+  const pairs = [
+    ["_pdbx_struct_mod_residue.", "comp_id", "parent_comp_id"],
+    ["_chem_comp.", "id", "mon_nstd_parent_comp_id"],
+  ];
+  const clean = (s) => (s === "." || s === "?" ? "" : s.replace(/^['"]|['"]$/g, "").toUpperCase());
+
+  const lines = text.split("\n");
+  for (const [prefix, idKey, parentKey] of pairs) {
+    // Key-value form: one record, `_cat.key value` per line.
+    const single = {};
+    for (const line of lines) {
+      const m = line.match(new RegExp(`^\\s*${prefix.replace(".", "\\.")}(\\S+)\\s+(\\S.*)$`));
+      if (m) single[m[1]] = clean(m[2].trim());
+    }
+    if (single[idKey] && single[parentKey]) out.set(single[idKey], single[parentKey]);
+
+    // Loop form.
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() !== "loop_") continue;
+      let j = i + 1;
+      const columns = [];
+      while (j < lines.length && lines[j].trim().startsWith("_")) {
+        columns.push(lines[j].trim().split(/\s+/)[0]);
+        j++;
+      }
+      if (!columns[0]?.startsWith(prefix)) continue;
+      const idAt = columns.indexOf(prefix + idKey);
+      const parentAt = columns.indexOf(prefix + parentKey);
+      if (idAt < 0 || parentAt < 0) continue;
+      for (; j < lines.length; j++) {
+        const line = lines[j].trim();
+        if (line === "" || line.startsWith("#") || line.startsWith("loop_")) break;
+        const row = line.match(/'[^']*'|"[^"]*"|\S+/g);
+        if (!row || row.length < columns.length) continue;
+        const id = clean(row[idAt]);
+        const parent = clean(row[parentAt]);
+        if (id && parent) out.set(id, parent);
+      }
+    }
+  }
+  return out;
+}
+
+/** @returns {{atoms: RawAtom[], modres: Map<string, string>}} */
 export function parseAtoms(text) {
   const looksCIF = /^\s*(data_|#)/.test(text) || text.includes("_atom_site.");
-  return looksCIF ? parseCIFAtoms(text) : parsePDBAtoms(text);
+  return looksCIF
+    ? { atoms: parseCIFAtoms(text), modres: parseCIFModres(text) }
+    : { atoms: parsePDBAtoms(text), modres: parsePDBModres(text) };
 }
 
 /**
@@ -203,7 +276,13 @@ export function structureFromText(text, opts = {}) {
   const wantLigands = opts.ligands !== false;
   // NA-MPNN only: nucleic acids become model positions instead of ligand atoms.
   const nucleicAsResidues = opts.nucleicAsResidues === true;
-  const atoms = parseAtoms(text).filter((a) => a.occupancy > 0 && Number.isFinite(a.x));
+  const parsed = parseAtoms(text);
+  const atoms = parsed.atoms.filter((a) => a.occupancy > 0 && Number.isFinite(a.x));
+  const modres = parsed.modres;
+  // A declared modification only counts if it resolves to something we know.
+  const standsFor = (name) => modres.get(name);
+  const isProteinName = (n) => PROTEIN.has(n) || PROTEIN.has(standsFor(n) ?? "");
+  const isNucleicName = (n) => NUCLEIC.has(n) || NUCLEIC.has(standsFor(n) ?? "");
   const chainFilter = opts.chains ? new Set(opts.chains) : null;
 
   /** @type {Map<string, {atoms: Map<string, RawAtom>, meta: RawAtom}>} */
@@ -215,8 +294,8 @@ export function structureFromText(text, opts = {}) {
     if (chainFilter && !chainFilter.has(atom.chain)) continue;
     if (WATER.has(atom.resName)) continue;
 
-    const isNucleic = nucleicAsResidues && NUCLEIC.has(atom.resName);
-    if ((PROTEIN.has(atom.resName) || isNucleic) && !atom.name.startsWith("H")) {
+    const isNucleic = nucleicAsResidues && isNucleicName(atom.resName);
+    if ((isProteinName(atom.resName) || isNucleic) && !atom.name.startsWith("H")) {
       const key = `${atom.chain}|${atom.resSeq}|${atom.iCode}`;
       let res = residues.get(key);
       if (res === undefined) {
@@ -226,7 +305,7 @@ export function structureFromText(text, opts = {}) {
       }
       // First altloc wins, matching the reference's occupancy-filtered selection.
       if (!res.atoms.has(atom.name)) res.atoms.set(atom.name, atom);
-    } else if (wantLigands && !PROTEIN.has(atom.resName)) {
+    } else if (wantLigands && !isProteinName(atom.resName)) {
       const type = ELEMENT_TO_INT[atom.element];
       // Hydrogen (1) and unrecognised elements (0) are dropped by the reference.
       if (type !== undefined && type !== 1) ligandAtoms.push({ ...atom, type });
@@ -235,10 +314,30 @@ export function structureFromText(text, opts = {}) {
 
   // A residue becomes a model position if it has its reference atom: C-alpha
   // for protein, C1' for a nucleotide. That is `macromolecule_reference_atoms`.
-  const kept = residueOrder.filter((k) => {
+  //
+  // A residue admitted only because a MODRES or _chem_comp record vouched for
+  // it has to be bonded into a chain as well, following py2Dmol. Otherwise a
+  // free nucleotide or a cofactor sitting in a pocket -- exactly the thing
+  // LigandMPNN wants as context -- gets absorbed into the polymer because a
+  // record somewhere named it. Distances are py2Dmol's chain-break cutoffs.
+  const refAtom = (res) => res.atoms.get(res.nucleic ? "C1'" : "CA");
+  const withRef = residueOrder.filter((k) => refAtom(residues.get(k)) !== undefined);
+  const connected = (k, index) => {
     const res = residues.get(k);
-    return res.atoms.has(res.nucleic ? "C1'" : "CA");
-  });
+    const declared = !(res.nucleic ? NUCLEIC : PROTEIN).has(res.meta.resName);
+    if (!declared) return true;
+    const a = refAtom(res);
+    const cutoff = res.nucleic ? 7.5 : 5.0;
+    for (const other of [withRef[index - 1], withRef[index + 1]]) {
+      if (other === undefined) continue;
+      const n = residues.get(other);
+      if (n.meta.chain !== res.meta.chain) continue;
+      const b = refAtom(n);
+      if (Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) <= cutoff) return true;
+    }
+    return false;
+  };
+  const kept = withRef.filter(connected);
   const L = kept.length;
 
   const X = new Float32Array(L * 12);
