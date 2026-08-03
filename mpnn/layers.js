@@ -95,9 +95,15 @@ function makeMessageTail(w, arena, prefix, names, hidden, tag) {
  * the *new* node states at neighbouring residues -- doing both in one pass
  * would let earlier chunks leak into later ones.
  *
- * @returns {(hV, hE, EIdx, mask, maskAttend, L) => void} mutates hV and hE
+ * `K` is per call, not per layer: the graph has `min(K, L)` neighbours, so a
+ * structure with fewer residues than the checkpoint's K -- a short peptide, a
+ * DNA duplex on its own -- gives every layer a narrower `hE` than the model
+ * nominally asks for. Baking the checkpoint's K into the closure indexed past
+ * the end of that.
+ *
+ * @returns {(hV, hE, EIdx, mask, maskAttend, L, K) => void} mutates hV and hE
  */
-export function makeEncoderLayer(w, arena, prefix, hidden, K) {
+export function makeEncoderLayer(w, arena, prefix, hidden) {
   const node = makeFusedMessage(w, arena, prefix, ["W1", "W2", "W3"], hidden, "enc");
   const edge = makeFusedMessage(w, arena, prefix, ["W11", "W12", "W13"], hidden, "enc");
   const dense = makeDense(w, arena, `${prefix}.dense`, hidden, "enc");
@@ -121,7 +127,7 @@ export function makeEncoderLayer(w, arena, prefix, hidden, K) {
     g: norm3.gamma, c: norm3.beta,
   };
 
-  return (hV, hE, EIdx, mask, maskAttend, L) => {
+  return (hV, hE, EIdx, mask, maskAttend, L, K) => {
     // --- node update (double buffered so neighbours read pre-update states) ---
     const hVNext = arena.f32("enc.hVNext", L * hidden);
     let proj = node.project(hV, L);

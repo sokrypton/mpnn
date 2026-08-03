@@ -106,7 +106,7 @@ export class Model {
 
     const a = this.arena;
     this.encoderLayers = [0, 1, 2].map(
-      (i) => makeEncoderLayer(weights, a, `encoder_layers.${i}`, this.hidden, this.K),
+      (i) => makeEncoderLayer(weights, a, `encoder_layers.${i}`, this.hidden),
     );
     this.decoderLayers = [0, 1, 2].map(
       (i) => makeDecoderLayer(weights, a, `decoder_layers.${i}`, this.hidden, this.hidden * 3),
@@ -236,7 +236,7 @@ export class Model {
       ligand = this._prepareLigand(inputs, bb, mask, L, EIdx, K);
     }
 
-    for (const layer of this.encoderLayers) layer(hV, hE, EIdx, mask, maskAttend, L);
+    for (const layer of this.encoderLayers) layer(hV, hE, EIdx, mask, maskAttend, L, K);
 
     if (this.isLigand) this._encodeLigandContext(hV, ligand, mask, L);
 

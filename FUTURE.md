@@ -10,10 +10,10 @@ order of magnitude.
 
 ## 1. Defects
 
-### 1.0 Any structure with fewer residues than K neighbours crashes
+### 1.0 Any structure with fewer residues than K neighbours crashes — *fixed*
 
-**Reproduce:** 1BNA, a 24-base-pair DNA duplex — L = 24 against NA-MPNN's
-K = 32 — or 1UBQ truncated to its first 20 residues:
+**Was:** 1BNA, a 24-base-pair DNA duplex — L = 24 against NA-MPNN's K = 32 —
+or 1L2Y, the 20-residue Trp-cage, under any model:
 
 ```
 RangeError: offset is out of bounds
@@ -21,14 +21,20 @@ RangeError: offset is out of bounds
     at mpnn/layers.js:160  (encoder edge update)
 ```
 
-Every family, not just NA-MPNN: measured `proteinmpnn_v_48_020` (K = 48) and
-`ligandmpnn_v_32_020_25` (K = 32) failing the same way at L = 20. Found while
-testing something else; it is long-standing, not a regression.
+`neighborGraph` already clamps to `min(K, L)` and returns what it used,
+matching the reference's `topk(..., min(top_k, L))`. But `makeEncoderLayer`
+closed over the *checkpoint's* K and indexed `hE` with it, so every layer read
+past the end of a graph narrower than the model nominally asks for. K is a
+property of the graph, not of the layer, so it is now an argument to the call
+like L. The decoder already took it from the encoding and was never wrong.
 
-Not diagnosed further than the stack. `neighborGraph` presumably yields fewer
-than K columns when it runs out of residues, and the encoder's edge update
-sizes its output from K regardless. Short peptides and short duplexes are
-things people will actually paste in, and there is no test below L = 76.
+Long-standing, not a regression, and it survived because nothing in the suite
+went below L = 76 — `test/small.mjs` now covers L = 2 to 49 across four
+checkpoints on both kernels, and fails 23 ways against the old engine. Verified
+in the page too: 1L2Y designs, scores and profiles.
+
+Structures at L ≥ K are untouched, by sha256 over `hV`, `hE` and `mask` on
+1STP (half- and all-fixed side chains) and 3HDD on the JS kernel.
 
 ### 1.1 Side-chain context runs out of WASM memory on a large complex — *fixed*
 
@@ -134,7 +140,8 @@ The next thing in this path is the RBF fill, not the matmul.
   headers, which GitHub Pages does not send — likely a non-starter as hosted.
 
 **Not worth doing** (measured, negative or negligible):
-`scratch.fill(0)` in `naEdgeFeatures` is 27 ms of 3541 (0.8%);
+`naEdgeFeatures`'s `scratch.fill(0)` was 27 ms of 3541 (0.8%) — moot now, the
+compaction in §2.1 leaves nothing to zero;
 `naBackbone`'s six `pick()` closures are 1–4 ms of a 5.4 s encode; hoisting the
 `liveJ` recompute and precomputing the position table were inside run-to-run
 variance. Making the *weights* fp16 in RAM saves ~5 MB against ~305 MB of
@@ -233,8 +240,10 @@ status/progress area instead of five scattered ones).
   large structure at all.
 - NA-MPNN scoring is not in the browser test, though the display↔parse
   round-trip was verified exact over all 97 residues of 4OQU.
-- **Nothing is tested below L = 76**, which is how §1.0 survived. The suite's
-  smallest structure is 1UBQ and every model's K is 32 or 48.
+- `test/small.mjs` covers L = 2 to 49 (§1.0) but only checks that the encode
+  runs, that K clamps, and that the letters are in range. Whether a short
+  structure agrees *numerically* with the reference is unverified — it needs a
+  golden case from `tools/make_reference.py` at L < K.
 
 ---
 
@@ -254,9 +263,8 @@ status/progress area instead of five scattered ones).
   fixed and designed positions. The reference reassigns `S_t` inside its group
   loop so a fixed member leaks its native residue into the others; this engine
   samples one identity per group. Documented in `test/sampling.mjs`.
-- §1.1, §1.2 and §2.1 are done; §1.0 is open and is the only crash left. The
-  rest of §1.1 is memory *headroom*, not a defect — nothing fails, but three
-  buffers still grow with the pair count.
+- All of §1 and §2.1 are done. What is left of §1.1 is memory *headroom*, not
+  a defect — nothing fails, but three buffers still grow with the pair count.
 - **Every "bit-identical" claim in here was checked, not just argued.** The
   method: sha256 the encoder's `hV`, `hE` and `mask` on a spread of structures,
   on both kernels, with the change stashed and unstashed. It costs a few

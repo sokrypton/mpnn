@@ -337,6 +337,12 @@ in the sampler, which is stochastic. Both sides are pinned the same way: an
 explicit decoding order, and a temperature of 1e-6 that collapses the draw onto
 the argmax. The sequences then have to match *exactly*.
 
+`test/small.mjs` runs L = 2 to 49 through four checkpoints, because everything
+above went through a structure with more residues than the model's K = 32 or 48
+neighbours. It needs no golden tensors — it asserts the encode runs, that K
+clamps to `min(K, L)`, and that the letters are in range — so unlike the parity
+tests it runs against the shipped fp16 weights.
+
 ### One deliberate divergence
 
 A tied group containing both fixed and designed positions is the single place
