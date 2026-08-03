@@ -630,6 +630,13 @@ files still match.
 `ligandmpnn_sc_v_32_002_16` (the sidechain packer) is deliberately not
 converted; nothing here runs it.
 
+## What is not done
+
+[`FUTURE.md`](FUTURE.md) lists everything known-open with the evidence for each
+— a memory ceiling on side-chain context at the worst case, the NA-MPNN edge
+matmul spending 92% of its FLOPs on structural zeros, side-chain packing and
+NA-MPNN's specificity mode, and a pass of UI cleanup.
+
 ## Credit
 
 Model architecture and weights are from
