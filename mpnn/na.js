@@ -20,9 +20,8 @@
 //     inputs against 416. Each block is masked by both endpoints' atom masks --
 //     a protein residue has no C1', a nucleotide has no CA -- so a
 //     protein-protein edge has only 5x5 = 25 live blocks and a
-//     nucleotide-nucleotide edge 13x13. Only the live ones are written, but the
-//     matmul is still dense over all 5200 columns and that is the dominant
-//     cost; see `naEdgeFeatures` for the measurement and the fix.
+//     nucleotide-nucleotide edge 13x13. Only the live ones are written, and
+//     the matmul is compacted to just those columns; see `naEdgeFeatures`.
 //
 //   * Nodes carry a polymer-type one-hot instead of nothing, which is the same
 //     shape as the membrane models' per-residue label.
@@ -222,34 +221,107 @@ export function labelNodeFeatures(w, labels, classes, L, hidden) {
 }
 
 /**
+ * Which of the 18 atom slots a residue actually has, as a bitmap.
+ *
+ * This is what decides the shape of an edge's feature row, and a real
+ * structure has only a handful of distinct values: protein-complete,
+ * DNA-complete, RNA-complete, and a few with an atom missing.
+ */
+function maskPattern(xyzMask, i) {
+  let bits = 0;
+  for (let a = 0; a < NA_SLOTS; a++) if (xyzMask[i * NA_SLOTS + a]) bits |= 1 << a;
+  return bits;
+}
+
+/**
+ * The columns of the 5200-wide edge input that an edge between these two
+ * patterns can ever write: the 16-column position prefix, then one 16-column
+ * RBF block per live (a, b).
+ *
+ * Ascending, which is what makes the compaction below exact -- see
+ * `compactedEdgeWeight`.
+ */
+function liveEdgeColumns(pi, pj) {
+  let n = 16;
+  for (let a = 0; a < NA_SLOTS; a++) {
+    if (!(pi & (1 << a))) continue;
+    for (let b = 0; b < NA_SLOTS; b++) if (pj & (1 << b)) n += RBF.count;
+  }
+  const cols = new Int32Array(n);
+  for (let o = 0; o < 16; o++) cols[o] = o;
+  let c = 16;
+  for (let a = 0; a < NA_SLOTS; a++) {
+    if (!(pi & (1 << a))) continue;
+    for (let b = 0; b < NA_SLOTS; b++) {
+      if (!(pj & (1 << b))) continue;
+      const base = 16 + (a * NA_SLOTS + b) * RBF.count;
+      for (let r = 0; r < RBF.count; r++) cols[c++] = base + r;
+    }
+  }
+  return cols;
+}
+
+/**
+ * `edge_embedding.weight` with the dead columns removed, per mask-pattern pair.
+ *
+ * Cached against the weight array itself: it is derived from the checkpoint and
+ * a pair of patterns, never from coordinates, so one structure's buckets serve
+ * every later encode with the same model. A bucket is 128 x cols x 4 bytes --
+ * 213 KB for protein-protein, 1.4 MB for the RNA-RNA worst case.
+ *
+ * Dropping columns this way is **bit-identical**, not merely within tolerance.
+ * `linear_f32` gives SIMD lane `l` the terms with `k = l (mod 4)` and sums the
+ * lanes at the end; every run of dropped columns has length 16 (a whole RBF
+ * block), so every surviving column keeps its residue mod 4 and therefore its
+ * lane. What each lane accumulates is its old addend sequence with some
+ * `acc + 0*w` steps removed, and those are exact no-ops for finite `w`. The
+ * scalar fallback in `ops.js` sums in index order, where the same argument is
+ * simpler still. `cin` stays a multiple of 4, so neither path grows a tail.
+ */
+const compactedEdgeWeights = new WeakMap();
+
+function compactedEdgeWeight(weight, edgeIn, hidden, pi, pj) {
+  let byPattern = compactedEdgeWeights.get(weight);
+  if (byPattern === undefined) {
+    byPattern = new Map();
+    compactedEdgeWeights.set(weight, byPattern);
+  }
+  // Two 18-bit patterns; the product stays exact in a double.
+  const key = pi * (1 << NA_SLOTS) + pj;
+  let entry = byPattern.get(key);
+  if (entry === undefined) {
+    const cols = liveEdgeColumns(pi, pj);
+    const packed = new Float32Array(hidden * cols.length);
+    for (let o = 0; o < hidden; o++) {
+      const src = o * edgeIn;
+      const dst = o * cols.length;
+      for (let c = 0; c < cols.length; c++) packed[dst + c] = weight[src + cols[c]];
+    }
+    entry = { cols, weight: packed };
+    byPattern.set(key, entry);
+  }
+  return entry;
+}
+
+/**
  * Edge features for NA-MPNN: relative position, then every live atom-pair RBF.
  *
- * Two things make the 5200-wide input affordable.
+ * The nominal input is 5200 wide -- a 16-column relative-position prefix and
+ * an RBF block for each of the 18 x 18 backbone atom pairs -- but only the
+ * blocks live at both endpoints are ever written. A protein-protein edge fills
+ * 5 x 5 of the 324 blocks and a nucleotide-nucleotide edge 13 x 13, so a dense
+ * multiply spends most of its FLOPs on structural zeros: measured at L = 1000,
+ * K = 32, all protein, the call issued 42.6 GFLOP in 3.08 s of which 8% was
+ * useful, and staged 668 MB of mostly-zero scratch into wasm memory per encode.
  *
- * It is built a chunk of residues at a time, never all at once: the full
- * tensor would be 666 MB at L = 1000, while a 16-residue chunk is 10 MB and
- * stays in cache.
+ * So edges are bucketed by the pair of atom-mask patterns at their endpoints
+ * and each bucket multiplies a column-compacted copy of the weight -- 416
+ * columns for protein-protein, 2720 for the RNA-RNA worst case. Only the live
+ * columns are ever materialised, which is also why nothing has to be zeroed
+ * first. `compactedEdgeWeight` has the argument that this is bit-identical.
  *
- * And only the live (a, b) blocks are written. Each block is masked by both
- * endpoints' atom masks, so a protein-protein edge fills 5x5 of the 324 and a
- * nucleotide-nucleotide edge 13x13; the rest of the row is left at zero from
- * the clear.
- *
- * The matmul that follows is dense over all 5200 columns, and that *is*
- * wasteful -- an earlier version of this comment claimed otherwise on the
- * strength of the kernel's headline throughput, which was the wrong thing to
- * compare. Measured at L = 1000, K = 32, all protein: the call issues 42.6
- * GFLOP in 3.08 s, so 13.8 GFLOP/s of which 8% is useful -- 1.1 useful
- * GFLOP/s, no better than the scalar walk over live blocks it replaced. It
- * also stages 668 MB of mostly-zero scratch into wasm memory per encode.
- *
- * The fix is to bucket edges by the pair of atom-mask patterns -- a real
- * structure has a handful -- and multiply by a column-compacted copy of
- * `edge_embedding.weight` per bucket, which is bit-identical because every
- * dropped run is a multiple of four columns and so leaves each SIMD lane's
- * addend sequence unchanged. That would put protein-protein edges back at 416
- * columns. Not done yet; the chunking below is what makes the dense version
- * merely slow rather than a 666 MB allocation.
+ * It still runs a chunk of residues at a time, so the scratch is bounded by
+ * the chunk rather than by L.
  *
  * @returns {Float32Array} [L, K, hidden]
  */
@@ -263,23 +335,46 @@ export function naEdgeFeatures(w, bb, EIdx, residueIdx, chainLabels, L, K, chunk
   const { xyz, xyzMask } = bb;
 
   const E = new Float32Array(L * K * hidden);
-  const scratch = new Float32Array(chunk * K * edgeIn);
   const projected = new Float32Array(chunk * K * hidden);
+  const bucketOut = new Float32Array(chunk * K * hidden);
   const live = new Int32Array(NA_SLOTS);
   const liveJ = new Int32Array(NA_SLOTS);
+  const pattern = new Int32Array(L);
+  for (let i = 0; i < L; i++) pattern[i] = maskPattern(xyzMask, i);
+
+  // Grown on demand: the width depends on which patterns the structure has.
+  let scratch = new Float32Array(0);
+  /** @type {Map<number, number[]>} bucket key -> edge indices within the chunk */
+  const buckets = new Map();
 
   for (let start = 0; start < L; start += chunk) {
     const end = Math.min(L, start + chunk);
     const rows = end - start;
-    scratch.fill(0, 0, rows * K * edgeIn);
 
+    buckets.clear();
     for (let i = start; i < end; i++) {
-      let nLive = 0;
-      for (let a = 0; a < NA_SLOTS; a++) if (xyzMask[i * NA_SLOTS + a]) live[nLive++] = a;
-
       for (let k = 0; k < K; k++) {
-        const j = EIdx[i * K + k];
-        const base = ((i - start) * K + k) * edgeIn;
+        const key = pattern[i] * (1 << NA_SLOTS) + pattern[EIdx[i * K + k]];
+        const list = buckets.get(key);
+        if (list === undefined) buckets.set(key, [(i - start) * K + k]);
+        else list.push((i - start) * K + k);
+      }
+    }
+
+    for (const [key, list] of buckets) {
+      const pi = Math.floor(key / (1 << NA_SLOTS));
+      const { cols, weight: packed } = compactedEdgeWeight(
+        edgeEmbed.weight, edgeIn, hidden, pi, key - pi * (1 << NA_SLOTS));
+      const nCols = cols.length;
+      if (scratch.length < list.length * nCols) {
+        scratch = new Float32Array(list.length * nCols);
+      }
+
+      for (let r = 0; r < list.length; r++) {
+        const e = list[r];
+        const i = start + ((e / K) | 0);
+        const j = EIdx[i * K + (e % K)];
+        const base = r * nCols;
 
         // Relative position: a one-hot into `embeddings.linear`, a column read.
         const sameChain = chainLabels[i] === chainLabels[j] ? 1 : 0;
@@ -293,22 +388,27 @@ export function naEdgeFeatures(w, bb, EIdx, residueIdx, chainLabels, L, K, chunk
           scratch[base + o] = posLinear.weight[o * posIn + d] + posLinear.bias[o];
         }
 
+        // The RBF blocks, in the order `liveEdgeColumns` laid them out: `a`
+        // ascending over i's live slots, `b` ascending over j's.
+        let nLive = 0;
+        for (let a = 0; a < NA_SLOTS; a++) if (xyzMask[i * NA_SLOTS + a]) live[nLive++] = a;
         let nLiveJ = 0;
         for (let b = 0; b < NA_SLOTS; b++) if (xyzMask[j * NA_SLOTS + b]) liveJ[nLiveJ++] = b;
-
+        let c = base + 16;
         for (let ai = 0; ai < nLive; ai++) {
-          const a = live[ai];
-          const ao = (i * NA_SLOTS + a) * 3;
-          for (let bi = 0; bi < nLiveJ; bi++) {
-            const b = liveJ[bi];
-            rbfInto(scratch, base + 16 + (a * NA_SLOTS + b) * RBF.count,
-              dist(xyz, ao, xyz, (j * NA_SLOTS + b) * 3));
+          const ao = (i * NA_SLOTS + live[ai]) * 3;
+          for (let bi = 0; bi < nLiveJ; bi++, c += RBF.count) {
+            rbfInto(scratch, c, dist(xyz, ao, xyz, (j * NA_SLOTS + liveJ[bi]) * 3));
           }
         }
       }
+
+      linear(scratch, packed, edgeEmbed.bias, list.length, nCols, hidden, bucketOut);
+      for (let r = 0; r < list.length; r++) {
+        projected.set(bucketOut.subarray(r * hidden, (r + 1) * hidden), list[r] * hidden);
+      }
     }
 
-    linear(scratch, edgeEmbed.weight, edgeEmbed.bias, rows * K, edgeIn, hidden, projected);
     layerNorm(projected, normEdges.gamma, normEdges.beta, rows * K, hidden,
       E.subarray(start * K * hidden, end * K * hidden));
   }

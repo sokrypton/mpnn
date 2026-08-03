@@ -258,6 +258,16 @@ is masked by both endpoints, though, so a protein–protein edge fills 25 of the
 324 and a nucleotide–nucleotide edge 169; only the live blocks are written.
 Neighbours are found on `CA + C1'`, which works because the two are disjoint.
 
+Which blocks are live depends only on the two endpoints' atom masks, and a real
+structure has a handful of distinct masks, so edges are bucketed by that pair
+and each bucket multiplies a **column-compacted copy of the weight** — 416
+columns for a protein–protein edge, 2720 for the RNA–RNA worst case, instead of
+5200 for everything. On 6VXX (L = 2916, all protein) that is 124.2 GFLOP and
+1941 MB of staged scratch down to 9.9 GFLOP and 155 MB, and the featuriser from
+5.13 s to 1.40 s. It is bit-identical, not merely close: every dropped run is a
+whole 16-column RBF block, so each surviving column keeps its index mod 4 and
+therefore its SIMD lane, and all a lane loses is `acc + 0*w` steps.
+
 **Polymer-type nodes**, a 6-class one-hot — the same shape as the membrane
 models' per-residue label.
 
@@ -642,9 +652,9 @@ converted; nothing here runs it.
 ## What is not done
 
 [`FUTURE.md`](FUTURE.md) lists everything known-open with the evidence for each
-— the NA-MPNN edge matmul spending 92% of its FLOPs on structural zeros,
-what memory side-chain context still holds proportional to the structure,
-side-chain packing and NA-MPNN's specificity mode, and a pass of UI cleanup.
+— a crash on any structure with fewer residues than K neighbours, what memory
+side-chain context still holds proportional to the structure, side-chain
+packing and NA-MPNN's specificity mode, and a pass of UI cleanup.
 
 ## Credit
 

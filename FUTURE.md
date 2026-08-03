@@ -10,6 +10,26 @@ order of magnitude.
 
 ## 1. Defects
 
+### 1.0 Any structure with fewer residues than K neighbours crashes
+
+**Reproduce:** 1BNA, a 24-base-pair DNA duplex — L = 24 against NA-MPNN's
+K = 32 — or 1UBQ truncated to its first 20 residues:
+
+```
+RangeError: offset is out of bounds
+    at Accelerator.edgeBlock (mpnn/accel.js:239)
+    at mpnn/layers.js:160  (encoder edge update)
+```
+
+Every family, not just NA-MPNN: measured `proteinmpnn_v_48_020` (K = 48) and
+`ligandmpnn_v_32_020_25` (K = 32) failing the same way at L = 20. Found while
+testing something else; it is long-standing, not a regression.
+
+Not diagnosed further than the stack. `neighborGraph` presumably yields fewer
+than K columns when it runs out of residues, and the encoder's edge update
+sizes its output from K regardless. Short peptides and short duplexes are
+things people will actually paste in, and there is no test below L = 76.
+
 ### 1.1 Side-chain context runs out of WASM memory on a large complex — *fixed*
 
 **Was:** encoding 6VXX (L = 2916) with LigandMPNN, `useSideChains: true` and
@@ -75,31 +95,36 @@ needs no headers.
 
 ## 2. Performance
 
-### 2.1 NA-MPNN's edge matmul is 92% structural zeros
+### 2.1 NA-MPNN's edge matmul is 92% structural zeros — *fixed*
 
-`naEdgeFeatures` builds a 5200-wide input and multiplies densely, but for a
+`naEdgeFeatures` built a 5200-wide input and multiplied densely, though for a
 protein–protein edge only `16 + 5·5·16 = 416` of those columns are ever
-written. Measured at L = 1000, K = 32, all protein: the `linear` call issues
-42.6 GFLOP in 3.08 s — 13.8 GFLOP/s, of which **8% is useful**, i.e. 1.1 useful
-GFLOP/s. It also stages ~668 MB of mostly-zero scratch into WASM memory per
-encode.
+written. Edges are now bucketed by the pair of 18-bit atom-mask patterns at
+their endpoints and each bucket multiplies a column-compacted copy of
+`edge_embedding.weight`, cached against the weight array.
 
-**Fix:** the live column set is a pure function of the two endpoints' 18-bit
-atom masks, and a real structure has only a handful of distinct masks
-(protein-complete, DNA, RNA, plus a few with a missing atom). Bucket each
-chunk's edges by `(maskPattern(i), maskPattern(j))`, build one column-compacted
-copy of `edge_embedding.weight` per bucket (cache it on the model — it is
-weight-derived, not input-derived), and call the existing `linear` at the
-compacted width.
+Measured on `naEdgeFeatures` alone, K = 32:
 
-This is **bit-identical**, not merely within tolerance: every RBF block is 16
-columns and the position prefix is 16, so every dropped run has length ≡ 0
-(mod 4), and `linear_f32` assigns lane `l` the terms with `k ≡ l (mod 4)` —
-compaction leaves each lane's addend sequence unchanged except for removing
-`acc + 0.0f*w`, an exact no-op for finite `w`.
+| | before | after |
+| --- | --- | --- |
+| 6VXX, L = 2916, all protein | 5.13 s, 124.2 GFLOP, 1941 MB staged | **1.40 s**, 9.9 GFLOP, 155 MB |
+| 3HDD, L = 153, protein + DNA | 0.27 s, 6.5 GFLOP, 102 MB | **0.13 s**, 1.0 GFLOP, 16 MB |
+| 4OQU, L = 97, RNA | 0.23 s, 4.1 GFLOP, 65 MB | 0.23 s, 2.2 GFLOP, 34 MB |
 
-Expected: protein–protein edges back to 416 columns (today's ProteinMPNN cost),
-worst case RNA–RNA 2720, and staging down to ~53 MB.
+The FLOP counts fall by 12.5× on protein and the staging with them. Wall clock
+does not follow all the way: throughput drops from ~24 GFLOP/s to ~7, because
+what is left is a smaller matmul against the same scalar RBF fill, and on
+RNA — 13×13 live blocks, 2720 of 5200 columns — the fill now dominates
+entirely and the time does not move at all. Whole-encode: 3HDD 0.42 → 0.20 s
+on the WASM kernel and 2.56 → 1.23 s on the JS one.
+
+**Bit-identical**, and checked rather than only argued: sha256 over `hV`, `hE`
+and `mask` matches before and after on 3HDD, 4OQU, 1UBQ and 1STP, on both
+kernels. The argument is in `compactedEdgeWeight` — every dropped run is a
+whole 16-column RBF block, so each surviving column keeps its index mod 4 and
+so its SIMD lane, and what a lane loses is `acc + 0*w` steps.
+
+The next thing in this path is the RBF fill, not the matmul.
 
 ### 2.2 Ideas not yet investigated
 
@@ -208,6 +233,8 @@ status/progress area instead of five scattered ones).
   large structure at all.
 - NA-MPNN scoring is not in the browser test, though the display↔parse
   round-trip was verified exact over all 97 residues of 4OQU.
+- **Nothing is tested below L = 76**, which is how §1.0 survived. The suite's
+  smallest structure is 1UBQ and every model's K is 32 or 48.
 
 ---
 
@@ -227,5 +254,11 @@ status/progress area instead of five scattered ones).
   fixed and designed positions. The reference reassigns `S_t` inside its group
   loop so a fixed member leaks its native residue into the others; this engine
   samples one identity per group. Documented in `test/sampling.mjs`.
-- §1 is done. What is left of it is the memory *headroom* noted under §1.1, not
-  a defect: nothing crashes, but three buffers still grow with the pair count.
+- §1.1, §1.2 and §2.1 are done; §1.0 is open and is the only crash left. The
+  rest of §1.1 is memory *headroom*, not a defect — nothing fails, but three
+  buffers still grow with the pair count.
+- **Every "bit-identical" claim in here was checked, not just argued.** The
+  method: sha256 the encoder's `hV`, `hE` and `mask` on a spread of structures,
+  on both kernels, with the change stashed and unstashed. It costs a few
+  minutes and it is the only thing that would have caught a lane-assignment
+  mistake in §2.1.
