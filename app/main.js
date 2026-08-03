@@ -134,7 +134,7 @@ const ONE_TO_THREE = Object.fromEntries(
 /**
  * The three-letter name of what is *displayed* at a position.
  *
- * The vendored sequence viewer takes residue names, not letters -- it does its
+ * The sequence viewer takes residue names, not letters -- it does its
  * own three-to-one conversion and, more importantly, sniffs protein/DNA/RNA
  * from the names to decide which table to use. So this has to hand it the name
  * of the residue as shown, which for a painted design is the designed one and
@@ -681,7 +681,7 @@ function redraw() {
 }
 
 /**
- * Hand the structure to the vendored sequence viewer.
+ * Hand the structure to the sequence viewer.
  *
  * Whether heteroatoms appear as ligand tokens follows the same rule the 3D
  * view uses for drawing them: only LigandMPNN's encoder reads them, and a

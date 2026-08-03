@@ -86,8 +86,8 @@ indices.
 - **Chain buttons** in the track itself, which is why there is no longer a
   separate row of them above it.
 
-All of this is the vendored viewer's own work, not a reimplementation of it --
-see *What is vendored* below.
+All of this is the copied viewer's own work, not a reimplementation of it --
+see *Where the sequence track came from* below.
 
 The canvas is also why it is fast. The DOM version rebuilt every span on every
 selection change, about a second per click at L = 121 before any model work;
@@ -108,13 +108,15 @@ Under both, the native sequence is a colour-coded strip rather than plain text,
 and `CSV` writes the whole matrix out -- probabilities, bits, and which
 positions were designed -- so nobody has to reverse numbers out of pixels.
 
-### What is vendored
+### Where the sequence track came from
 
-Both, in the end. `app/viewer-seq.js` is py2Dmol's sequence viewer copied
-byte-for-byte, and `app/ligandgroups.js` is the two ligand-grouping functions
-from its `web/utils.js`, likewise unmodified. `app/seqview.js` is the adapter,
-standing in the same relation to `viewer-seq.js` as `app/viewer.js` does to the
-vendored `trace3d.js`.
+`app/viewer-seq.js` is py2Dmol's sequence viewer and `app/ligandgroups.js` is
+the ligand grouping from its `web/utils.js`. Neither has needed changing yet,
+which is a fact about this page's requirements rather than a rule: they are
+ours, and `viewer-seq.js` in particular is 2279 lines of somebody else's
+structure that could usefully be cut down to what is actually called here.
+`app/seqview.js` is the adapter, standing in the same relation to it as
+`app/viewer.js` does to `trace3d.js`.
 
 There was a hand-written sequence track here first, and it was worse in the ways
 that only show up once you use it: no touch handling, no virtual scrolling or
@@ -148,11 +150,12 @@ typed the first base of each DNA strand as protein, and the viewer then
 correctly inserted its polymer-type-change spacer, producing a gap in the
 display where the numbering is contiguous (3HDD chains C and D).
 
-## The renderer is vendored, not reimplemented
+## The renderer was copied, not reimplemented
 
-`app/trace3d.js` and `app/sec.js` are copied **verbatim** from
-[CIRPIN-web](https://github.com/sokrypton/CIRPIN-web). Please do not rewrite
-them.
+`app/trace3d.js` and `app/sec.js` came from
+[CIRPIN-web](https://github.com/sokrypton/CIRPIN-web). They are ours now:
+refactor them, rewrite them, cut what this page does not use. What is worth
+keeping is the knowledge in them, not their byte order.
 
 There was a hand-written cartoon renderer here first and it was worse in ways
 that are not obvious until you look at a render: no background halo, so crossing
@@ -161,15 +164,14 @@ one depth, so a strand passing through a helix drew entirely in front of it;
 ribbon widths in screen units rather than angstroms, so a small domain looked
 chunky and a large one spindly; and a secondary-structure heuristic invented on
 the spot instead of TM-align's `make_sec`, which CIRPIN's parity suite already
-checks against the C++ to 5e-11. Every one of those is a comment in the vendored
+checks against the C++ to 5e-11. Every one of those is a comment in the copied
 file explaining what the fix was for.
 
-There are two modifications. `setPaper()` at the bottom of `trace3d.js`, plus
-`PAPER_CSS` becoming `let` so it can follow. `shade()` expresses depth by
-blending toward the page background and returning an *opaque* colour, which only
-works if it knows what that background is; CIRPIN-web is a light page with a
-fixed paper colour and this one has a dark mode. `diff` against upstream shows
-exactly that one line changed.
+Changes so far. `setPaper()` at the bottom of `trace3d.js`, plus `PAPER_CSS`
+becoming `let` so it can follow: `shade()` expresses depth by blending toward
+the page background and returning an *opaque* colour, which only works if it
+knows what that background is; CIRPIN-web is a light page with a fixed paper
+colour and this one has a dark mode.
 
 And a nucleic-acid block, for NA-MPNN. A nucleotide trace steps along C1',
 which sits 5.5-6.5 Å from its neighbour where a C-alpha sits 3.8 Å — past the
@@ -182,11 +184,32 @@ those positions to coil, because `make_sec` reads C1' spacing as helix. A layer
 that sets no `nucleic` renders exactly as before: verified byte-identical
 screenshots for ubiquitin and for streptavidin + biotin.
 
+And two additions for ligands, both per layer: `tubeA`, an explicit tube radius,
+and one-point layers drawn as a disc. See *Ligands* below for why they are in
+the renderer rather than painted over it.
+
+### Ligands
+
+Bonds, not ball-and-stick, following py2Dmol: discs at every atom hide the
+pocket the ligand sits in. Bonds are inferred at py2Dmol's 2 Å heavy-atom
+cutoff, since CONECT records are usually absent for the ligands that matter,
+and each is split at its midpoint into two half-bonds coloured by the element at
+their own end. Metals are never bonded to anything -- coordination is not a
+covalent bond, and a zinc joined by sticks to its four cysteines draws a
+molecule that is not there -- so they, and anything else the cutoff leaves
+unbonded, are drawn as discs instead.
+
+They are handed to `drawTraces` as layers rather than painted after it, which
+is the whole point: a bond is a two-point layer, a lone atom a one-point layer,
+and both then sort against the ribbon by depth. Painted afterwards, as they
+were, a ligand behind the fold still drew in front of it from every angle. The
+comment excusing that said depth-sorting into the ribbon would mean reaching
+inside the renderer; it does not, because the renderer already sorts every
+segment of every layer it is given.
+
 Everything else lives in `app/viewer.js`, which is an adapter: it decides
-colours, draws the ligand as ball-and-stick (bonds inferred at py2Dmol's 2 Å
-heavy-atom cutoff, since CONECT records are usually absent for the ligands that
-matter) and hit-tests residues (the renderer has no picking,
-and the design UI needs it). Its projection is copied line for line from
+colours and hit-tests residues (the renderer has no picking, and the design UI
+needs it). Its projection is copied line for line from
 `drawTraces` -- it has to be, or clicks land somewhere other than where the
 ribbon was drawn.
 
@@ -197,12 +220,12 @@ index.html          the page
 app/                UI
   main.js             page controller: selection, worker, colour modes
   worker.js           runs the engine off the main thread
-  trace3d.js          cartoon renderer -- VENDORED from CIRPIN-web
-  sec.js              C-alpha secondary structure -- VENDORED from CIRPIN-web
+  trace3d.js          cartoon renderer -- from CIRPIN-web
+  sec.js              C-alpha secondary structure -- from CIRPIN-web
   viewer.js           adapter: colours, ligand discs, residue picking
   logo.js             position profile: sequence logo and heatmap, on a canvas
-  viewer-seq.js       the sequence track -- VENDORED from py2Dmol
-  ligandgroups.js     heteroatoms -> ligands -- VENDORED from py2Dmol
+  viewer-seq.js       the sequence track -- from py2Dmol
+  ligandgroups.js     heteroatoms -> ligands -- from py2Dmol
   seqview.js          adapter: structure, colours and selection for viewer-seq
   style.css
 mpnn/               the engine, usable on its own from Node or a browser

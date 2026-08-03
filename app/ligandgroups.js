@@ -1,4 +1,4 @@
-// Ligand grouping -- VENDORED from py2Dmol's `web/utils.js`.
+// Ligand grouping, copied from py2Dmol's `web/utils.js` and ours to change.
 //
 // https://github.com/sokrypton/py2Dmol
 //
@@ -9,16 +9,15 @@
 //  * this stuff is worth it, you can buy me a beer in return.  Sergey Ovchinnikov
 //  * ----------------------------------------------------------------------------
 //
-// Copied rather than rewritten because it is a pure function over four parallel
-// arrays -- no DOM, no renderer, no state -- and the interesting part is not the
-// mechanics but the *priority*: name+number, then number, then a fallback that
+// Copied rather than rewritten because the interesting part is not the
+// mechanics -- it is a pure function over four parallel arrays -- but the
+// *priority*: name+number, then number, then a fallback that
 // lumps a chain's heteroatoms together when the file numbers them 1, 2, 3... or
 // calls them all UNK. That last case is the one a paraphrase would have dropped,
 // and it is exactly the file you meet in the wild.
 //
-// The only change is `export` on the two declarations. `positionTypes` is 'L'
-// for a ligand atom here, as it is upstream; this page has no other kind in the
-// array it passes.
+// Changed so far: `export` on the two declarations. `positionTypes` is 'L' for
+// a ligand atom here, as upstream; this page passes no other kind.
 
 /**
  * Create a unique key for a ligand group

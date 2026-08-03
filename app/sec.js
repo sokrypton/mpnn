@@ -1,4 +1,4 @@
-// VENDORED VERBATIM from sokrypton/CIRPIN-web, src/tmalign.js.
+// Copied from sokrypton/CIRPIN-web, src/tmalign.js, and ours to change.
 //
 // `makeSec` is that repository's port of TM-align's `make_sec` (TMalign.cpp:2466):
 // secondary structure from C-alpha geometry alone, classified from the distance

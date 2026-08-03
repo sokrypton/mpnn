@@ -223,11 +223,11 @@ README has what changed and why. Two things left in that area:
 - **The track is upstream's now**, so its gaps are upstream's: see
   `app/viewer-seq.js` and the README. The one thing lost in the swap is this
   page's lower-case convention for nucleotides — `naDisplaySequence` writes
-  `acgu`, and the vendored viewer upper-cases them from the residue name, so
+  `acgu`, and `viewer-seq.js` upper-cases them from the residue name, so
   the track and the FASTA now disagree in case. The letters are right and the
   chains are separated and coloured, so nothing is ambiguous; it is a
-  consistency wart, and fixing it means either a local modification to a
-  vendored file or a change upstream.
+  consistency wart, and fixing it is a small change in `viewer-seq.js` -- which
+  is ours to change.
 - **Nothing checks the adapter.** `app/seqview.js` is the only new logic and it
   has no test. The bug it already had — taking the position type from
   `polytype`, which calls a 5'-terminal nucleotide UNK, so the first base of
@@ -280,11 +280,14 @@ README has what changed and why. Two things left in that area:
   `python tools/convert_weights.py --src <ckpts> --out /tmp/w32 --dtype float32`.
   fp16's ~5e-4 relative error swamps every tolerance in the suite and reads as a
   broken port.
-- **`app/trace3d.js` and `app/sec.js` are vendored from CIRPIN-web.** Two
-  deliberate modifications, both documented in the README: `setPaper()`, and the
-  nucleic-acid block. Keep additions opt-in per layer so a layer that sets no
-  flags renders byte-identically — that property is what made the nucleic change
-  safe to verify by screenshot hash.
+- **`app/trace3d.js` and `app/sec.js` came from CIRPIN-web, `app/viewer-seq.js`
+  and `app/ligandgroups.js` from py2Dmol.** They are this repo's now — refactor
+  or rewrite them freely. What is worth preserving is the knowledge in them, not
+  their byte order: `trace3d.js` in particular encodes a long list of rendering
+  fixes that a from-scratch version reproduced as bugs once already, and each
+  one is a comment saying what it was for. Keeping additions opt-in per layer is
+  still worth doing where it is cheap, because it lets a change be verified by
+  screenshot hash against the untouched path.
 - **One deliberate divergence from the reference** remains: a tied group mixing
   fixed and designed positions. The reference reassigns `S_t` inside its group
   loop so a fixed member leaks its native residue into the others; this engine

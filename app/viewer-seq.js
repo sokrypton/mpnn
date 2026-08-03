@@ -1,4 +1,5 @@
-// VENDORED VERBATIM from sokrypton/py2Dmol, py2Dmol/resources/viewer-seq.js.
+// Copied from sokrypton/py2Dmol, py2Dmol/resources/viewer-seq.js, and ours to
+// change.
 //
 //  * ----------------------------------------------------------------------------
 //  * "THE BEER-WARE LICENSE" (Revision 42):
@@ -7,16 +8,18 @@
 //  * this stuff is worth it, you can buy me a beer in return.  Sergey Ovchinnikov
 //  * ----------------------------------------------------------------------------
 //
-// Do not rewrite this file. There was a hand-written sequence track here first
-// and it was worse in the ways that only show up once you use it: no touch
-// handling, no virtual scrolling or scrollbar, no preview during a drag, no
-// chain buttons in the track itself, and a drag that stuttered whenever the
+// Copied rather than written because there was a hand-written sequence track
+// here first and it was worse in the ways that only show up once you use it: no
+// touch handling, no virtual scrolling or scrollbar, no preview during a drag,
+// no chain buttons in the track itself, and a drag that stuttered whenever the
 // pointer crossed a row gap. All of that is solved here already.
 //
-// It is not modified at all. Everything this page has to supply -- the
-// structure, the colours, the selection -- goes through `SEQ.setCallbacks`
-// and a renderer-shaped object; see `app/seqview.js`, which is the adapter,
-// exactly as `app/viewer.js` is the adapter for the vendored trace3d.js.
+// Unmodified so far, which is a fact about how much has needed changing rather
+// than a rule. Everything this page supplies -- the structure, the colours, the
+// selection -- goes through `SEQ.setCallbacks` and a renderer-shaped object;
+// see `app/seqview.js`. When something here needs to change, change it; it is
+// 2279 lines of somebody else's structure, and refactoring it down to what this
+// page actually uses is fair game.
 //
 // Upstream: https://github.com/sokrypton/py2Dmol/blob/main/py2Dmol/resources/viewer-seq.js
 

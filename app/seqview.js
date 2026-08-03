@@ -1,10 +1,10 @@
-// Adapter between this page and the vendored py2Dmol sequence viewer.
+// Adapter between this page and the py2Dmol sequence viewer in viewer-seq.js.
 //
-// `viewer-seq.js` is copied verbatim and talks to a "renderer": an object with
+// `viewer-seq.js` talks to a "renderer": an object with
 // a handful of properties and methods, and a frame made of plain parallel
 // arrays. None of that is py2Dmol-specific once it is written down, so this
 // file supplies it from `state` -- the same relationship `viewer.js` has with
-// the vendored trace3d.js.
+// trace3d.js.
 //
 // Two things need translating rather than passing through.
 //

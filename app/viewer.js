@@ -1,4 +1,4 @@
-// Adapter between the page's state and the vendored CIRPIN renderer.
+// Adapter between the page's state and the CIRPIN cartoon renderer.
 //
 // All the drawing lives in trace3d.js and all the secondary-structure
 // assignment in sec.js, both copied verbatim. This file only does the things
@@ -10,7 +10,6 @@
 // lands somewhere other than where the ribbon was drawn.
 
 import {
-  PAPER,
   PE_MAX,
   drawTraces,
   fitOf,
@@ -19,15 +18,28 @@ import {
   orbit,
   prep,
   setPaper,
-  shade,
   spectrumRgb,
 } from "./trace3d.js";
 import { POLYTYPE } from "../mpnn/na.js";
 
 /** Heavy atoms this close are bonded, as py2Dmol's `ligand_bond` cutoff has it. */
 const BOND_A2 = 2.0 * 2.0;
-/** Bonds take one neutral colour; the atoms carry the element colouring. */
-const BOND_RGB = [130, 140, 155];
+/** Bond stick radius, angstroms. */
+const BOND_TUBE_A = 0.34;
+/** Lone-atom disc radius. Bigger than a bond, so an ion reads as an atom. */
+const ATOM_DISC_A = 0.75;
+/**
+ * Elements drawn as a disc and never bonded to anything.
+ *
+ * Coordination is not a covalent bond, and a zinc joined by sticks to the four
+ * cysteines around it would read as a molecule that is not there. Anything else
+ * that ends up with no bond within the cutoff gets a disc too -- a chloride, a
+ * lone water -- since a bare stub is not a useful drawing of an atom.
+ */
+const METALS = new Set([
+  "LI", "NA", "K", "RB", "CS", "MG", "CA", "SR", "BA",
+  "MN", "FE", "CO", "NI", "CU", "ZN", "CD", "HG", "PT", "AU", "AG", "PB", "MO", "W",
+]);
 import { makeSec, smoothSec } from "./sec.js";
 
 export { hexToRgb, spectrumRgb, makeCamera, orbit };
@@ -41,7 +53,7 @@ const INSET = 10;
 // caller's business, not the renderer's, so it is fixed here.
 const DEFAULT_ZOOM = 1.5;
 
-/** Ligand atoms are drawn as discs, coloured by element. */
+/** Bond colours, by the element at that end. */
 const ELEMENT_RGB = {
   C: [148, 163, 184], N: [96, 165, 250], O: [248, 113, 113], S: [251, 191, 36],
   P: [251, 146, 60], F: [74, 222, 128], CL: [74, 222, 128], BR: [249, 115, 22],
@@ -151,17 +163,19 @@ export class Viewer {
 
     drawTraces(
       this.canvas,
-      [{
-        coords: this.ca,
-        sec: this.sec,
-        nucleic: this.nucleic,
-        colourAt: (i) => this.colourAt(i),
-      }],
+      [
+        {
+          coords: this.ca,
+          sec: this.sec,
+          nucleic: this.nucleic,
+          colourAt: (i) => this.colourAt(i),
+        },
+        ...this._ligandLayers(),
+      ],
       { into: p, box, fit: this.fit, rot: this.camera.rot, zoom: this.camera.zoom, inset: INSET },
     );
 
     this._projectAll();
-    if (this.showLigand) this._drawLigand(p.ctx);
     if (this.highlight >= 0) this._drawHighlight(p.ctx);
     if (this.box) this._drawSelectionBox(p.ctx);
   }
@@ -200,69 +214,88 @@ export class Viewer {
     this._projected = out;
   }
 
-  _drawLigand(ctx) {
+  /**
+   * Ligand bonds, as layers for the renderer rather than a pass painted after
+   * it.
+   *
+   * They used to be drawn on top of the finished cartoon, which meant a ligand
+   * behind the fold still drew in front of it -- always, from every angle. The
+   * comment excusing that said depth-sorting into the ribbon would mean
+   * reaching inside the renderer. It does not: `drawTraces` already
+   * sorts every segment of every layer it is given, so a bond expressed as a
+   * two-point layer sorts against the ribbon for free, and picks up the same
+   * halo and depth shading as everything else.
+   *
+   * Bonds only, no atom discs -- py2Dmol draws ligands as a bond skeleton and
+   * it reads better: discs at this scale hide the pocket the ligand sits in.
+   * Each bond is split at its midpoint into two half-bonds coloured by the
+   * element at their own end, which is the usual convention and keeps the
+   * element information the discs used to carry.
+   */
+  _ligandLayers() {
     const s = this.structure;
     const n = s.ligandType.length;
-    if (!n) return;
-    // Painted after the cartoon rather than interleaved with it. The ligand is
-    // the thing you are looking at with LigandMPNN, and depth-sorting it into
-    // the ribbon would mean reaching inside the vendored renderer.
-    const discs = [];
-    for (let i = 0; i < n; i++) {
-      const q = this._project(s.ligandXyz[i * 3], s.ligandXyz[i * 3 + 1], s.ligandXyz[i * 3 + 2]);
-      discs.push({ q, rgb: ELEMENT_RGB[s.ligandElements[i]] ?? ELEMENT_FALLBACK });
+    if (!this.showLigand || !n) return [];
+    if (this._bondCache?.n !== n || this._bondCache?.xyz !== s.ligandXyz) {
+      const bonds = [];
+      const bonded = new Uint8Array(n);
+      for (let i = 0; i < n; i++) {
+        if (METALS.has(s.ligandElements[i])) continue;
+        for (let j = i + 1; j < n; j++) {
+          if (METALS.has(s.ligandElements[j])) continue;
+          const dx = s.ligandXyz[i * 3] - s.ligandXyz[j * 3];
+          const dy = s.ligandXyz[i * 3 + 1] - s.ligandXyz[j * 3 + 1];
+          const dz = s.ligandXyz[i * 3 + 2] - s.ligandXyz[j * 3 + 2];
+          if (dx * dx + dy * dy + dz * dz <= BOND_A2) {
+            bonds.push(i, j);
+            bonded[i] = 1;
+            bonded[j] = 1;
+          }
+        }
+      }
+      this._bondCache = { n, xyz: s.ligandXyz, bonds: Int32Array.from(bonds), bonded };
     }
 
-    // Bonds first, so the discs cap them. Inferred by distance the way py2Dmol
-    // does it -- any two heavy atoms within 2 A -- because a PDB's CONECT
-    // records are optional and usually absent for the ligands that matter.
-    const bonds = [];
-    for (let i = 0; i < n; i++) {
-      for (let j = i + 1; j < n; j++) {
-        const dx = s.ligandXyz[i * 3] - s.ligandXyz[j * 3];
-        const dy = s.ligandXyz[i * 3 + 1] - s.ligandXyz[j * 3 + 1];
-        const dz = s.ligandXyz[i * 3 + 2] - s.ligandXyz[j * 3 + 2];
-        if (dx * dx + dy * dy + dz * dz <= BOND_A2) bonds.push([i, j]);
+    const { bonds, bonded } = this._bondCache;
+    const layers = [];
+    const rgbOf = (a) => ELEMENT_RGB[s.ligandElements[a]] ?? ELEMENT_FALLBACK;
+
+    for (let b = 0; b < bonds.length; b += 2) {
+      const i = bonds[b];
+      const j = bonds[b + 1];
+      const mx = (s.ligandXyz[i * 3] + s.ligandXyz[j * 3]) / 2;
+      const my = (s.ligandXyz[i * 3 + 1] + s.ligandXyz[j * 3 + 1]) / 2;
+      const mz = (s.ligandXyz[i * 3 + 2] + s.ligandXyz[j * 3 + 2]) / 2;
+      for (const end of [i, j]) {
+        const rgb = rgbOf(end);
+        layers.push({
+          coords: Float64Array.of(
+            s.ligandXyz[end * 3], s.ligandXyz[end * 3 + 1], s.ligandXyz[end * 3 + 2],
+            mx, my, mz,
+          ),
+          // Coil, so it comes out as a round tube -- a bond stick.
+          sec: "CC",
+          tubeA: BOND_TUBE_A,
+          colourAt: () => ({ rgb, dim: 1 }),
+        });
       }
     }
-    bonds.sort((a, b) => (discs[a[0]].q[2] + discs[a[1]].q[2])
-      - (discs[b[0]].q[2] + discs[b[1]].q[2]));
-    for (const [i, j] of bonds) {
-      const a = discs[i].q;
-      const b = discs[j].q;
-      const near = Math.min(Math.max(((a[2] + b[2]) / 2 + 1) / 2, 0), 1);
-      const width = Math.max(1.4, (0.36 / this.fit.r) * a[4] * a[3]);
-      // Halo then fill, matching how the cartoon separates crossing strands.
-      ctx.lineCap = "round";
-      ctx.beginPath();
-      ctx.moveTo(a[0], a[1]);
-      ctx.lineTo(b[0], b[1]);
-      ctx.strokeStyle = `rgb(${PAPER[0]},${PAPER[1]},${PAPER[2]})`;
-      ctx.lineWidth = width + 3;
-      ctx.stroke();
-      ctx.strokeStyle = shade(BOND_RGB, near, 1);
-      ctx.lineWidth = width;
-      ctx.stroke();
-    }
 
-    discs.sort((a, b) => a.q[2] - b.q[2]);
-    for (const { q, rgb } of discs) {
-      const near = Math.min(Math.max((q[2] + 1) / 2, 0), 1);
-      // Small enough to read as an atom on a bonded skeleton rather than a
-      // space-filling blob that hides the fold it sits in.
-      const radius = Math.max(1.2, (0.42 / this.fit.r) * q[4] * q[3]);
-      ctx.beginPath();
-      ctx.arc(q[0], q[1], radius + 1.6, 0, Math.PI * 2);
-      ctx.fillStyle = `rgb(${PAPER[0]},${PAPER[1]},${PAPER[2]})`;
-      ctx.fill();
-      ctx.beginPath();
-      ctx.arc(q[0], q[1], radius, 0, Math.PI * 2);
-      ctx.fillStyle = shade(rgb, near, 1);
-      ctx.fill();
-      ctx.strokeStyle = shade(rgb, near, 1, 0.62);
-      ctx.lineWidth = 1;
-      ctx.stroke();
+    // Whatever has no stick to sit on: metals, and any atom the cutoff left
+    // unbonded. One-point layers, which the renderer draws as discs.
+    for (let a = 0; a < n; a++) {
+      if (bonded[a]) continue;
+      const rgb = rgbOf(a);
+      layers.push({
+        coords: Float64Array.of(
+          s.ligandXyz[a * 3], s.ligandXyz[a * 3 + 1], s.ligandXyz[a * 3 + 2],
+        ),
+        sec: "C",
+        tubeA: ATOM_DISC_A,
+        colourAt: () => ({ rgb, dim: 1 }),
+      });
     }
+    return layers;
   }
 
   _drawHighlight(ctx) {

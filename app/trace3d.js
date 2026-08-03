@@ -1,17 +1,26 @@
-// VENDORED VERBATIM from sokrypton/CIRPIN-web, src/trace3d.js.
+// Copied from sokrypton/CIRPIN-web, src/trace3d.js, and ours to change.
 //
-// Do not rewrite this file. It encodes a long list of specific fixes -- the
-// background halo that makes crossing elements read as occluding rather than
-// blending, per-quad depth sorting, ribbon widths in angstroms divided by the
-// fit radius, the 0.45 depth floor, butt-capped loop halos -- and every one of
-// them was arrived at by looking at renders that were wrong. A from-scratch
+// Copied rather than written because it encodes a long list of specific fixes
+// -- the background halo that makes crossing elements read as occluding rather
+// than blending, per-quad depth sorting, ribbon widths in angstroms divided by
+// the fit radius, the 0.45 depth floor, butt-capped loop halos -- and every one
+// of them was arrived at by looking at renders that were wrong. A from-scratch
 // version reproduces the bugs, which is exactly what happened here before this
-// file was vendored.
+// file was brought over. That is a reason to start from it, not a reason to
+// treat it as read-only.
 //
-// The ONLY modification is at the bottom: `setPaper()`, plus `PAPER_CSS` being
-// `let` instead of `const` so it can follow it. CIRPIN-web is a light page with
-// a fixed paper colour; this one has a dark mode, and `shade()` blends toward
-// the page background by design, so the background has to be settable.
+// Local changes so far, all opt-in per layer:
+//
+//   * `setPaper()` at the bottom, plus `PAPER_CSS` being `let` instead of
+//     `const` so it can follow it. CIRPIN-web is a light page with a fixed
+//     paper colour; this one has a dark mode, and `shade()` blends toward the
+//     page background by design, so the background has to be settable.
+//   * the nucleic-acid block: a `nucleic` flag array widening the break
+//     allowance and the tube.
+//   * `layer.tubeA`, an explicit tube radius in angstroms, so ligand bonds can
+//     be handed in as two-point layers and depth-sort against the ribbon.
+//   * one-point layers, drawn as a disc of radius `tubeA`. A metal ion has no
+//     bond to hang off and has to sort against the fold like everything else.
 //
 // Upstream: https://github.com/sokrypton/CIRPIN-web/blob/main/src/trace3d.js
 
@@ -162,7 +171,7 @@ const SS_HALF_A = { H: 1.3, E: 1.1 };     // ribbon half-width, angstroms
 const SS_TUBE_A = 0.27;                   // loop tube radius, angstroms
 
 // --- nucleic acids -------------------------------------------------------
-// Added for NA-MPNN; everything above is CIRPIN-web verbatim and a layer that
+// Added for NA-MPNN; a layer that
 // does not set `nucleic` renders exactly as it did before.
 //
 // A nucleotide trace is stepped along C1', which sits 5.5-6.5 A from its
@@ -317,6 +326,21 @@ export function drawTraces(canvas, layers, opts = {}) {
         box.y + box.size / 2 - v[1] * R * pe, v[2], pe];
     };
 
+    // A one-point layer is a lone atom: a metal ion, or anything else with no
+    // bond to hang off. It becomes a disc that sorts with everything else, so
+    // a zinc behind a helix is behind it.
+    if (n === 1) {
+      const c = layer.colourAt(0);
+      if (c) {
+        const A = project(at(0));
+        segs.push({
+          dot: true, x1: A[0], y1: A[1], z: A[2], pe: A[3], c,
+          rad: layer.tubeA ?? SS_TUBE_A,
+        });
+      }
+      continue;
+    }
+
     // Side vector for the ribbon face. The curvature direction — where the two
     // neighbours sit relative to this residue — is what orients a real cartoon:
     // for a helix it points at the axis, for a strand it lies in the pleat. Cross
@@ -449,7 +473,7 @@ export function drawTraces(canvas, layers, opts = {}) {
               segs.push({
                 x1: prevTube[0], y1: prevTube[1], x2: A[0], y2: A[1],
                 z: (prevTube[2] + A[2]) / 2, pe: (prevTube[3] + A[3]) / 2, c, ss: 'C',
-                na,
+                na, tube: layer.tubeA,
               });
             }
             prevTube = A;
@@ -475,7 +499,20 @@ export function drawTraces(canvas, layers, opts = {}) {
     // crosses when both are the same colour. Then the element itself, edged in a
     // darker tint so a ribbon reads as a surface rather than a flat patch.
     const dark = shade(g.c.rgb, near, weight, 0.62);
-    if (g.quad) {
+    if (g.dot) {
+      const rad = Math.max(2, (g.rad / r) * 2 * R * g.pe);
+      ctx.beginPath();
+      ctx.arc(g.x1, g.y1, rad + HALO / 2, 0, Math.PI * 2);
+      ctx.fillStyle = PAPER_CSS;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(g.x1, g.y1, rad, 0, Math.PI * 2);
+      ctx.fillStyle = col;
+      ctx.fill();
+      ctx.strokeStyle = dark;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    } else if (g.quad) {
       const q = g.quad;
       // The halo is a copy of the quad widened PERPENDICULAR to the ribbon axis,
       // filled rather than stroked.
@@ -523,7 +560,7 @@ export function drawTraces(canvas, layers, opts = {}) {
       ctx.stroke();
       ctx.lineCap = 'round';
     } else {
-      const tube = g.na ? NA_TUBE_A : SS_TUBE_A;
+      const tube = g.tube ?? (g.na ? NA_TUBE_A : SS_TUBE_A);
       const lw = Math.max(1.5, (tube / r) * 2 * R * g.pe);
       ctx.beginPath();
       ctx.moveTo(g.x1, g.y1);
