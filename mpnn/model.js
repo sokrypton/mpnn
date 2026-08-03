@@ -26,8 +26,8 @@ import {
 } from "./features.js";
 import { makeDecoderLayer, makeEncoderLayer } from "./layers.js";
 import {
-  naBackbone, naEdgeFeatures, naNodeFeatures,
-  NA_OMIT_LEGACY_RNA, NA_OMIT_UNK, POLYTYPE,
+  labelNodeFeatures, naBackbone, naEdgeFeatures,
+  NA_OMIT_LEGACY_RNA, NA_OMIT_UNK, N_POLYTYPES, POLYTYPE,
 } from "./na.js";
 import { gatherNodes, layerNorm, linear, logSoftmax, softmax } from "./ops.js";
 
@@ -182,18 +182,20 @@ export class Model {
     // NA-MPNN graphs 18 atom slots over protein and nucleic residues alike and
     // centres its neighbour search on CA + C1'; everything else graphs 5 atoms
     // over C-alpha. Both then run the identical encoder.
+    const polytype = this.isNA
+      ? (inputs.polytype ?? new Int32Array(L).fill(POLYTYPE.PP))
+      : null;
     let bb;
     let EIdx;
-    let DNeighbors;
     let K;
     let E;
     if (this.isNA) {
-      const polytype = inputs.polytype ?? new Int32Array(L).fill(POLYTYPE.PP);
       bb = naBackbone(inputs.X16, inputs.X16Mask, polytype, L);
-      ({ EIdx, DNeighbors, K } = neighborGraph(bb.centre, mask, L, this.K));
+      ({ EIdx, K } = neighborGraph(bb.centre, mask, L, this.K));
       E = naEdgeFeatures(w, bb, EIdx, residueIdx, chainLabels, L, K);
     } else {
       bb = computeBackbone(X, L);
+      let DNeighbors;
       ({ EIdx, DNeighbors, K } = neighborGraph(bb.CA, mask, L, this.K));
       E = edgeFeatures(w, bb, EIdx, DNeighbors, residueIdx, chainLabels, L, K);
     }
@@ -202,21 +204,13 @@ export class Model {
     const hE = linear(E, wE.weight, wE.bias, L * K, wE.shape[1], H);
     let hV = new Float32Array(L * H);
 
-    if (this.isNA) {
-      const polytype = inputs.polytype ?? new Int32Array(L).fill(POLYTYPE.PP);
-      const V = naNodeFeatures(w, polytype, L, H);
-      const wV = w.linear("W_v");
-      hV = linear(V, wV.weight, wV.bias, L, H, H);
-    } else if (this.isMembrane) {
-      // Membrane models seed the node state from the per-residue label; the
-      // others start from zero.
-      const labels = inputs.membraneLabels ?? new Int32Array(L);
-      const nodeEmbed = w.linear("features.node_embedding");
-      const normNodes = w.norm("features.norm_nodes");
-      const oneHot = new Float32Array(L * 3);
-      for (let i = 0; i < L; i++) oneHot[i * 3 + labels[i]] = 1;
-      const V = linear(oneHot, nodeEmbed.weight, nodeEmbed.bias, L, 3, H);
-      layerNorm(V, normNodes.gamma, normNodes.beta, L, H, V);
+    // Two families seed the node state from a per-residue integer label -- the
+    // membrane models from buried/interface/soluble, NA-MPNN from the polymer
+    // type. Same embedding, different width. Everything else starts from zero.
+    if (this.isNA || this.isMembrane) {
+      const labels = this.isNA ? polytype : (inputs.membraneLabels ?? new Int32Array(L));
+      const classes = this.isNA ? N_POLYTYPES : 3;
+      const V = labelNodeFeatures(w, labels, classes, L, H);
       const wV = w.linear("W_v");
       hV = linear(V, wV.weight, wV.bias, L, wV.shape[1], H);
     }

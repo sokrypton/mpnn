@@ -20,6 +20,9 @@ import sys
 import numpy as np
 import torch
 
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+from make_reference import ar_mask_from_order, decoder_pass  # noqa: E402
+
 
 def load(ref: pathlib.Path):
     """Import NA-MPNN's inference modules without installing the package."""
@@ -40,32 +43,6 @@ POLYTYPES = ["PP", "DNA", "RNA", "UNK", "MAS", "PAD"]
 RESTYPES = ["ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
             "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "UNK",
             "DA", "DC", "DG", "DT", "DX", "A", "C", "G", "U", "RX", "MAS", "PAD"]
-
-
-def ar_mask_from_order(order, L):
-    rank = np.empty(L, dtype=np.int64)
-    rank[np.asarray(order)] = np.arange(L)
-    return (rank[:, None] > rank[None, :]).astype(np.float32)
-
-
-def decoder_pass(mu, model, h_V_enc, h_E, E_idx, S, mask, ar_mask):
-    mask_attend = torch.gather(ar_mask[None], 2, E_idx).unsqueeze(-1)
-    mask_1D = mask.view([1, -1, 1, 1])
-    mask_bw = mask_1D * mask_attend
-    mask_fw = mask_1D * (1.0 - mask_attend)
-
-    h_S = model.W_s(S)
-    h_ES = mu.cat_neighbors_nodes(h_S, h_E, E_idx)
-    h_EX_encoder = mu.cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
-    h_EXV_encoder = mu.cat_neighbors_nodes(h_V_enc, h_EX_encoder, E_idx)
-    h_EXV_encoder_fw = mask_fw * h_EXV_encoder
-
-    h_V = h_V_enc
-    for layer in model.decoder_layers:
-        h_ESV = mu.cat_neighbors_nodes(h_V, h_ES, E_idx)
-        h_ESV = mask_bw * h_ESV + h_EXV_encoder_fw
-        h_V = layer(h_V, h_ESV, mask)
-    return model.W_out(h_V)
 
 
 def main() -> int:
@@ -113,12 +90,12 @@ def main() -> int:
             rng = np.random.default_rng(12345)
             order = rng.permutation(L)
             logits = {
-                "none": decoder_pass(mu, model, h_V, h_E, E_idx, fd["S"], fd["mask"],
-                                     torch.zeros(L, L)),
-                "order": decoder_pass(mu, model, h_V, h_E, E_idx, fd["S"], fd["mask"],
-                                      torch.tensor(ar_mask_from_order(order, L))),
-                "all_but_self": decoder_pass(mu, model, h_V, h_E, E_idx, fd["S"], fd["mask"],
-                                             torch.tensor(1.0 - np.eye(L, dtype=np.float32))),
+                "none": decoder_pass(model, h_V, h_E, E_idx, fd["S"], fd["mask"],
+                                     torch.zeros(L, L), mu),
+                "order": decoder_pass(model, h_V, h_E, E_idx, fd["S"], fd["mask"],
+                                      torch.tensor(ar_mask_from_order(order, L)), mu),
+                "all_but_self": decoder_pass(model, h_V, h_E, E_idx, fd["S"], fd["mask"],
+                                             torch.tensor(1.0 - np.eye(L, dtype=np.float32)), mu),
             }
 
         case = {

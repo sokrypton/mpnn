@@ -5,79 +5,22 @@
 
 import { readFileSync } from "node:fs";
 
-import { AR, Model } from "../mpnn/model.js";
-import { Weights } from "../mpnn/weights.js";
-import { enableAcceleration } from "../mpnn/accel.js";
+import { AR } from "../mpnn/model.js";
+import { argmaxAgreement, loadModel, mulberry32, Report, startKernel } from "./harness.mjs";
 
 const [, , refPath, inputsPath, weightsDir] = process.argv;
-const wasmPath = new URL("../wasm/kernels.wasm", import.meta.url);
-const simd = process.env.MPNN_NO_SIMD
-  ? null
-  : await enableAcceleration(readFileSync(wasmPath).buffer);
-console.log(`kernel: ${simd ? "wasm simd" : "javascript"}`);
+await startKernel();
 
 const reference = JSON.parse(readFileSync(refPath, "utf8"));
 const cases = JSON.parse(readFileSync(inputsPath, "utf8"));
-
-function stats(a, b) {
-  let maxAbs = 0;
-  let sumSq = 0;
-  let refSq = 0;
-  for (let i = 0; i < a.length; i++) {
-    const d = Math.abs(a[i] - b[i]);
-    if (d > maxAbs) maxAbs = d;
-    sumSq += d * d;
-    refSq += b[i] * b[i];
-  }
-  return { maxAbs, rel: Math.sqrt(sumSq / Math.max(refSq, 1e-30)) };
-}
-
-/** Fraction of positions where the two logit rows pick the same argmax. */
-function argmaxAgreement(a, b, rows, cols) {
-  let same = 0;
-  for (let i = 0; i < rows; i++) {
-    let ai = 0;
-    let bi = 0;
-    for (let v = 1; v < cols; v++) {
-      if (a[i * cols + v] > a[i * cols + ai]) ai = v;
-      if (b[i * cols + v] > b[i * cols + bi]) bi = v;
-    }
-    if (ai === bi) same++;
-  }
-  return same / rows;
-}
-
-const TOL = { maxAbs: 2e-3, rel: 2e-4 };
-let failures = 0;
-
-function check(label, got, want, tol = TOL) {
-  const { maxAbs, rel } = stats(got, want);
-  const ok = maxAbs <= tol.maxAbs && rel <= tol.rel;
-  if (!ok) failures++;
-  console.log(
-    `    ${ok ? "PASS" : "FAIL"}  ${label.padEnd(28)} maxAbs=${maxAbs.toExponential(2)} `
-    + `rel=${rel.toExponential(2)}`,
-  );
-  return ok;
-}
+const report = new Report();
+const check = (label, got, want, tol) => report.close(label, got, want, tol);
 
 for (const ref of reference) {
   const testCase = cases.find((c) => c.name === ref.name);
   console.log(`\n${ref.name}  (${ref.modelType}, ${ref.checkpoint}, L=${ref.L}, K=${ref.K})`);
 
-  const buffer = readFileSync(`${weightsDir}/${ref.checkpoint}.mpnn`);
-  const weights = Weights.fromArrayBuffer(
-    buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
-  );
-  const model = new Model(weights);
-  // float16 weights lose ~5e-4 relative, which swamps every tolerance below and
-  // reads as a broken port. The page ships float16; parity needs
-  // `convert_weights.py --dtype float32`.
-  if (weights.dtype !== "float32") {
-    console.log(`\n${weightsDir} holds ${weights.dtype} weights. `
-      + "Parity needs float32 -- rerun tools/convert_weights.py --dtype float32.");
-    process.exit(2);
-  }
+  const model = loadModel(weightsDir, ref.checkpoint);
 
   const raw = testCase.inputs;
   const inputs = {
@@ -103,11 +46,8 @@ for (const ref of reference) {
   const refEIdx = ref.EIdx.flat();
   let graphMismatch = 0;
   for (let i = 0; i < refEIdx.length; i++) if (enc.EIdx[i] !== refEIdx[i]) graphMismatch++;
-  console.log(
-    `    ${graphMismatch === 0 ? "PASS" : "FAIL"}  ${"neighbour graph".padEnd(28)} `
-    + `${refEIdx.length - graphMismatch}/${refEIdx.length} edges identical`,
-  );
-  if (graphMismatch !== 0) failures++;
+  report.ok("neighbour graph", graphMismatch === 0,
+    `${refEIdx.length - graphMismatch}/${refEIdx.length} edges identical`);
 
   check("encoder h_V", enc.hV, Float32Array.from(ref.hV.flat()));
 
@@ -141,16 +81,4 @@ for (const ref of reference) {
   );
 }
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-console.log(failures === 0 ? "\nall checks passed" : `\n${failures} check(s) failed`);
-process.exit(failures === 0 ? 0 : 1);
+report.finish("all checks passed");

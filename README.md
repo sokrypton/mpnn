@@ -258,9 +258,12 @@ agrees with ProDy on residue count, polymer type, sequence, numbering and
 coordinates exactly.
 
 Two notes. Encoding costs about 2x ProteinMPNN at the same length (2.5 s at
-L = 389), because of the wider edge features; grouping edges by polymer-type
-pair would compact the matmul back to 416 columns for protein–protein edges and
-is the obvious next step. And 1am9 has four residues with no complete backbone
+L = 389) and scales worse: at L = 1000 the edge-embedding matmul alone is 3.1 s,
+running at 13.8 GFLOP/s of which only 8% is useful work — the other 92% is
+multiplying the structural zeros left by the masked-out blocks. Bucketing edges
+by atom-mask pattern and compacting the weight matrix per bucket would fix it
+and is bit-identical (every dropped run is a multiple of four columns, so each
+SIMD lane's addend sequence is unchanged). And 1am9 has four residues with no complete backbone
 of any kind, whose `D_adjust` row is all zeros — the reference's `topk` breaks
 that tie arbitrarily, so the neighbour-graph assertion covers unmasked rows and
 reports the rest.

@@ -6,8 +6,8 @@
 
 import { ATOM37, ELEMENT_TO_INT, THREE_TO_ONE } from "./constants.js";
 import {
-  DNA_BACKBONE, naDisplaySequence, NA_ATOMS, NA_RESTYPE_TO_INT, NA_UNKNOWN,
-  POLYTYPE, PROTEIN_BACKBONE, RNA_BACKBONE,
+  DNA_BACKBONE, naDisplaySequence, NA_ATOMS, NA_RESTYPE_TO_INT, NA_RNA_TO_DNA,
+  NA_UNKNOWN, POLYTYPE, PROTEIN_BACKBONE, RNA_BACKBONE,
 } from "./na.js";
 
 /** Residues treated as protein even though they carry a non-standard name. */
@@ -19,6 +19,32 @@ const WATER = new Set(["HOH", "DOD", "WAT", "H2O", "TIP", "TIP3", "SOL"]);
 const PROTEIN = new Set([...Object.keys(THREE_TO_ONE), ...EXTRA_PROTEIN]);
 
 const BACKBONE = ["N", "CA", "C", "O"];
+
+/** What a nucleotide contributes to `X`, purely so the renderer can trace it. */
+const NUCLEIC_TRACE = ["P", "C1'", "C3'", "O4'"];
+
+/**
+ * Copy a residue's named atoms into a strided [L, names.length, 3] array.
+ *
+ * @param {Float32Array} [mask] set to 1 per present atom, when supplied
+ * @returns {number} 1 if every name was present
+ */
+function fillSlots(res, names, out, mask, i) {
+  let complete = 1;
+  names.forEach((name, slot) => {
+    const atom = res.atoms.get(name);
+    if (atom === undefined) {
+      complete = 0;
+      return;
+    }
+    const off = (i * names.length + slot) * 3;
+    out[off] = atom.x;
+    out[off + 1] = atom.y;
+    out[off + 2] = atom.z;
+    if (mask) mask[i * names.length + slot] = 1;
+  });
+  return complete;
+}
 
 /**
  * Nucleic-acid residue names, as ProDy's `nucleic` selection understands them.
@@ -245,27 +271,8 @@ export function structureFromText(text, opts = {}) {
 
   kept.forEach((key, i) => {
     const res = residues.get(key);
-    let complete = 1;
-    BACKBONE.forEach((name, slot) => {
-      const atom = res.atoms.get(name);
-      if (atom === undefined) {
-        complete = 0;
-        return;
-      }
-      X[i * 12 + slot * 3] = atom.x;
-      X[i * 12 + slot * 3 + 1] = atom.y;
-      X[i * 12 + slot * 3 + 2] = atom.z;
-    });
-    mask[i] = complete;
-    ATOM37.forEach((name, slot) => {
-      const atom = res.atoms.get(name);
-      if (atom === undefined) return;
-      const off = (i * 37 + slot) * 3;
-      xyz37[off] = atom.x;
-      xyz37[off + 1] = atom.y;
-      xyz37[off + 2] = atom.z;
-      xyz37Mask[i * 37 + slot] = 1;
-    });
+    mask[i] = fillSlots(res, BACKBONE, X, null, i);
+    fillSlots(res, ATOM37, xyz37, xyz37Mask, i);
     const letter = THREE_TO_ONE[res.meta.resName] ?? "X";
     S[i] = "ACDEFGHIKLMNPQRSTVWYX".indexOf(letter);
 
@@ -274,25 +281,11 @@ export function structureFromText(text, opts = {}) {
       // C-alpha slot, so give a nucleotide the nearest equivalents and it draws
       // like anything else. Purely cosmetic; nothing downstream of the model
       // sees these.
-      ["P", "C1'", "C3'", "O4'"].forEach((name, slot) => {
-        const atom = res.atoms.get(name);
-        if (atom === undefined) return;
-        X[i * 12 + slot * 3] = atom.x;
-        X[i * 12 + slot * 3 + 1] = atom.y;
-        X[i * 12 + slot * 3 + 2] = atom.z;
-      });
+      fillSlots(res, NUCLEIC_TRACE, X, null, i);
     }
 
     if (nucleicAsResidues) {
-      NA_ATOMS.forEach((name, slot) => {
-        const atom = res.atoms.get(name);
-        if (atom === undefined) return;
-        const off = (i * NA_ATOMS.length + slot) * 3;
-        X16[off] = atom.x;
-        X16[off + 1] = atom.y;
-        X16[off + 2] = atom.z;
-        X16Mask[i * NA_ATOMS.length + slot] = 1;
-      });
+      fillSlots(res, NA_ATOMS, X16, X16Mask, i);
       // Polymer type is decided by which backbone is complete, not by the
       // residue name -- `parse_PDB`'s default branch. RNA is subtracted out of
       // the DNA test because RNA carries every DNA backbone atom as well.
@@ -309,9 +302,8 @@ export function structureFromText(text, opts = {}) {
       // tokens an RNA base is stored as the corresponding DNA one.
       const unknown = polytype[i] === POLYTYPE.DNA ? NA_UNKNOWN.DNA
         : polytype[i] === POLYTYPE.RNA ? NA_UNKNOWN.RNA : NA_UNKNOWN.PP;
-      const shared = { A: "DA", C: "DC", G: "DG", U: "DT", RX: "DX" };
-      const name = res.meta.resName;
-      S[i] = NA_RESTYPE_TO_INT[shared[name] ?? name] ?? unknown;
+      const token = NA_RESTYPE_TO_INT[res.meta.resName];
+      S[i] = token === undefined ? unknown : (NA_RNA_TO_DNA.get(token) ?? token);
     }
 
     resSeq[i] = res.meta.resSeq;

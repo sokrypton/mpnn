@@ -138,9 +138,14 @@ def ar_mask_from_order(order, L):
     return (rank[:, None] > rank[None, :]).astype(np.float32)
 
 
-def decoder_pass(model, h_V_enc, h_E, E_idx, S, mask, ar_mask):
-    """Teacher-forced decoder driven by an explicit autoregressive mask."""
-    mu = sys.modules["ref_model_utils"]
+def decoder_pass(model, h_V_enc, h_E, E_idx, S, mask, ar_mask, mu=None):
+    """Teacher-forced decoder driven by an explicit autoregressive mask.
+
+    `mu` is the reference's `model_utils`, for `cat_neighbors_nodes`. It
+    defaults to the LigandMPNN module this file imports; NA-MPNN's harness
+    passes its own, which is why this is a parameter at all.
+    """
+    mu = mu or sys.modules["ref_model_utils"]
     mask_attend = torch.gather(ar_mask[None], 2, E_idx).unsqueeze(-1)
     mask_1D = mask.view([1, -1, 1, 1])
     mask_bw = mask_1D * mask_attend
