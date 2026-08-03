@@ -151,7 +151,11 @@ export class Viewer {
     if (!this.structure) return;
     this.syncBackground();
 
-    const side = Math.min(this.canvas.clientWidth, this.canvas.clientHeight);
+    // Measure the *container*, not the canvas. `prep` sets the canvas's inline
+    // height, so measuring the canvas measures whatever prep last decided --
+    // the size latches and the structure can never grow when its pane does.
+    const host = this.canvas.parentElement;
+    const side = Math.min(host.clientWidth, host.clientHeight);
     const p = prep(this.canvas, side);
     if (!p) return;
     const box = {

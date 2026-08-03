@@ -12,6 +12,15 @@
   --good: #4ade80;
   --bad: #f87171;
   --radius: 10px;
+  /* A scale, because every gap and pad used to be a bare px literal. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --text-sm: 12px;
+  --text-md: 13px;
+  --text-lg: 15px;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
 }
 
@@ -38,19 +47,42 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font: var(--text-lg)/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* The shell: header measures itself, main takes the rest. */
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  margin: 0;
 }
 
 header {
-  padding: 32px 24px 12px;
-  max-width: 1400px;
-  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--line);
 }
+
+/* One status line and one progress bar, for a worker that runs one job. */
+.statusbar {
+  flex: 1 1 22rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-items: flex-end;
+}
+
+.statusbar .status,
+.statusbar .hint { margin: 0; text-align: right; }
+.statusbar .progress { width: min(100%, 22rem); }
 
 h1 {
   margin: 0;
-  font-size: 30px;
+  font-size: 21px;
   letter-spacing: -0.02em;
   font-weight: 650;
 }
@@ -58,10 +90,13 @@ h1 {
 h1 .dot { color: var(--accent); }
 
 .tagline {
-  margin: 6px 0 0;
+  margin: 2px 0 0;
   color: var(--ink-dim);
-  max-width: 70ch;
+  font-size: var(--text-sm);
 }
+
+.credits { font-size: var(--text-sm); color: var(--ink-dim); }
+.credits p { margin: var(--space-2) 0 0; }
 
 h2 {
   margin: 0 0 12px;
@@ -72,14 +107,66 @@ h2 {
   color: var(--ink-dim);
 }
 
+/*
+ * The app shell.
+ *
+ * A grid that fills the viewport rather than a document that scrolls: the
+ * structure is the subject and should not be something you scroll away from.
+ * Panes scroll internally; below the breakpoint they stack and the page scrolls
+ * again, which is the only sensible thing on a phone.
+ */
 main {
-  max-width: 1400px;
-  margin: 0 auto;
-  padding: 16px 24px 48px;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5) var(--space-5);
+  /* The structure is the subject, so it gets the room: a bit under half the
+     height and nearly two thirds of the width. The sequence track scrolls
+     internally, so it needs only enough to show a few chains. */
+  /*
+   * The structure is the subject, so it gets the height -- and height is all
+   * that matters: `drawTraces` fits the model into `min(width, height)`, so
+   * canvas width beyond its height is just background. Hence a column split
+   * nearer square than wide, and as much of the height as the other two rows
+   * can spare. Both of those scroll internally, so they cope.
+   */
+  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 3fr) minmax(112px, 0.5fr) minmax(0, 1.15fr);
+  grid-template-areas:
+    "structure inspector"
+    "sequence  sequence"
+    "results   analysis";
+  flex: 1 1 auto;
+  min-height: 0;
+  box-sizing: border-box;
 }
+
+#viewer-panel   { grid-area: structure; }
+#inspector      { grid-area: inspector; }
+#sequence-panel { grid-area: sequence; }
+#results-panel  { grid-area: results; display: flex; flex-direction: column; padding: var(--space-3); }
+#results-panel .results { flex: 1 1 auto; overflow: auto; }
+#analysis-panel { grid-area: analysis; }
+
+/* Structure only, for as long as it is asked for. */
+body.focus-structure main {
+  grid-template-rows: minmax(0, 1fr) 0 0;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 22rem);
+}
+body.focus-structure #sequence-panel,
+body.focus-structure #results-panel,
+body.focus-structure #analysis-panel { display: none; }
+
+/* Every pane owns its own scrollbar. */
+main > .panel { overflow: auto; }
+
+#viewer-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: var(--space-2);
+}
+
+#viewer-panel .viewer-head { margin-bottom: var(--space-2); }
 
 .panel {
   background: var(--panel);
@@ -89,10 +176,15 @@ main {
   min-width: 0;
 }
 
-.panel.wide { grid-column: 1 / -1; }
-
 @media (max-width: 900px) {
-  main { grid-template-columns: minmax(0, 1fr); }
+  body { height: auto; }
+  main {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-template-areas: "structure" "inspector" "sequence" "results" "analysis";
+  }
+  main > .panel { overflow: visible; }
+  #viewer-panel { min-height: 60vh; }
 }
 
 /* --- controls ----------------------------------------------------------- */
@@ -233,6 +325,8 @@ details > summary {
 
 .viewer-wrap {
   position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -242,7 +336,7 @@ details > summary {
 #viewer {
   display: block;
   width: 100%;
-  height: 520px;
+  height: 100%;
   touch-action: none;
   cursor: grab;
 }
@@ -288,11 +382,176 @@ details > summary {
 
 .seq-hint { margin-top: 8px; }
 
+.tie-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+
+.tie-row {
+  display: grid;
+  grid-template-columns: 3em 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.tie-row .tie-label { font-family: var(--mono); color: var(--accent); }
+.tie-row .tie-what { color: var(--ink-dim); }
+.tie-row select { flex: 0 0 auto; font-size: 11px; padding: 2px 4px; }
+.tie-row button { padding: 2px 7px; line-height: 1; }
+
+/* Divides the pointing verbs from the ones that change the design mask. */
+.viewer-tools .sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 4px;
+  background: var(--line);
+}
+
 /* --- results ------------------------------------------------------------ */
 
-.results { max-height: 340px; overflow-y: auto; }
+.results { min-height: 0; }
 
 .results .empty { color: var(--ink-dim); font-size: 13px; }
+
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.results-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 5px 8px;
+  text-align: right;
+  font-weight: 500;
+  color: var(--ink-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.results-table th:first-child,
+.results-table td:first-child { text-align: left; }
+.results-table th:hover { color: var(--ink); }
+.results-table th[data-sorted]::after {
+  content: " \2191";
+  color: var(--accent);
+}
+.results-table th[data-sorted="desc"]::after { content: " \2193"; }
+
+.results-table td {
+  padding: 4px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.results-table tbody tr { cursor: pointer; }
+.results-table tbody tr:hover { background: var(--panel-2); }
+.results-table tbody tr.active { background: var(--panel-2); }
+.results-table tbody tr.active td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* --- sequence track ----------------------------------------------------- */
+
+.sequence-wrap {
+  margin-top: 12px;
+  /* No max-height and no overflow here on purpose: the vendored viewer caps its
+     own canvas and scrolls virtually inside it, and a second scroller wrapped
+     around that eats the wheel events it wants. */
+}
+
+/* The vendored viewer builds its own canvas in here and sizes it to the box. */
+#sequenceView {
+  /* A drag across residues must not start a text selection on the page. */
+  user-select: none;
+}
+
+.seq-hint { margin-top: 8px; }
+
+.tie-list { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+
+.tie-row {
+  display: grid;
+  grid-template-columns: 3em 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.tie-row .tie-label { font-family: var(--mono); color: var(--accent); }
+.tie-row .tie-what { color: var(--ink-dim); }
+.tie-row select { flex: 0 0 auto; font-size: 11px; padding: 2px 4px; }
+.tie-row button { padding: 2px 7px; line-height: 1; }
+
+/* Divides the pointing verbs from the ones that change the design mask. */
+.viewer-tools .sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 4px;
+  background: var(--line);
+}
+
+/* --- results ------------------------------------------------------------ */
+
+.results { min-height: 0; }
+
+.results .empty { color: var(--ink-dim); font-size: 13px; }
+
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.results-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 5px 8px;
+  text-align: right;
+  font-weight: 500;
+  color: var(--ink-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.results-table th:first-child,
+.results-table td:first-child { text-align: left; }
+.results-table th:hover { color: var(--ink); }
+.results-table th[data-sorted]::after {
+  content: " \2191";
+  color: var(--accent);
+}
+.results-table th[data-sorted="desc"]::after { content: " \2193"; }
+
+.results-table td {
+  padding: 4px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+.results-table tbody tr { cursor: pointer; }
+.results-table tbody tr:hover { background: var(--panel-2); }
+.results-table tbody tr.active { background: var(--panel-2); }
+.results-table tbody tr.active td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 
 .design {
   display: grid;
@@ -341,29 +600,101 @@ details > summary {
 
 /* --- amino-acid bias grid ---------------------------------------------- */
 
-.aa-bias {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(78px, 1fr));
-  gap: 6px;
-  margin-bottom: 10px;
-}
+/* --- constraints pane ---------------------------------------------------- */
 
-.aa-bias .cell {
+.constraints { display: flex; flex-direction: column; gap: var(--space-2); }
+
+.ctable-head {
   display: flex;
   align-items: center;
-  gap: 4px;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+/* Says what the editor will change, instead of a dropdown asking you to pick. */
+.ctable-target {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--ink-dim);
+}
+
+.seg { display: flex; }
+
+.seg button {
+  border-radius: 0;
+  font-size: 11px;
+  padding: 3px 8px;
+}
+.seg button:first-child { border-radius: 6px 0 0 6px; }
+.seg button:last-child { border-radius: 0 6px 6px 0; }
+.seg button + button { border-left: 0; }
+.seg button[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #04121e;
+}
+
+.aa-editor {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(74px, 1fr));
+  gap: var(--space-1);
+}
+
+.aa-editor .cell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
   background: var(--panel-2);
   border: 1px solid var(--line);
   border-radius: 6px;
-  padding: 3px 5px;
+  padding: 2px 4px;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 
-.aa-bias .cell.omitted { opacity: 0.4; }
-.aa-bias .cell.override { border-color: var(--accent-2); }
-.aa-bias .cell input { width: 100%; flex: 1; min-width: 0; }
-.aa-bias .cell .letter { cursor: pointer; user-select: none; width: 1.2em; }
+.aa-editor .cell.omitted { opacity: 0.4; }
+.aa-editor .cell.omit-mixed { border-style: dashed; }
+/* Overridden reads as accent, inherited as muted -- otherwise the sparse
+   model is invisible and there was no point to it. */
+.aa-editor .cell.override { border-color: var(--accent-2); }
+.aa-editor .cell input { width: 100%; flex: 1; min-width: 0; padding: 2px 4px; }
+.aa-editor .cell .letter { cursor: pointer; user-select: none; width: 1.2em; }
+
+.ctable-scroll {
+  max-height: 210px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.ctable {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.ctable th {
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 3px 6px;
+  text-align: left;
+  font-weight: 500;
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+
+.ctable td { padding: 2px 6px; white-space: nowrap; }
+.ctable tbody tr { cursor: default; }
+.ctable tbody tr.selected { background: var(--panel-2); }
+.ctable tbody tr.pad { background: none; }
+.ctable td.pos { color: var(--ink-dim); }
+.ctable td.bias.override { color: var(--accent-2); }
+.ctable td.tie { color: var(--accent); }
+.ctable input[type="checkbox"] { margin: 0; }
 
 footer {
   max-width: 1400px;
@@ -388,3 +719,59 @@ textarea {
 }
 
 #score-orders { flex: 0 0 60px; }
+
+/* --- inspector ----------------------------------------------------------- */
+
+/* One scrolling column of labelled groups, rather than four separate panels. */
+.stack { display: flex; flex-direction: column; gap: var(--space-5); }
+
+.group > h2 { margin-bottom: var(--space-2); }
+
+/* A collapsible group: the heading is the summary, with the marker inline. */
+details.group > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+details.group > summary::-webkit-details-marker { display: none; }
+details.group > summary h2 { margin: 0; }
+details.group > summary::after {
+  content: "\2212";
+  color: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+details.group:not([open]) > summary::after { content: "\002B"; }
+
+.group + .group { border-top: 1px solid var(--line); padding-top: var(--space-4); }
+
+/* --- tabs ---------------------------------------------------------------- */
+
+.tabs { display: flex; gap: var(--space-1); }
+
+.tab {
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 4px 8px;
+  font-size: var(--text-md);
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.tab:hover:not(:disabled) { color: var(--ink); border-color: var(--line); }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+
+#sequence-panel { display: flex; flex-direction: column; padding: var(--space-2) var(--space-3); }
+
+/* The track scrolls internally past its budget, which `seqview.js` measures
+   from this wrap -- so a 9-chain complex cannot starve the structure pane. */
+/* A floor, or the hint below it is squeezed over the top of the track. */
+.sequence-wrap { flex: 1 1 auto; min-height: 26px; }
+#analysis-panel { display: flex; flex-direction: column; padding: var(--space-3); }
+#analysis-panel > div[id^="pane-"] { flex: 1 1 auto; min-height: 0; overflow: auto; }

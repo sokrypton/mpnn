@@ -204,56 +204,34 @@ sampler.
 
 ## 4. UI
 
-The page shows every affordance at once. `4aa6158` gated the ones that read
-absent data; what remains:
+Reworked into a fixed-pane app shell; the README has what changed and why. Of
+the seven problems this section used to list, six are gone: the progress bar and
+the five status lines are now one strip in the header, the kernel line appears
+only on the JS fallback, the numbered wizard headings are gone with the panels
+they numbered, and the bias scope dropdown and symmetry text box no longer
+exist. What remains:
 
-1. **The progress bar is in the wrong panel.** `#progress` lives inside the
-   Design panel, but Score and Profile both drive it, so clicking Score animates
-   a bar somewhere unrelated. One global strip under the header — the worker is
-   serial, so there is only ever one job.
-2. **Four status lines** (`load`, `model`, `design`, `score`) are permanently on
-   screen and usually three are stale. Only one operation can run; they could
-   collapse into one area.
-3. **The kernel line is permanent but only interesting when it is bad.**
-   "Running on the WebAssembly SIMD kernel" never changes. Show it only on the
-   JS fallback, which is the ~5×-slower case worth knowing about.
-4. **The seed field is inert while "random" is ticked**, which is the default.
-   Disable it, or fold the seed control into the advanced `<details>`.
-5. **The numbered headings imply a wizard.** "1 · Structure … 4 · Design", then
-   Results, Score and Profile unnumbered. Number all or none.
-6. **Redundant text.** Every colour option repeats "colour:" and every profile
-   view repeats "view:" — the second was added knowingly, to match the first
-   rather than leave one bare dropdown next to one labelled one, so fix them
-   together. `#score-hint` reprints a full mode description plus paste
-   instructions on every change.
-7. **Stale examples.** 1UBQ, 1STP, 4KT0, 1BL8 — none nucleic, though 4OQU is
+1. **The seed field is inert while "random" is ticked**, which is the default.
+   Disable it, or fold it away.
+2. **Stale examples.** 1UBQ, 1STP, 4KT0, 1BL8 — none nucleic, though 4OQU is
    already in `assets/`. 4KT0 and 1BL8 only make sense with particular models.
-
-Biggest win for least risk: 1–3 together, since they are one idea (a single
-status/progress area instead of five scattered ones).
-
-The sequence track and the profile display were reworked after py2Dmol's; the
-README has what changed and why. Two things left in that area:
-
-- **The track is upstream's now**, so its gaps are upstream's: see
-  `app/viewer-seq.js` and the README. The one thing lost in the swap is this
-  page's lower-case convention for nucleotides — `naDisplaySequence` writes
-  `acgu`, and `viewer-seq.js` upper-cases them from the residue name, so
-  the track and the FASTA now disagree in case. The letters are right and the
-  chains are separated and coloured, so nothing is ambiguous; it is a
-  consistency wart, and fixing it is a small change in `viewer-seq.js` -- which
-  is ours to change.
-- **Nothing checks the adapter.** `app/seqview.js` is the only new logic and it
-  has no test. The bug it already had — taking the position type from
-  `polytype`, which calls a 5'-terminal nucleotide UNK, so the first base of
-  each DNA strand typed as protein and the viewer drew a polymer-change spacer
-  where the numbering is contiguous — was found by looking at 3HDD, not by
-  anything automatic. A test over the frame it builds (types, names, numbering,
-  ligand grouping) for 1STP/3HDD/4KT0 would be cheap and needs no weights.
-- **The heatmap has no scale.** Cell alpha is `sqrt(p)` and nothing says so, so
-  it reads as ordering rather than magnitude. A short legend, or numbers in the
-  tooltip, would fix it — the tooltip already reports the top few letters with
-  percentages, so the information is one step away.
+3. **`colour:` and `view:` prefixes** still repeat on every option of two
+   selects. Fix them together.
+4. **The inspector is one long scrolling column.** Structure and Model fold away
+   once a structure is loaded, which puts the constraints near the top, but on a
+   short viewport the tie list is still below the fold. Tabs would fix it.
+5. **The 3D view is height-bound.** `drawTraces` fits the model into
+   `min(width, height)`, so on a wide screen the extra canvas width is
+   background and only height makes the structure bigger. The other two rows
+   have given up what they can spare, and `⤢` borrows the rest on demand. A
+   non-square fit in the renderer would be the real answer.
+6. **The heatmap has no scale.** Cell alpha is `sqrt(p)` and nothing says so.
+7. **`viewer-seq.js` upper-cases nucleotides** while `naDisplaySequence` writes
+   `acgu`, so the track and the FASTA disagree in case. The letters are right.
+8. **Nothing checks `app/seqview.js` or `app/constrainttable.js`.** Both are new
+   logic with no test. `test/browser.mjs` covers the constraints pane through
+   the DOM, but it needs `playwright`, which is not installed here — so the
+   rewritten assertions in it are **unrun**.
 
 ### 4.1 Rendering
 

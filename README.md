@@ -19,15 +19,17 @@ first load.
 - **Pick any of 15 checkpoints** — the four ProteinMPNN and four SolubleMPNN
   noise levels, four LigandMPNN variants, the two membrane models, and NA-MPNN
   for RNA and protein–DNA.
-- **Choose what to design** by clicking residues in the 3D view or the sequence
-  track, dragging across a run of them in the track, shift-dragging a box in 3D,
-  toggling whole chains, or selecting everything within 6 Å of a ligand. The
-  track wraps to the panel and is painted in whatever colour mode the 3D view
-  is using, so it doubles as a legend; designed residues are saturated and kept
-  ones washed out.
-- **Design** with a temperature, a batch size, per-amino-acid bias and
-  omissions, tied/symmetric positions, and a seed that makes a run reproducible.
-  Bias can be global or scoped to the residues you have selected.
+- **Select** by clicking residues in the 3D view or the sequence track, dragging
+  a run in the track, shift-dragging a box in 3D, toggling whole chains, or
+  taking everything within 6 Å of a ligand. Then say what the model may do with
+  the selection: **Design** or **Keep**. Selecting and designing are two things
+  — see *Selection is not the design mask* below.
+- **Design** with a temperature, a batch size, a seed, per-position amino-acid
+  bias and omissions, and tied positions. The constraints pane shows a table of
+  what is set and where, so an override is never invisible.
+- **Read the results as a table** — score, recovery overall and per chain, how
+  many positions the run was allowed to change, and the seed. Sortable, and a
+  row keeps its number when you sort or run again.
 - **Score a sequence** you paste in, per position and averaged, by
   pseudo-likelihood or true autoregressive likelihood (see *Conditioning*).
 - **Feed LigandMPNN the side chains** of the residues you are not designing,
@@ -44,6 +46,63 @@ first load.
 Everything is plain ES modules. There is no bundler, no framework, and no
 runtime dependency — the only external resource the page ever fetches is a
 structure file, and only when you ask it to.
+
+## Selection is not the design mask
+
+They used to be one thing: clicking a residue toggled whether it was designed,
+and `selectedPositions()` just read the mask. That made two ordinary requests
+impossible — "bias these thirteen residues" without also designing them, and
+"bias a subset of what I am designing" at all.
+
+So **selecting is pointing** (`state.selection`) and **designing is a property
+you set on what you have pointed at** (`state.designMask`, unchanged, still what
+the engine gets). The sequence track saturates what is *selected*; the 3D view
+dims what is not *designed*; both facts are on screen at once.
+
+## Constraints are per position, and visible
+
+`Model.sample` has always taken a genuine `[L, V]` bias. The interface could only
+paint one uniform row across the design mask, through a dropdown that made the
+same twenty number boxes mean two different things — and once you had set a
+per-position override, nothing on the page showed you where it was.
+
+Now `app/constraints.js` holds **sparse per-letter deltas**: a position stores
+only the letters it overrides, so editing a default still shows through
+everywhere it was not specifically contradicted. Omission is tri-state, so "omit
+cysteine everywhere except the catalytic one" is expressible. And the pane is a
+table of the positions in scope, so "what is set, and where" has an answer you
+can read.
+
+Two bugs died with the rewrite. Letters are now keyed by their index in the
+33-letter superset rather than the current model's alphabet: `ALPHABET` is
+`ACDEFGHIKLMNPQRSTVWYX` and `NA_ALPHABET` is `ARNDCQEGHILKMFPSTWYVXacgtx…`, so
+index 1 is **C** in one and **R** in the other, and switching model family
+silently turned "omit cysteine" into "omit arginine". And the editor no longer
+rebuilds itself on every keystroke, which used to eat the caret.
+
+Bias is added to the logits *before* the temperature divide, so it is in nats and
+only wins where the model's own preference is weaker. Measured on 1STP with nine
+positions biased toward proline: `+2` changes nothing, `+4` flips one position,
+`+8` flips all nine. `omit` is the hard version.
+
+## Tied positions
+
+Groups are objects — created from the selection, from residue-number matches
+across chains, or from chain-qualified text (`A12, A20-A24`) — that you can see,
+rename, re-mode and delete. They coexist; the old checkbox disabled the old text
+box.
+
+**Every group averages its members' logits by default**, and says so. Before,
+the checkbox emitted weight `1/n` and averaged while a typed group emitted bare
+indices and so *summed*, from the same panel, with nothing disclosing it. `sum`
+survives as an explicit per-group option. This changes results for anyone
+re-running an old hand-typed symmetry string.
+
+The engine also read bias only at a group's **first** member, silently ignoring
+bias set on the others — invisible while bias was one row applied everywhere, and
+a lie as soon as a table shows bias per position. `mpnn/model.js` now combines it
+over the group with the same weights the logits use, which is identical to before
+whenever a group's members share a bias row.
 
 ## Two views borrowed from py2Dmol
 
@@ -224,6 +283,9 @@ app/                UI
   sec.js              C-alpha secondary structure -- from CIRPIN-web
   viewer.js           adapter: colours, ligand discs, residue picking
   logo.js             position profile: sequence logo and heatmap, on a canvas
+  constraints.js      per-position bias and omissions, sparse and canonical
+  constrainttable.js  the constraints pane: letter editor over a windowed table
+  ties.js             tied position groups
   viewer-seq.js       the sequence track -- from py2Dmol
   ligandgroups.js     heteroatoms -> ligands -- from py2Dmol
   seqview.js          adapter: structure, colours and selection for viewer-seq

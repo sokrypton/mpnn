@@ -1276,8 +1276,17 @@
         }
 
         // Calculate visible area dimensions
-        const maxVisibleLines = 32; // Maximum number of lines to show at once (same as before)
-        const maxVisibleHeight = maxVisibleLines * charHeight + spacing;
+        // How tall this is allowed to get. Upstream fixes it at 32 lines, which
+        // on a 9-chain structure is 362px and, in a fixed-pane layout, starves
+        // the pane holding the structure. `--seq-max-height` lets the page say
+        // what it can spare; the fallback is upstream's number.
+        const budget = parseFloat(
+            getComputedStyle(sequenceViewEl).getPropertyValue('--seq-max-height'),
+        );
+        const maxVisibleLines = 32;
+        const maxVisibleHeight = Number.isFinite(budget) && budget > 0
+            ? budget
+            : maxVisibleLines * charHeight + spacing;
         const fullContentHeight = currentY; // Full content height (actual total)
 
         // Store fullContentHeight in layout for later use

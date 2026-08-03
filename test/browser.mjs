@@ -60,7 +60,7 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 1600 } });
 async function waitReady(residues, timeout) {
   await page.waitForFunction(
     (n) => new RegExp(`encoded ${n} residues`).test(
-      document.getElementById("model-status").textContent),
+      document.getElementById("status").textContent),
     residues,
     { timeout },
   );
@@ -72,11 +72,11 @@ async function waitReady(residues, timeout) {
  * case whenever something re-encodes the same structure.
  */
 async function waitReencode(action, residues, timeout) {
-  const before = await page.textContent("#model-status");
+  const before = await page.textContent("#status");
   await action();
   await page.waitForFunction(
     ({ prev, n }) => {
-      const text = document.getElementById("model-status").textContent;
+      const text = document.getElementById("status").textContent;
       return text !== prev && new RegExp(`encoded ${n} residues`).test(text);
     },
     { prev: before, n: residues },
@@ -98,8 +98,8 @@ const pdbPath = structurePath ?? join(ROOT, "assets", "1ubq.pdb");
 await page.setInputFiles("#file-input", pdbPath);
 
 await waitReady(76, 180000);
-console.log("load :", (await page.textContent("#load-status")).trim());
-console.log("model:", (await page.textContent("#model-status")).trim());
+console.log("load :", (await page.textContent("#status")).trim());
+console.log("model:", (await page.textContent("#status")).trim());
 const kernel = await page.textContent("#kernel-status");
 console.log("kernel:", kernel.trim());
 if (!/SIMD/.test(kernel)) problems.push("the SIMD kernel did not load in the browser");
@@ -150,10 +150,10 @@ await page.fill("#batch", "2");
 await page.evaluate(() => document.getElementById("batch").dispatchEvent(new Event("input")));
 await page.click("#design-btn");
 await page.waitForFunction(
-  () => /sequences in/.test(document.getElementById("design-status").textContent),
+  () => /sequences in/.test(document.getElementById("status").textContent),
   { timeout: 300000 },
 );
-console.log("design:", (await page.textContent("#design-status")).trim());
+console.log("design:", (await page.textContent("#status")).trim());
 
 const designs = await page.evaluate(() =>
   [...document.querySelectorAll(".design")].map((d) => ({
@@ -169,10 +169,10 @@ if (designs.some((d) => !/^[ACDEFGHIKLMNPQRSTVWY]+$/.test(d.seq))) {
 // Profile + logo.
 await page.click("#profile-btn");
 await page.waitForFunction(
-  () => /Profile in/.test(document.getElementById("design-status").textContent),
+  () => /Profile in/.test(document.getElementById("status").textContent),
   { timeout: 300000 },
 );
-console.log("profile:", (await page.textContent("#design-status")).trim());
+console.log("profile:", (await page.textContent("#status")).trim());
 // The logo is a canvas, so check what it painted rather than counting nodes:
 // how much ink, and how many distinct columns actually got glyphs.
 const logoInk = await page.evaluate(() => {
@@ -210,7 +210,10 @@ if (designedAfter !== designedBefore - 1) problems.push("clicking a logo column 
 
 // Selection round-trip: clicking a residue in the track toggles it.
 const before = await page.evaluate(() => document.querySelectorAll(".res.designed").length);
-await page.evaluate(() => document.querySelector('.res[data-i="5"]').click());
+await page.evaluate(() => {
+  [...document.querySelectorAll(".seg button")].find((b) => b.textContent === "All").click();
+  document.querySelector('.ctable tbody tr[data-pos="5"]').click();
+});
 const after = await page.evaluate(() => document.querySelectorAll(".res.designed").length);
 console.log(`selection: ${before} -> ${after} designed`);
 if (after !== before - 1) problems.push("clicking a residue did not toggle it");
@@ -230,34 +233,50 @@ console.log("colour modes: ok");
   });
 
   // Scope the bias to a selection and confirm only those positions carry it.
+  //
+  // The sequence track is a canvas, so the DOM handle on a position is a row of
+  // the constraints table -- clicking one toggles that position's selection.
   await page.click("#select-none");
   await page.evaluate(() => {
-    for (let i = 10; i < 20; i++) document.querySelector(`.res[data-i="${i}"]`).click();
+    [...document.querySelectorAll(".seg button")]
+      .find((b) => b.textContent === "All").click();
   });
-  await page.selectOption("#bias-scope", "selected");
   await page.evaluate(() => {
-    const cell = [...document.querySelectorAll("#aa-bias .cell")]
+    for (let i = 10; i < 20; i++) {
+      document.querySelector(`.ctable tbody tr[data-pos="${i}"]`)?.click();
+    }
+  });
+  const target = await page.evaluate(() =>
+    document.querySelector(".ctable-target").textContent.trim());
+  console.log("bias target:", target);
+  if (!/Editing 10 selected positions/.test(target)) {
+    problems.push(`bias editor is not aimed at the ten selected positions: ${target}`);
+  }
+
+  await page.evaluate(() => {
+    const cell = [...document.querySelectorAll(".aa-editor .cell")]
       .find((c) => c.querySelector(".letter").textContent === "W");
     const input = cell.querySelector("input");
     input.value = "5";
     input.dispatchEvent(new Event("input"));
   });
-  const built = await page.evaluate(() => {
-    // Reach into the module's own bias builder through a design run's payload
-    // would be indirect; instead read the summary it renders.
-    return document.getElementById("bias-summary").textContent;
+  const overridden = await page.evaluate(() => {
+    [...document.querySelectorAll(".seg button")]
+      .find((b) => b.textContent === "Constrained").click();
+    return document.querySelectorAll(".ctable tbody tr[data-pos]").length;
   });
-  console.log("bias:", built.trim());
-  if (!/10 position\(s\) carry an override/.test(built)) {
-    problems.push("per-position bias override was not recorded");
+  console.log(`bias: ${overridden} position(s) carry an override`);
+  if (overridden !== 10) {
+    problems.push(`expected 10 positions to carry an override, saw ${overridden}`);
   }
 
   // With W boosted only at 10..19, a low-temperature design should put W there
-  // and (mostly) not elsewhere. Results accumulate and re-sort by score across
-  // runs, so clear them first -- otherwise `.design` is whichever earlier,
-  // unbiased sequence happens to score best.
+  // and (mostly) not elsewhere. Results accumulate and re-sort across runs, so
+  // clear them first -- otherwise the best-scoring row is an earlier, unbiased
+  // sequence.
   await page.click("#clear-results");
   await page.click("#select-all");
+  await page.click("#mark-design");
   await page.fill("#temperature", "0.1");
   await page.evaluate(() => document.getElementById("temperature")
     .dispatchEvent(new Event("input")));
@@ -265,20 +284,22 @@ console.log("colour modes: ok");
   await page.evaluate(() => document.getElementById("batch").dispatchEvent(new Event("input")));
   await page.click("#design-btn");
   await page.waitForFunction(
-    () => /sequences in/.test(document.getElementById("design-status").textContent),
+    () => /sequences in/.test(document.getElementById("status").textContent),
     { timeout: 300000 },
   );
+  // The sequence is not a results column any more; each row carries it.
   const seq = await page.evaluate(() =>
-    document.querySelector(".design .seq").textContent.trim());
+    document.querySelector(".results-table tbody tr").dataset.seq);
   const inWindow = [...seq.slice(10, 20)].filter((c) => c === "W").length;
   const outside = [...seq.slice(0, 10) + seq.slice(20)].filter((c) => c === "W").length;
   console.log(`bias: W inside biased window ${inWindow}/10, outside ${outside}/${seq.length - 10}`);
-  // 8-9 of 10, not 10 -- bias is added to the logits, not a constraint, and a
-  // couple of buried core positions in ubiquitin have a raw logit gap wider
-  // than 5 nats. `omit` (-1e9) is the hard version; sampling.mjs checks it.
+  // Not 10 of 10: bias is added to the logits, not a constraint, so it only wins
+  // where the model's own preference is weaker than the bias. A couple of buried
+  // core positions have a raw logit gap wider than 5 nats. `omit` (-1e9) is the
+  // hard version.
   if (inWindow < 5) problems.push("per-position bias did not steer the design");
+
   await page.click("#bias-clear-overrides");
-  await page.selectOption("#bias-scope", "global");
 
   // Scoring. The default is the single-pass pseudo-likelihood, which reports no
   // spread because there is nothing to average over.
@@ -287,12 +308,12 @@ console.log("colour modes: ok");
     await page.click("#score-btn");
     await page.waitForFunction(
       (prev) => {
-        const t = document.getElementById("score-status").textContent;
+        const t = document.getElementById("status").textContent;
         return t !== prev && /nll |Failed/.test(t);
       },
       "Scoring…", { timeout: 300000 },
     );
-    return (await page.textContent("#score-status")).trim();
+    return (await page.textContent("#status")).trim();
   };
 
   if (await page.isVisible("#score-orders-row")) {
@@ -332,13 +353,16 @@ console.log("colour modes: ok");
   // silently reusing the all-soluble one.
   await page.click("#select-none");
   await page.evaluate(() => {
-    for (let i = 0; i < 38; i++) document.querySelector(`.res[data-i="${i}"]`).click();
+    [...document.querySelectorAll(".seg button")].find((b) => b.textContent === "All").click();
+    for (let i = 0; i < 38; i++) {
+      document.querySelector(`.ctable tbody tr[data-pos="${i}"]`)?.click();
+    }
   });
-  const before = await page.textContent("#model-status");
+  const before = await page.textContent("#status");
   await page.click("#mem-buried");
   await page.waitForFunction(
-    (prev) => document.getElementById("model-status").textContent !== prev
-      && /encoded 76 residues/.test(document.getElementById("model-status").textContent),
+    (prev) => document.getElementById("status").textContent !== prev
+      && /encoded 76 residues/.test(document.getElementById("status").textContent),
     before, { timeout: 300000 },
   );
   const labels = await page.evaluate(() => {
@@ -358,8 +382,8 @@ if (!process.argv.includes("--no-ligand")) {
   await page.setInputFiles("#file-input", join(ROOT, "assets", "1stp.pdb"));
   // Wait for the encoding of *this* structure, not a stale one still in flight.
   await waitReady(121, 600000);
-  console.log("load :", (await page.textContent("#load-status")).trim());
-  console.log("model:", (await page.textContent("#model-status")).trim());
+  console.log("load :", (await page.textContent("#status")).trim());
+  console.log("model:", (await page.textContent("#status")).trim());
 
   const ligandVisible = await page.evaluate(() =>
     !document.getElementById("atom-context-row").hidden);
@@ -385,13 +409,13 @@ if (!process.argv.includes("--no-ligand")) {
   await page.fill("#seed", "12345");
   await page.click("#design-btn");
   await page.waitForFunction(
-    () => /sequences in/.test(document.getElementById("design-status").textContent),
+    () => /sequences in/.test(document.getElementById("status").textContent),
     { timeout: 600000 },
   );
-  console.log("design:", (await page.textContent("#design-status")).trim());
+  console.log("design:", (await page.textContent("#status")).trim());
   const ligandDesign = await page.evaluate(() => ({
     meta: document.querySelector(".design .meta").textContent.trim(),
-    seq: document.querySelector(".design .seq").textContent.trim(),
+    seq: document.querySelector(".results-table tbody tr").dataset.seq,
   }));
   console.log(`   ${ligandDesign.meta}  ${ligandDesign.seq.slice(0, 60)}`);
 
@@ -413,12 +437,12 @@ if (!process.argv.includes("--no-ligand")) {
     await page.click("#score-btn");
     await page.waitForFunction(
       (prev) => {
-        const t = document.getElementById("score-status").textContent;
+        const t = document.getElementById("status").textContent;
         return t !== prev && /nll |Failed/.test(t);
       },
       "Scoring…", { timeout: 600000 },
     );
-    const text = (await page.textContent("#score-status")).trim();
+    const text = (await page.textContent("#status")).trim();
     return parseFloat(text.match(/nll ([0-9.]+)/)?.[1] ?? "NaN");
   };
   // The score averages over the designed positions, which here are the ~14
@@ -462,9 +486,9 @@ if (!process.argv.includes("--no-ligand")) {
   // for every other one.
   await page.setInputFiles("#file-input", join(ROOT, "assets", "4oqu.pdb"));
   await waitReady(97, 600000);
-  const naLoad = (await page.textContent("#load-status")).trim();
+  const naLoad = (await page.textContent("#status")).trim();
   console.log("load :", naLoad);
-  const naModel = (await page.textContent("#model-status")).trim();
+  const naModel = (await page.textContent("#status")).trim();
   console.log("model:", naModel);
   if (!/na_mpnn_design/.test(naModel)) {
     problems.push(`NA-MPNN was not the model that encoded: ${naModel}`);
@@ -488,12 +512,12 @@ if (!process.argv.includes("--no-ligand")) {
     .dispatchEvent(new Event("input")));
   await page.click("#design-btn");
   await page.waitForFunction(
-    () => /sequences in|Failed/.test(document.getElementById("design-status").textContent),
+    () => /sequences in|Failed/.test(document.getElementById("status").textContent),
     { timeout: 900000 },
   );
-  console.log("design:", (await page.textContent("#design-status")).trim());
+  console.log("design:", (await page.textContent("#status")).trim());
   const naSeqs = await page.evaluate(() =>
-    [...document.querySelectorAll(".design .seq")].map((e) => e.textContent.trim()));
+    [...document.querySelectorAll(".results-table tbody tr")].map((e) => e.dataset.seq));
   for (const seq of naSeqs) console.log(`   ${seq.slice(0, 60)}`);
   // The bug this catches: the sampler used to consider only the first 20
   // letters, so a 33-letter model could never emit a nucleotide at all.
@@ -508,10 +532,10 @@ if (!process.argv.includes("--no-ligand")) {
   // the profile panel, which stays hidden until the first profile exists.
   await page.click("#profile-btn");
   await page.waitForFunction(
-    () => /Profile in|Failed/.test(document.getElementById("design-status").textContent),
+    () => /Profile in|Failed/.test(document.getElementById("status").textContent),
     { timeout: 900000 },
   );
-  console.log("profile:", (await page.textContent("#design-status")).trim());
+  console.log("profile:", (await page.textContent("#status")).trim());
   const logoInk = await page.evaluate(() => {
     const c = document.getElementById("logo");
     const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
@@ -526,15 +550,15 @@ if (!process.argv.includes("--no-ligand")) {
   // the load has to fail cleanly rather than encode a 0-residue structure.
   await page.selectOption("#model-select", "proteinmpnn_v_48_020");
   await page.waitForFunction(
-    () => /No protein residues/.test(document.getElementById("load-status").textContent),
+    () => /No protein residues/.test(document.getElementById("status").textContent),
     { timeout: 60000 },
   );
-  console.log("switch back:", (await page.textContent("#load-status")).trim());
+  console.log("switch back:", (await page.textContent("#status")).trim());
 }
 
-// --- homo-oligomer tying ----------------------------------------------------
+// --- tying whole chains ----------------------------------------------------
 {
-  console.log("\n-- homo-oligomer --");
+  console.log("\n-- tying whole chains --");
   // A two-chain assembly, built by translating ubiquitin rather than shipping
   // another fixture. Both copies keep their original residue numbering, which
   // is the case the reference's residue-number matching is written for.
@@ -554,14 +578,23 @@ if (!process.argv.includes("--no-ligand")) {
   await page.evaluate(() => {
     for (const d of document.querySelectorAll("details")) d.open = true;
   });
-  await page.check("#homo-oligomer");
-  const note = (await page.textContent("#homo-summary")).trim();
-  console.log("homo-oligomer:", note);
+  // "Tie all chains" is a generator now, not a mode: it materialises groups you
+  // can see, edit and delete, and they coexist with hand-made ones.
+  await page.click("#tie-chains");
+  const note = (await page.textContent("#status")).trim();
+  console.log("tie chains:", note);
   if (!/76 group\(s\) of 2, matched by residue number/.test(note)) {
-    problems.push(`homo-oligomer grouping looks wrong: ${note}`);
+    problems.push(`chain tying looks wrong: ${note}`);
   }
-  if (!await page.evaluate(() => document.getElementById("symmetry").disabled)) {
-    problems.push("the manual symmetry field stayed editable while chains were tied");
+  const groups = await page.evaluate(() =>
+    document.querySelectorAll("#tie-list .tie-row").length);
+  if (groups !== 76) problems.push(`expected 76 tie groups in the list, saw ${groups}`);
+  const modes = await page.evaluate(() =>
+    [...new Set([...document.querySelectorAll("#tie-list select")].map((s) => s.value))]);
+  // Every group averages by default. Before, the checkbox averaged and a typed
+  // group summed, from the same panel, with nothing saying so.
+  if (modes.join() !== "average") {
+    problems.push(`tie groups should default to average, saw ${modes.join()}`);
   }
 
   // A warm temperature, so agreement between the chains is the tying and not
@@ -573,11 +606,11 @@ if (!process.argv.includes("--no-ligand")) {
     .dispatchEvent(new Event("input")));
   await page.click("#design-btn");
   await page.waitForFunction(
-    () => /sequences in/.test(document.getElementById("design-status").textContent),
+    () => /sequences in/.test(document.getElementById("status").textContent),
     { timeout: 600000 },
   );
   const tied = await page.evaluate(() =>
-    [...document.querySelectorAll(".design .seq")].map((e) => e.textContent.trim()));
+    [...document.querySelectorAll(".results-table tbody tr")].map((e) => e.dataset.seq));
   for (const seq of tied) {
     const [a, b] = [seq.slice(0, 76), seq.slice(76)];
     let same = 0;
@@ -588,15 +621,17 @@ if (!process.argv.includes("--no-ligand")) {
 
   // Untied, the same warm temperature should let them drift apart -- otherwise
   // the check above proves nothing.
-  await page.uncheck("#homo-oligomer");
+  await page.evaluate(() => {
+    for (const b of document.querySelectorAll("#tie-list .tie-row button")) b.click();
+  });
   await page.click("#clear-results");
   await page.click("#design-btn");
   await page.waitForFunction(
-    () => /sequences in/.test(document.getElementById("design-status").textContent),
+    () => /sequences in/.test(document.getElementById("status").textContent),
     { timeout: 600000 },
   );
   const free = await page.evaluate(() =>
-    document.querySelector(".design .seq").textContent.trim());
+    document.querySelector(".results-table tbody tr").dataset.seq);
   let drift = 0;
   for (let i = 0; i < 76; i++) if (free[i] !== free[76 + i]) drift++;
   console.log(`   untied, chains differ at ${drift}/76`);

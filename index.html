@@ -11,19 +11,55 @@
 <body>
 
 <header>
-  <h1>mpnn<span class="dot">.</span>web</h1>
-  <p class="tagline">
-    ProteinMPNN &middot; SolubleMPNN &middot; LigandMPNN &middot; MembraneMPNN &middot;
-    NA-MPNN, running in this tab. Nothing is uploaded &mdash; the weights come down once and
-    every forward pass happens on your machine.
-  </p>
+  <div class="brand">
+    <h1>mpnn<span class="dot">.</span>web</h1>
+    <p class="tagline">five MPNN families, running in this tab &middot; nothing is uploaded</p>
+  </div>
+  <div class="statusbar">
+    <p class="status" id="status">Load a structure to begin.</p>
+    <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
+    <p class="hint" id="kernel-status" hidden></p>
+  </div>
 </header>
 
 <main>
 
-  <!-- ------------------------------------------------------------------ -->
-  <section class="panel" id="load-panel">
-    <h2>1 &middot; Structure</h2>
+  <section class="panel" id="viewer-panel">
+    <div class="viewer-head">
+      <div class="viewer-tools">
+        <select id="color-mode">
+          <option value="chain">colour: chain</option>
+          <option value="design">colour: designed / fixed</option>
+          <option value="confidence" hidden>colour: model confidence</option>
+          <option value="identity">colour: identity to input</option>
+          <option value="rainbow">colour: N → C</option>
+          <option value="membrane" hidden>colour: membrane label</option>
+          <option value="score" hidden>colour: per-position score</option>
+        </select>
+        <button id="select-all">All</button>
+        <button id="select-none">None</button>
+        <button id="select-invert">Invert</button>
+        <button id="select-interface" hidden>Near ligand</button>
+        <span class="sep"></span>
+        <button id="mark-design" title="design the selected residues">Design</button>
+        <button id="mark-keep" title="keep the selected residues as they are">Keep</button>
+        <span class="sep"></span>
+        <button id="expand-structure" title="give the structure the whole window"
+          aria-pressed="false">&#10530;</button>
+      </div>
+    </div>
+    <div class="viewer-wrap">
+      <canvas id="viewer"></canvas>
+      <div class="viewer-hint">drag rotate &middot; wheel zoom &middot; click residue &middot; shift-drag box select &middot; double-click reset</div>
+      <div id="tooltip" class="tooltip" hidden></div>
+    </div>
+  </section>
+
+  <section class="panel" id="inspector">
+    <div class="stack">
+
+      <details class="group" id="group-structure" open>
+        <summary><h2>Structure</h2></summary>
     <div class="row">
       <input id="pdb-id" type="text" placeholder="PDB ID (1UBQ) or UniProt (P69905)" spellcheck="false">
       <button id="fetch-btn" class="primary">Fetch</button>
@@ -41,12 +77,10 @@
       <button class="link" data-example="4KT0">4KT0 with ligand</button>
       <button class="link" data-example="1BL8">1BL8 K⁺ channel</button>
     </div>
-    <p class="status" id="load-status">No structure loaded.</p>
-  </section>
+      </details>
 
-  <!-- ------------------------------------------------------------------ -->
-  <section class="panel" id="model-panel">
-    <h2>2 &middot; Model</h2>
+      <details class="group" id="group-model" open>
+        <summary><h2>Model</h2></summary>
     <div class="row">
       <select id="model-select"></select>
     </div>
@@ -90,45 +124,10 @@
         <button id="mem-reset">Reset</button>
       </div>
     </div>
-    <p class="status" id="model-status">No model loaded.</p>
-    <p class="hint" id="kernel-status"></p>
-  </section>
+      </details>
 
-  <!-- ------------------------------------------------------------------ -->
-  <section class="panel wide" id="viewer-panel">
-    <div class="viewer-head">
-      <h2>3 &middot; Pick what to design</h2>
-      <div class="viewer-tools">
-        <select id="color-mode">
-          <option value="chain">colour: chain</option>
-          <option value="design">colour: designed / fixed</option>
-          <option value="confidence" hidden>colour: model confidence</option>
-          <option value="identity">colour: identity to input</option>
-          <option value="rainbow">colour: N → C</option>
-          <option value="membrane" hidden>colour: membrane label</option>
-          <option value="score" hidden>colour: per-position score</option>
-        </select>
-        <button id="select-all">All</button>
-        <button id="select-none">None</button>
-        <button id="select-invert">Invert</button>
-        <button id="select-interface" hidden>Near ligand</button>
-      </div>
-    </div>
-    <div class="viewer-wrap">
-      <canvas id="viewer"></canvas>
-      <div class="viewer-hint">drag rotate &middot; wheel zoom &middot; click residue &middot; shift-drag box select &middot; double-click reset</div>
-      <div id="tooltip" class="tooltip" hidden></div>
-    </div>
-    <div class="sequence-wrap">
-      <div id="sequenceView"></div>
-    </div>
-    <p class="hint seq-hint">Click a residue to keep or design it; drag to sweep a run;
-      click a chain to toggle it. Saturated is designed, faded is kept.</p>
-  </section>
-
-  <!-- ------------------------------------------------------------------ -->
-  <section class="panel" id="design-panel">
-    <h2>4 &middot; Design</h2>
+      <div class="group" id="group-design">
+        <h2>Design</h2>
     <div class="control">
       <label for="temperature">Temperature <output id="temperature-out">0.10</output></label>
       <input type="range" id="temperature" min="0.01" max="1.0" step="0.01" value="0.1">
@@ -146,57 +145,77 @@
       </div>
     </div>
 
-    <details class="control">
-      <summary>Amino-acid bias &amp; omissions</summary>
+    <details class="control" open>
+      <summary>Bias &amp; omissions</summary>
       <p class="hint">
         Bias is added to the logits before sampling, so +2 makes a residue
-        roughly e² times more likely. Omit removes it entirely.
+        roughly e&sup2; times more likely &mdash; it only wins where the model's
+        own preference is weaker than that. Omit removes a letter outright.
       </p>
-      <div class="row">
-        <select id="bias-scope">
-          <option value="global">applies to: every position</option>
-          <option value="selected">applies to: selected positions only</option>
-        </select>
-      </div>
-      <div id="aa-bias" class="aa-bias"></div>
+      <div id="constraints" class="constraints"></div>
       <div class="row">
         <button id="bias-reset">Reset all</button>
-        <button id="omit-cys">Omit C</button>
-        <button id="omit-met">Omit M</button>
-        <button id="bias-clear-overrides" hidden>Clear overrides</button>
+        <button id="bias-clear-overrides" hidden>Clear per-position</button>
       </div>
-      <p class="hint" id="bias-summary"></p>
     </details>
 
     <details class="control">
-      <summary>Symmetry / tied positions</summary>
-      <div id="homo-oligomer-row" hidden>
-        <div class="row">
-          <label class="check">
-            <input type="checkbox" id="homo-oligomer">
-            Homo-oligomer: tie every chain to every other
-          </label>
-        </div>
-        <p class="hint" id="homo-summary"></p>
-      </div>
+      <summary>Tied positions</summary>
       <p class="hint">
-        Or list comma-separated groups of 1-based positions that must share an
-        identity, e.g. <code>10+40, 11+41</code>. Tied positions are decoded
-        together and their logits averaged.
+        Tied positions are decoded together and share one identity. Their logits
+        are <em>averaged</em>, so a group behaves like a single position; the
+        <code>sum</code> mode adds them instead, which sharpens as the group grows.
       </p>
-      <input id="symmetry" type="text" placeholder="10+40, 11+41" spellcheck="false">
+      <div class="row">
+        <button id="tie-selection">Tie selection</button>
+        <button id="tie-across">Tie across chains</button>
+        <button id="tie-chains" hidden>Tie all chains</button>
+      </div>
+      <div class="row">
+        <input id="tie-text" type="text" placeholder="A12, A20-A24, B12" spellcheck="false">
+        <button id="tie-add-text">Add</button>
+      </div>
+      <div id="tie-list" class="tie-list"></div>
+      <p class="hint" id="tie-note"></p>
     </details>
 
     <div class="row">
       <button id="design-btn" class="primary" disabled>Design</button>
       <button id="profile-btn" disabled>Position profile</button>
     </div>
-    <p class="status" id="design-status"></p>
-    <div class="progress" id="progress" hidden><div id="progress-bar"></div></div>
+      </div>
+
+      <details class="group credits">
+        <summary>Credits and licences</summary>
+<p>
+    Weights and model architecture from
+    <a href="https://github.com/dauparas/LigandMPNN">dauparas/LigandMPNN</a>
+    (MIT). Speed and API ideas from
+    <a href="https://github.com/sokrypton/ColabDesign">ColabDesign</a>;
+    page structure after
+    <a href="https://github.com/sokrypton/CIRPIN-web">CIRPIN-web</a>.
+    Structures fetched from <a href="https://www.rcsb.org">RCSB</a> and the
+    <a href="https://alphafold.ebi.ac.uk">AlphaFold DB</a>.
+  </p>
+  <p><a href="https://github.com/sokrypton/mpnn">source</a></p>
+      </details>
+
+    </div>
   </section>
 
-  <!-- ------------------------------------------------------------------ -->
-  <section class="panel" id="results-panel" hidden>
+  <section class="panel" id="sequence-panel">
+    <div class="viewer-head">
+      <h2>Sequence</h2>
+      <div class="viewer-tools" id="sequence-tools"></div>
+    </div>
+    <div class="sequence-wrap">
+      <div id="sequenceView"></div>
+    </div>
+    <p class="hint seq-hint">Saturated is selected &middot; drag to sweep &middot; click a chain
+      badge for the whole chain</p>
+  </section>
+
+  <section class="panel" id="results-panel">
     <div class="viewer-head">
       <h2>Results</h2>
       <div class="viewer-tools">
@@ -210,34 +229,16 @@
     </div>
   </section>
 
-  <!-- ------------------------------------------------------------------ -->
-  <section class="panel wide" id="score-panel">
+  <section class="panel" id="analysis-panel">
     <div class="viewer-head">
-      <h2>Score a sequence</h2>
-      <div class="viewer-tools">
-        <select id="score-mode">
-          <option value="all-but-self">pseudo-likelihood (1 pass)</option>
-          <option value="none">backbone only (1 pass)</option>
-          <option value="order">autoregressive (averaged)</option>
-        </select>
-        <label class="check" id="score-orders-row" hidden>
-          orders
-          <input type="number" id="score-orders" value="8" min="1" max="64" step="1">
-        </label>
-        <button id="score-native">Use input sequence</button>
-        <button id="score-btn" disabled>Score</button>
+      <div class="tabs" role="tablist">
+        <button id="tab-profile" class="tab" role="tab" aria-selected="true">Position profile</button>
+        <button id="tab-score" class="tab" role="tab" aria-selected="false">Score a sequence</button>
       </div>
+      <div class="viewer-tools" id="analysis-tools"></div>
     </div>
-    <p class="hint" id="score-hint"></p>
-    <textarea id="score-seq" rows="3" spellcheck="false"
-      placeholder="MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQ..."></textarea>
-    <p class="status" id="score-status"></p>
-  </section>
-
-  <!-- ------------------------------------------------------------------ -->
-  <section class="panel wide" id="profile-panel" hidden>
+    <div id="pane-profile">
     <div class="viewer-head">
-      <h2>Position profile</h2>
       <div class="viewer-tools">
         <select id="profile-mode">
           <option value="none">backbone only (1 pass)</option>
@@ -258,23 +259,32 @@
       <canvas id="logo"></canvas>
       <div id="logo-tooltip" class="tooltip" hidden></div>
     </div>
+    </div>
+    <div id="pane-score" hidden>
+    <div class="viewer-head">
+      <div class="viewer-tools">
+        <select id="score-mode">
+          <option value="all-but-self">pseudo-likelihood (1 pass)</option>
+          <option value="none">backbone only (1 pass)</option>
+          <option value="order">autoregressive (averaged)</option>
+        </select>
+        <label class="check" id="score-orders-row" hidden>
+          orders
+          <input type="number" id="score-orders" value="8" min="1" max="64" step="1">
+        </label>
+        <button id="score-native">Use input sequence</button>
+        <button id="score-btn" disabled>Score</button>
+      </div>
+    </div>
+    <p class="hint" id="score-hint"></p>
+    <textarea id="score-seq" rows="3" spellcheck="false"
+      placeholder="MQIFVKTLTGKTITLEVEPSDTIENVKAKIQDKEGIPPDQ..."></textarea>
+    </div>
   </section>
 
 </main>
 
-<footer>
-  <p>
-    Weights and model architecture from
-    <a href="https://github.com/dauparas/LigandMPNN">dauparas/LigandMPNN</a>
-    (MIT). Speed and API ideas from
-    <a href="https://github.com/sokrypton/ColabDesign">ColabDesign</a>;
-    page structure after
-    <a href="https://github.com/sokrypton/CIRPIN-web">CIRPIN-web</a>.
-    Structures fetched from <a href="https://www.rcsb.org">RCSB</a> and the
-    <a href="https://alphafold.ebi.ac.uk">AlphaFold DB</a>.
-  </p>
-  <p><a href="https://github.com/sokrypton/mpnn">source</a></p>
-</footer>
+
 
 <!-- From py2Dmol; installs window.SEQ, so it must load first. -->
 <script src="app/viewer-seq.js"></script>

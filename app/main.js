@@ -8,7 +8,19 @@ import {
 import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
 import { elementRgb, Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
 import { AA_COLORS, Logo } from "./logo.js";
+import {
+  buildBias as buildBiasFrom, clearAll, clearOverrides, createConstraints,
+  overriddenPositions,
+} from "./constraints.js";
+// The table needs the whole surface, and passing it a namespace keeps that one
+// dependency visible rather than threading nine functions through its options.
+import * as constraints from "./constraints.js";
+import { ConstraintTable } from "./constrainttable.js";
 import { SequenceView } from "./seqview.js";
+import {
+  acrossChains, addGroup, chainGroups, clearTies, createTies, groupByPosition,
+  parsePositions, removeGroup, toEngineSymmetry, validateTies,
+} from "./ties.js";
 
 const WEIGHTS_BASE = new URL("../weights", import.meta.url).href;
 
@@ -56,23 +68,34 @@ const state = {
   /** 1 = design this position, 0 = keep it. */
   designMask: null,
   /**
-   * Per-letter bias, sized for the widest alphabet (NA-MPNN's 33).
+   * What the next edit applies to, as position indices.
    *
-   * It must not be sized to the *current* model: a short array reads
-   * `undefined` past its end, writing that into a Float32Array gives NaN, and
-   * a NaN bias loses every comparison in the sampler -- which showed up as
-   * NA-MPNN quietly designing amino acids into an RNA chain.
+   * Deliberately not the same thing as `designMask`. They used to be one
+   * object, which meant "select these thirteen residues and bias them" could
+   * not be said without also making them designed, and biasing a subset of the
+   * designed positions could not be said at all. Selecting is now pointing;
+   * designing is a property you set on what you have pointed at.
    */
-  bias: new Float32Array(33),
-  omitted: new Set(),
+  selection: new Set(),
   /**
-   * Position -> Float32Array of bias values that replace the global table
-   * there, and Position -> Set of omitted amino acids. Sparse: only positions
-   * the user actually touched appear.
+   * Amino-acid bias and omissions; see `app/constraints.js`.
+   *
+   * Sized for the widest alphabet and keyed by *that* alphabet's order, not
+   * the current model's. Both matter: a short array reads `undefined` past its
+   * end, writing that into a Float32Array gives NaN, and a NaN bias loses every
+   * comparison in the sampler -- which showed up as NA-MPNN quietly designing
+   * amino acids into an RNA chain. And a model-relative index means something
+   * different after a family switch, which silently turned "omit C" into
+   * "omit R".
    */
-  biasOverrides: new Map(),
-  omitOverrides: new Map(),
+  constraints: createConstraints(),
+  /** Tied position groups; see `app/ties.js`. */
+  ties: createTies(),
   designs: [],
+  /** Monotonic, so a row keeps its number when the table is re-sorted. */
+  nextDesignId: 1,
+  /** Which column the results table is sorted by, and which way. */
+  sort: { key: "score", dir: 1 },
   activeDesign: -1,
   profile: null,
   scorePerPosition: null,
@@ -214,6 +237,27 @@ const ENCODE_DEBOUNCE_MS = 350;
 
 const viewer = new Viewer($("viewer"));
 const logo = new Logo($("logo"));
+const constraintTable = new ConstraintTable({
+  getState: () => state,
+  alphabet,
+  letters: biasLetters,
+  letterAt: (i) => displayLetter(i, state.structure.S[i]),
+  c: constraints,
+  tiesByPosition: () => groupByPosition(state.ties),
+  onChange: () => {
+    renderConstraints();
+    redraw();
+    // The design mask is an encoder input under side-chain context.
+    if ($("use-side-chains").checked && readsLigands() && state.structure) scheduleEncode();
+  },
+});
+
+/** The constraints pane, plus the two buttons that live beside it. */
+function renderConstraints() {
+  constraintTable.render();
+  $("bias-clear-overrides").hidden = overriddenPositions(state.constraints).size === 0;
+}
+
 const track = new SequenceView({
   getState: () => state,
   colourFor: (i) => colourFor(i),
@@ -337,10 +381,20 @@ function updateModelHint() {
 // Structure loading
 // ---------------------------------------------------------------------------
 
-function setStatus(id, text, kind = "") {
-  const el = $(id);
+/**
+ * The one status line.
+ *
+ * There used to be five -- load, model, design, score, kernel -- permanently on
+ * screen, of which four were usually stale. The worker is serial, so there is
+ * only ever one thing happening and only ever one thing worth saying. `kind`
+ * goes on a data attribute rather than into `className`, which the old helper
+ * overwrote wholesale and so destroyed any other class on the element.
+ */
+function setStatus(text, kind = "") {
+  const el = $("status");
   el.textContent = text;
-  el.className = `status ${kind}`;
+  if (kind) el.dataset.kind = kind;
+  else delete el.dataset.kind;
 }
 
 async function loadStructureText(text, label) {
@@ -349,11 +403,11 @@ async function loadStructureText(text, label) {
   try {
     structure = structureFromText(text, { nucleicAsResidues: nucleic });
   } catch (error) {
-    setStatus("load-status", `Could not parse: ${error.message}`, "error");
+    setStatus(`Could not parse: ${error.message}`, "error");
     return;
   }
   if (structure.L === 0) {
-    setStatus("load-status", nucleic
+    setStatus(nucleic
       ? "No protein or nucleic-acid residues found."
       : "No protein residues with a C-alpha found.", "error");
     return;
@@ -366,19 +420,24 @@ async function loadStructureText(text, label) {
   state.structure = structure;
   state.structureId += 1;
   state.designMask = new Float32Array(structure.L).fill(1);
+  state.selection = new Set(Array.from({ length: structure.L }, (_, i) => i));
   state.membraneLabels = new Int32Array(structure.L);
-  state.biasOverrides.clear();
-  state.omitOverrides.clear();
+  clearOverrides(state.constraints);
   state.membraneVersion += 1;
   state.designs = [];
   state.activeDesign = -1;
   state.profile = null;
   state.encodedFor = null;
-  $("profile-panel").hidden = true;
 
   viewer.setStructure(structure);
   $("color-mode").value = structure.chainList.length > 1 ? "chain" : "rainbow";
-  refreshHomoOligomer();
+  clearTies(state.ties);
+  renderTies();
+  // The inspector is one scrolling column and the constraints are the part you
+  // come back to; fold away the two you set once.
+  $("group-structure").open = false;
+  $("group-model").open = false;
+  renderConstraints();
   renderSequenceTrack();
   renderResults();
   refreshAffordances();
@@ -400,24 +459,22 @@ async function loadStructureText(text, label) {
         .filter(([c]) => c).map(([c, name]) => `${c} ${name}`).join(", ")
       + ")";
   }
-  setStatus(
-    "load-status",
-    `${label}: ${structure.L} residues${composition}, ${structure.chainList.length} chain(s)`
+  setStatus(`${label}: ${structure.L} residues${composition}, ${structure.chainList.length} chain(s)`
     + (ligand ? `, ${ligand} ligand/heteroatom atoms` : ", no heteroatoms"),
   );
   if (ligand && !$("model-select").value.startsWith("ligandmpnn")) {
-    setStatus("model-status", "This structure has heteroatoms — LigandMPNN will use them.", "");
+    setStatus("This structure has heteroatoms — LigandMPNN will use them.", "");
   }
   await ensureEncoded();
 }
 
 async function fetchStructure(id) {
-  setStatus("load-status", `Fetching ${id}…`, "busy");
+  setStatus(`Fetching ${id}…`, "busy");
   try {
     const text = await fetchPDB(id);
     await loadStructureText(text, id.toUpperCase());
   } catch (error) {
-    setStatus("load-status", `Fetch failed: ${error.message}`, "error");
+    setStatus(`Fetch failed: ${error.message}`, "error");
   }
 }
 
@@ -468,7 +525,7 @@ async function runEncode() {
 
   try {
     if (state.modelName !== name) {
-      setStatus("model-status", `Loading ${name}…`, "busy");
+      setStatus(`Loading ${name}…`, "busy");
       showProgress(0);
       onProgress = (message) => {
         if (message.stage === "download" && message.total) {
@@ -481,13 +538,15 @@ async function runEncode() {
       if (token !== encodeToken) return false;
       state.modelName = name;
       state.modelType = info.modelType;
-      $("kernel-status").textContent = info.simd
-        ? "Running on the WebAssembly SIMD kernel."
-        : "Running on the JavaScript kernel — this browser has no WebAssembly SIMD, "
-          + "so expect roughly 5x slower.";
+      // Only worth saying when it is bad: the SIMD path is the expected one and
+      // saying so every time is a line that never changes.
+      $("kernel-status").hidden = info.simd;
+      $("kernel-status").textContent = info.simd ? ""
+        : "No WebAssembly SIMD in this browser, so this is the JavaScript kernel "
+          + "— expect roughly 5x slower.";
     }
 
-    setStatus("model-status", "Encoding structure…", "busy");
+    setStatus("Encoding structure…", "busy");
     const t0 = performance.now();
     const info = await call("encode", {
       inputs: {
@@ -518,9 +577,7 @@ async function runEncode() {
     // now holds, so do not claim the cache or report readiness.
     if (token !== encodeToken) return false;
     state.encodedFor = key;
-    setStatus(
-      "model-status",
-      `${state.modelName} ready — encoded ${info.L} residues in `
+    setStatus(`${state.modelName} ready — encoded ${info.L} residues in `
       + `${(info.ms / 1000).toFixed(2)} s (${((performance.now() - t0) / 1000).toFixed(2)} s total)`,
     );
     $("design-btn").disabled = false;
@@ -530,7 +587,7 @@ async function runEncode() {
   } catch (error) {
     onProgress = null;
     hideProgress();
-    if (token === encodeToken) setStatus("model-status", `Failed: ${error.message}`, "error");
+    if (token === encodeToken) setStatus(`Failed: ${error.message}`, "error");
     return false;
   }
 }
@@ -572,8 +629,9 @@ function refreshAffordances() {
   show(option("membrane"), type === "per_residue_label_membrane_mpnn"
     || type === "global_label_membrane_mpnn");
   show("select-interface", Boolean(s?.ligandType.length) && readsLigands());
-  show("homo-oligomer-row", (s?.chainList.length ?? 0) > 1);
-  show("results-panel", state.designs.length > 0);
+  // Always visible: in a fixed-pane shell, hiding a pane leaves a hole rather
+  // than reflowing, and the table has a perfectly good empty state. This also
+  // retires the bug where Clear left the panel up showing that empty state.
 
   // A hidden option stays selected if it was already chosen, which would leave
   // the viewer painting from data that is gone.
@@ -586,7 +644,7 @@ function refreshAffordances() {
 
 function refreshSelection() {
   track.invalidate();
-  if ($("bias-scope").value === "selected") renderBiasGrid();
+  renderConstraints();
   renderSequenceTrack();
   if (state.profile) renderLogo();
   redraw();
@@ -720,6 +778,13 @@ function drawTrack() {
   track.refresh();
 }
 
+/**
+ * The results table.
+ *
+ * Columns rather than one template string per row, so scores line up and can be
+ * sorted; and the sequence is not among them, because the sequence track is
+ * where a sequence is read and it already follows the selected design.
+ */
 function renderResults() {
   const wrap = $("results");
   wrap.innerHTML = "";
@@ -733,40 +798,96 @@ function renderResults() {
     return;
   }
 
-  const native = state.structure.S;
-  state.designs.forEach((design, index) => {
-    const row = document.createElement("div");
-    row.className = "design" + (index === state.activeDesign ? " active" : "");
+  const chains = state.structure.chainList;
+  const columns = [
+    { key: "id", label: "#", get: (d) => d.id, fmt: (d) => `#${d.id}` },
+    { key: "score", label: "score", get: (d) => d.score, fmt: (d) => d.score.toFixed(3) },
+    {
+      key: "identity",
+      label: "recovery",
+      title: "identity to the input sequence, over the designed positions only",
+      get: (d) => d.identity,
+      fmt: (d) => `${(d.identity * 100).toFixed(0)}%`,
+    },
+    ...(chains.length > 1 ? chains.map((chain) => ({
+      key: `chain:${chain}`,
+      label: chain,
+      title: `recovery within chain ${chain}`,
+      get: (d) => d.chainIdentity.get(chain) ?? -1,
+      fmt: (d) => {
+        const value = d.chainIdentity.get(chain);
+        return value === null || value === undefined ? "—" : `${(value * 100).toFixed(0)}%`;
+      },
+    })) : []),
+    {
+      key: "designed",
+      label: "designed",
+      title: "how many positions this run was allowed to change",
+      get: (d) => d.designed,
+      fmt: (d) => String(d.designed),
+    },
+    {
+      key: "seed",
+      label: "seed",
+      title: "what makes this row reproducible",
+      get: (d) => d.seed,
+      fmt: (d) => String(d.seed),
+    },
+  ];
 
-    const meta = document.createElement("div");
-    meta.className = "meta";
-    meta.textContent = `#${index + 1}  nll ${design.score.toFixed(3)}  `
-      + `id ${(design.identity * 100).toFixed(0)}%`;
+  const table = document.createElement("table");
+  table.className = "results-table";
 
-    const seq = document.createElement("div");
-    seq.className = "seq";
-    let html = "";
-    for (let i = 0; i < design.S.length; i++) {
-      const same = design.S[i] === native[i];
-      html += `<span class="${same ? "same" : "diff"}">${displayLetter(i, design.S[i])}</span>`;
+  const head = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const column of columns) {
+    const th = document.createElement("th");
+    th.textContent = column.label;
+    if (column.title) th.title = column.title;
+    if (state.sort.key === column.key) {
+      th.dataset.sorted = state.sort.dir > 0 ? "asc" : "desc";
     }
-    seq.innerHTML = html;
+    th.onclick = () => {
+      state.sort = state.sort.key === column.key
+        ? { key: column.key, dir: -state.sort.dir }
+        : { key: column.key, dir: 1 };
+      renderResults();
+    };
+    headRow.appendChild(th);
+  }
+  head.appendChild(headRow);
+  table.appendChild(head);
 
-    row.appendChild(meta);
-    row.appendChild(seq);
-    row.onclick = () => {
+  const sorter = columns.find((c) => c.key === state.sort.key) ?? columns[1];
+  const rows = [...state.designs].sort(
+    (a, b) => (sorter.get(a) - sorter.get(b)) * state.sort.dir,
+  );
+
+  const body = document.createElement("tbody");
+  for (const design of rows) {
+    const tr = document.createElement("tr");
+    const index = state.designs.indexOf(design);
+    if (index === state.activeDesign) tr.className = "active";
+    // The sequence is not a column -- the track is where it is read -- but it
+    // belongs somewhere reachable: on hover, and as a handle for tests.
+    tr.title = design.seq;
+    tr.dataset.seq = design.seq;
+    for (const column of columns) {
+      const td = document.createElement("td");
+      td.textContent = column.fmt(design);
+      tr.appendChild(td);
+    }
+    tr.onclick = () => {
       state.activeDesign = state.activeDesign === index ? -1 : index;
       renderResults();
       renderSequenceTrack();
       redraw();
     };
-    wrap.appendChild(row);
-  });
+    body.appendChild(tr);
+  }
+  table.appendChild(body);
+  wrap.appendChild(table);
 }
-
-// ---------------------------------------------------------------------------
-// Sequence logo
-// ---------------------------------------------------------------------------
 
 function renderLogo() {
   if (!state.profile) return;
@@ -798,63 +919,20 @@ function topAAs(probs, i, n = 3) {
 // Amino-acid bias grid
 // ---------------------------------------------------------------------------
 
+/** The selection, in ascending order. */
 function selectedPositions() {
-  const out = [];
-  if (!state.structure) return out;
-  for (let i = 0; i < state.structure.L; i++) if (state.designMask[i] > 0) out.push(i);
-  return out;
+  return [...state.selection].sort((a, b) => a - b);
+}
+
+/** Mark every selected position as designed, or as kept. */
+function setDesigned(on) {
+  for (const i of state.selection) state.designMask[i] = on ? 1 : 0;
+  state.encodedFor = null;
+  refreshSelection();
 }
 
 /**
- * The bias currently shown in the grid.
- *
- * In "selected" scope this is the value shared by every selected position, or
- * the global value where they disagree -- editing then writes to all of them,
- * which is the behaviour that makes a mixed selection usable.
- */
-function shownBias(v) {
-  if ($("bias-scope").value === "global") {
-    return { value: state.bias[v], omitted: state.omitted.has(v), override: false };
-  }
-  const positions = selectedPositions();
-  if (!positions.length) {
-    return { value: state.bias[v], omitted: state.omitted.has(v), override: false };
-  }
-  const first = state.biasOverrides.get(positions[0]);
-  const value = first ? first[v] : state.bias[v];
-  const omitted = (state.omitOverrides.get(positions[0]) ?? state.omitted).has(v);
-  const override = positions.some((p) => state.biasOverrides.has(p) || state.omitOverrides.has(p));
-  return { value, omitted, override };
-}
-
-function writeBias(v, value) {
-  if ($("bias-scope").value === "global") {
-    state.bias[v] = value;
-    return;
-  }
-  for (const p of selectedPositions()) {
-    if (!state.biasOverrides.has(p)) state.biasOverrides.set(p, Float32Array.from(state.bias));
-    state.biasOverrides.get(p)[v] = value;
-  }
-}
-
-function toggleOmit(v) {
-  if ($("bias-scope").value === "global") {
-    if (state.omitted.has(v)) state.omitted.delete(v);
-    else state.omitted.add(v);
-    return;
-  }
-  const positions = selectedPositions();
-  const turningOn = !(state.omitOverrides.get(positions[0]) ?? state.omitted).has(v);
-  for (const p of positions) {
-    if (!state.omitOverrides.has(p)) state.omitOverrides.set(p, new Set(state.omitted));
-    if (turningOn) state.omitOverrides.get(p).add(v);
-    else state.omitOverrides.get(p).delete(v);
-  }
-}
-
-/**
- * Letters the bias grid offers and the sampler may draw.
+ * Letters the editor offers and the sampler may draw.
  *
  * The 20 amino acids everywhere, plus NA-MPNN's DNA tokens -- which stand in
  * for the RNA bases too, since its `--na_shared_tokens` default aliases them.
@@ -866,165 +944,93 @@ function biasLetters() {
   return [...Array(20).keys(), ...NA_NUCLEOTIDES];
 }
 
-function renderBiasGrid() {
-  const wrap = $("aa-bias");
-  wrap.innerHTML = "";
-  const scoped = $("bias-scope").value === "selected";
-  const nSelected = selectedPositions().length;
-
-  for (const v of biasLetters()) {
-    const aa = alphabet()[v];
-    const shown = shownBias(v);
-    const cell = document.createElement("div");
-    cell.className = "cell" + (shown.omitted ? " omitted" : "")
-      + (scoped && shown.override ? " override" : "");
-
-    const letter = document.createElement("span");
-    letter.className = "letter";
-    letter.textContent = aa;
-    letter.style.color = AA_COLORS[aa];
-    letter.title = "click to omit";
-    letter.onclick = () => {
-      toggleOmit(v);
-      renderBiasGrid();
-    };
-
-    const input = document.createElement("input");
-    input.type = "number";
-    input.step = "0.5";
-    input.value = String(shown.value);
-    input.disabled = scoped && nSelected === 0;
-    input.oninput = () => {
-      writeBias(v, parseFloat(input.value) || 0);
-      renderBiasGrid();
-    };
-
-    cell.appendChild(letter);
-    cell.appendChild(input);
-    wrap.appendChild(cell);
-  }
-
-  const overrides = new Set([...state.biasOverrides.keys(), ...state.omitOverrides.keys()]);
-  $("bias-clear-overrides").hidden = overrides.size === 0;
-  $("bias-summary").textContent = scoped
-    ? `Editing ${nSelected} selected position(s). ${overrides.size} position(s) carry an override.`
-    : (overrides.size
-      ? `${overrides.size} position(s) carry an override, which wins over these values.`
-      : "");
-}
-
 /** Expand the per-letter bias into the [L, numLetters] array the model wants. */
 function buildBias() {
-  const L = state.structure.L;
-  const V = numLetters();
-  const allowed = new Set(biasLetters());
-  const bias = new Float32Array(L * V);
-  for (let i = 0; i < L; i++) {
-    const local = state.biasOverrides.get(i);
-    const omit = state.omitOverrides.get(i) ?? state.omitted;
-    for (let v = 0; v < V; v++) {
-      // Anything outside the offered letters is omitted outright: "X" for the
-      // protein models, and for NA-MPNN also the legacy RNA tokens and the
-      // MAS/PAD placeholders that never name a real residue.
-      bias[i * V + v] = !allowed.has(v) || omit.has(v)
-        ? -1e9
-        : (local ? local[v] : state.bias[v]);
-    }
-  }
-  return bias;
+  return buildBiasFrom(state.constraints, {
+    L: state.structure.L,
+    alphabet: alphabet(),
+    letters: biasLetters(),
+  });
 }
 
-/**
- * Tie every chain to every other, LigandMPNN's `--homo_oligomer`.
- *
- * The reference matches residues by *number*, not by position in the chain, so
- * a complex whose chains share a numbering ties correctly even when one of them
- * has a gap. When the numbering does not line up at all -- chain B continuing
- * where A left off, say -- that finds nothing, so equal-length chains fall back
- * to tying by position. Which one ran is reported, because the two disagree
- * exactly when it matters.
- *
- * Weights are 1/chains, so a group's members contribute the mean of their
- * logits rather than the sum.
- *
- * @returns {{groups: {pos: number, weight: number}[][] | null, note: string}}
- */
-function homoOligomerGroups() {
+/** Render the tie group list, with whatever the engine would quietly drop. */
+function renderTies() {
+  const wrap = $("tie-list");
+  wrap.innerHTML = "";
   const s = state.structure;
-  const chains = s?.chainList ?? [];
-  if (chains.length < 2) {
-    return { groups: null, note: "Needs at least two chains." };
-  }
-  const weight = 1 / chains.length;
+  const { groups } = state.ties;
+  $("tie-chains").hidden = (s?.chainList.length ?? 0) < 2;
 
-  // By residue number: chain -> "resSeq+iCode" -> position.
-  const byChain = new Map(chains.map((c) => [c, new Map()]));
-  for (let i = 0; i < s.L; i++) {
-    byChain.get(s.chainIds[i]).set(`${s.resSeq[i]}${s.iCodes[i]}`, i);
-  }
-  const reference = byChain.get(chains[0]);
-  const byNumber = [];
-  let unmatched = 0;
-  for (const [key, pos] of reference) {
-    const group = [pos];
-    for (let c = 1; c < chains.length; c++) {
-      const other = byChain.get(chains[c]).get(key);
-      if (other === undefined) break;
-      group.push(other);
+  for (const group of groups) {
+    const row = document.createElement("div");
+    row.className = "tie-row";
+
+    const name = document.createElement("span");
+    name.className = "tie-label";
+    name.textContent = group.label;
+
+    const what = document.createElement("span");
+    what.className = "tie-what";
+    what.textContent = `${group.positions.length} positions`;
+    what.title = group.positions
+      .map((p) => (s ? `${s.chainIds[p]}${s.resSeq[p]}` : p))
+      .join(" ");
+
+    const mode = document.createElement("select");
+    for (const value of ["average", "sum"]) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = value;
+      mode.appendChild(option);
     }
-    if (group.length === chains.length) byNumber.push(group);
-    else unmatched++;
+    mode.value = group.mode;
+    mode.onchange = () => { group.mode = mode.value; renderTies(); };
+
+    const drop = document.createElement("button");
+    drop.textContent = "\u2715";
+    drop.title = "remove this group";
+    drop.onclick = () => { removeGroup(state.ties, group.id); renderTies(); redraw(); };
+
+    row.append(name, what, mode, drop);
+    wrap.appendChild(row);
   }
 
-  const lengths = chains.map((c) => byChain.get(c).size);
-  const equalLength = lengths.every((n) => n === lengths[0]);
-
-  if (byNumber.length) {
-    const note = `${byNumber.length} group(s) of ${chains.length}, matched by residue number`
-      + (unmatched ? `; ${unmatched} residue(s) of chain ${chains[0]} have no counterpart` : "");
-    return { groups: byNumber.map((g) => g.map((pos) => ({ pos, weight }))), note };
+  const notes = [];
+  if (!groups.length) notes.push("No tied positions.");
+  if (s) {
+    const { conflicts, outOfRange } = validateTies(state.ties, s.L);
+    for (const c of conflicts) {
+      notes.push(`${s.chainIds[c.pos]}${s.resSeq[c.pos]} is in `
+        + `${[c.keeps, ...c.loses].map((g) => g.label).join(" and ")} — `
+        + `${c.keeps.label} wins, the rest drop it.`);
+    }
+    for (const o of outOfRange) {
+      notes.push(`${o.group.label} has ${o.positions.length} position(s) outside the structure.`);
+    }
   }
-  if (!equalLength) {
-    return {
-      groups: null,
-      note: `Chains have different lengths (${lengths.join(", ")}) and no residue numbers `
-        + "in common, so there is nothing to tie.",
-    };
-  }
-  // Positional fallback: the i-th residue of every chain.
-  const perChain = chains.map(() => []);
-  for (let i = 0; i < s.L; i++) perChain[s.chainLabels[i]].push(i);
-  const byPosition = perChain[0].map((_, i) => perChain.map((c) => ({ pos: c[i], weight })));
-  return {
-    groups: byPosition,
-    note: `${byPosition.length} group(s) of ${chains.length}, matched by position — the chains `
-      + "share no residue numbers, so this assumes they are aligned end to end.",
-  };
+  $("tie-note").textContent = notes.join(" ");
 }
 
-function parseSymmetry() {
-  if ($("homo-oligomer").checked) return homoOligomerGroups().groups;
-  const text = $("symmetry").value.trim();
-  if (!text) return null;
-  const groups = [];
-  for (const chunk of text.split(",")) {
-    const positions = chunk.split("+")
-      .map((p) => parseInt(p.trim(), 10) - 1)
-      .filter((p) => Number.isInteger(p) && p >= 0 && p < state.structure.L);
-    if (positions.length > 1) groups.push(positions);
+/** Add a group and report why not, rather than silently doing nothing. */
+function tie(positions, opts) {
+  const result = addGroup(state.ties, positions, opts);
+  if (!result.ok) {
+    setStatus(result.reason, "error");
+    return;
   }
-  return groups.length ? groups : null;
+  renderTies();
+  redraw();
 }
 
 // ---------------------------------------------------------------------------
-// Actions
+// Running the model
 // ---------------------------------------------------------------------------
 
 async function runDesign() {
   if (!await ensureEncoded()) return;
   const button = $("design-btn");
   button.disabled = true;
-  setStatus("design-status", "Designing…", "busy");
+  setStatus("Designing…", "busy");
 
   try {
     const seed = $("random-seed").checked
@@ -1036,40 +1042,54 @@ async function runDesign() {
       S: Array.from(state.structure.S),
       chainMask: Array.from(state.designMask),
       bias: Array.from(buildBias()),
-      symmetry: parseSymmetry(),
+      symmetry: toEngineSymmetry(state.ties, state.structure.L),
       seed,
     });
 
     const native = state.structure.S;
+    const chains = state.structure.chainList;
     for (let b = 0; b < result.S.length; b++) {
       const S = result.S[b];
+      // Recovery over the *designed* positions only -- a kept position matches
+      // by construction and would flatter the number. Per chain as well as
+      // overall, because "62% overall" hides one chain having gone nowhere.
       let same = 0;
       let counted = 0;
+      const perChain = new Map(chains.map((c) => [c, { same: 0, counted: 0 }]));
       for (let i = 0; i < S.length; i++) {
         if (!state.designMask[i]) continue;
         counted++;
-        if (S[i] === native[i]) same++;
+        const hit = S[i] === native[i];
+        if (hit) same++;
+        const row = perChain.get(state.structure.chainIds[i]);
+        row.counted++;
+        if (hit) row.same++;
       }
       state.designs.push({
+        // Stable for the life of the page. The row number used to be a position
+        // in an array re-sorted on every run, so "#3" meant a different design
+        // after the second run than after the first.
+        id: state.nextDesignId++,
         S,
         // Rendered here rather than in the worker: `sequenceToString` only
         // knows the 21-letter alphabet, and FASTA has to carry the RNA letters.
         seq: showSequence(S),
         score: result.scores[b],
         identity: counted ? same / counted : 0,
+        chainIdentity: new Map([...perChain].map(
+          ([c, r]) => [c, r.counted ? r.same / r.counted : null],
+        )),
+        designed: counted,
         seed,
       });
     }
-    state.designs.sort((a, b) => a.score - b.score);
     renderResults();
     refreshAffordances();
-    setStatus(
-      "design-status",
-      `${result.S.length} sequences in ${(result.ms / 1000).toFixed(2)} s `
+    setStatus(`${result.S.length} sequences in ${(result.ms / 1000).toFixed(2)} s `
       + `(${(result.ms / result.S.length).toFixed(0)} ms each), seed ${seed}`,
     );
   } catch (error) {
-    setStatus("design-status", `Failed: ${error.message}`, "error");
+    setStatus(`Failed: ${error.message}`, "error");
   } finally {
     button.disabled = false;
   }
@@ -1080,7 +1100,7 @@ async function runProfile() {
   const button = $("profile-btn");
   button.disabled = true;
   const mode = $("profile-mode").value;
-  setStatus("design-status", "Computing profile…", "busy");
+  setStatus("Computing profile…", "busy");
   if (mode === "exact") showProgress(0);
   onProgress = (message) => {
     if (message.stage === "profile") showProgress(message.received / message.total);
@@ -1111,14 +1131,14 @@ async function runProfile() {
       entropy[i] = h;
     }
     state.profile = { probs, entropy };
-    $("profile-panel").hidden = false;
+    showTab("profile");
     refreshAffordances();
     $("profile-hint").textContent = MODE_TEXT[mode] ?? "";
     renderLogo();
     redraw();
-    setStatus("design-status", `Profile in ${(result.ms / 1000).toFixed(2)} s`);
+    setStatus(`Profile in ${(result.ms / 1000).toFixed(2)} s`);
   } catch (error) {
-    setStatus("design-status", `Failed: ${error.message}`, "error");
+    setStatus(`Failed: ${error.message}`, "error");
   } finally {
     onProgress = null;
     hideProgress();
@@ -1161,12 +1181,12 @@ async function runScore() {
   try {
     S = parseSequence($("score-seq").value, state.structure.L);
   } catch (error) {
-    setStatus("score-status", error.message, "error");
+    setStatus(error.message, "error");
     button.disabled = false;
     return;
   }
   const mode = $("score-mode").value;
-  setStatus("score-status", "Scoring…", "busy");
+  setStatus("Scoring…", "busy");
   showProgress(0);
   onProgress = (message) => {
     if (message.stage === "score") showProgress(message.received / message.total);
@@ -1187,16 +1207,14 @@ async function runScore() {
     const spread = result.sd === null
       ? ""
       : ` ± ${result.sd.toFixed(4)} over ${result.orders} orders`;
-    setStatus(
-      "score-status",
-      `nll ${result.mean.toFixed(4)}${spread}, `
+    setStatus(`nll ${result.mean.toFixed(4)}${spread}, `
       + `${((same / S.length) * 100).toFixed(0)}% identical to the input structure's sequence `
       + `(${(result.ms / 1000).toFixed(2)} s)`,
     );
     $("color-mode").value = "score";
     redraw();
   } catch (error) {
-    setStatus("score-status", `Failed: ${error.message}`, "error");
+    setStatus(`Failed: ${error.message}`, "error");
   } finally {
     onProgress = null;
     hideProgress();
@@ -1227,8 +1245,9 @@ function describeScoreMode() {
 
 function fastaText() {
   const name = $("pdb-id").value.trim() || "design";
-  return state.designs.map((d, i) =>
-    `>${name}_${i + 1} score=${d.score.toFixed(4)} identity=${d.identity.toFixed(3)}\n${d.seq}`,
+  return state.designs.map((d) =>
+    `>${name}_${d.id} score=${d.score.toFixed(4)} identity=${d.identity.toFixed(3)}`
+    + ` seed=${d.seed}\n${d.seq}`,
   ).join("\n") + "\n";
 }
 
@@ -1301,14 +1320,42 @@ $("use-side-chains").onchange = () => {
   if (state.structure) ensureEncoded();
 };
 
-function refreshHomoOligomer() {
-  const on = $("homo-oligomer").checked;
-  $("symmetry").disabled = on;
-  $("homo-summary").textContent = !on ? ""
-    : state.structure ? homoOligomerGroups().note
-      : "Load a structure first.";
-}
-$("homo-oligomer").onchange = refreshHomoOligomer;
+$("tie-selection").onclick = () => tie(selectedPositions());
+
+$("tie-across").onclick = () => {
+  const s = state.structure;
+  if (!s) return;
+  const { groups, unmatched } = acrossChains(s, selectedPositions());
+  for (const group of groups) addGroup(state.ties, group, { source: "manual" });
+  renderTies();
+  redraw();
+  setStatus(`${groups.length} group(s) tied across chains`
+    + (unmatched.length ? `; ${unmatched.length} selected position(s) had no counterpart` : ""));
+};
+
+$("tie-chains").onclick = () => {
+  const { groups, note } = chainGroups(state.structure);
+  if (!groups) {
+    setStatus(note, "error");
+    return;
+  }
+  for (const group of groups) addGroup(state.ties, group, { source: "homo-oligomer" });
+  renderTies();
+  redraw();
+  setStatus(note);
+};
+
+$("tie-add-text").onclick = () => {
+  const s = state.structure;
+  if (!s) return;
+  const { positions, unresolved } = parsePositions(s, $("tie-text").value);
+  if (unresolved.length) {
+    setStatus(`Could not resolve: ${unresolved.join(", ")}`, "error");
+    return;
+  }
+  tie(positions);
+  $("tie-text").value = "";
+};
 
 $("temperature").oninput = (event) => {
   $("temperature-out").textContent = Number(event.target.value).toFixed(2);
@@ -1323,34 +1370,52 @@ $("profile-mode").onchange = () => {
 };
 
 $("select-all").onclick = () => {
-  state.designMask.fill(1);
+  for (let i = 0; i < state.structure.L; i++) state.selection.add(i);
   refreshSelection();
 };
 $("select-none").onclick = () => {
-  state.designMask.fill(0);
+  state.selection.clear();
   refreshSelection();
 };
 $("select-invert").onclick = () => {
-  for (let i = 0; i < state.designMask.length; i++) {
-    state.designMask[i] = state.designMask[i] ? 0 : 1;
+  for (let i = 0; i < state.structure.L; i++) {
+    if (state.selection.has(i)) state.selection.delete(i);
+    else state.selection.add(i);
   }
   refreshSelection();
 };
+/**
+ * Give the structure the whole window.
+ *
+ * The renderer fits the model into `min(width, height)` of its canvas, so on a
+ * wide screen height is the only dimension that makes it bigger -- and the
+ * other two rows have already given up what they can spare. This borrows the
+ * rest for as long as you want it.
+ */
+$("expand-structure").onclick = (event) => {
+  const on = document.body.classList.toggle("focus-structure");
+  event.currentTarget.setAttribute("aria-pressed", String(on));
+  redraw();
+};
+
+$("mark-design").onclick = () => setDesigned(true);
+$("mark-keep").onclick = () => setDesigned(false);
+
 $("select-interface").onclick = () => {
   const hits = nearLigand();
   if (!hits.size) {
-    setStatus("load-status", "No heteroatoms in this structure.", "error");
+    setStatus("No heteroatoms in this structure.", "error");
     return;
   }
-  state.designMask.fill(0);
-  for (const i of hits) state.designMask[i] = 1;
+  state.selection.clear();
+  for (const i of hits) state.selection.add(i);
   refreshSelection();
 };
 
 function paintMembrane(label) {
   if (!state.structure) return;
   for (let i = 0; i < state.structure.L; i++) {
-    if (state.designMask[i] > 0) state.membraneLabels[i] = label;
+    if (state.selection.has(i)) state.membraneLabels[i] = label;
   }
   state.membraneVersion += 1;
   state.encodedFor = null;
@@ -1386,32 +1451,20 @@ $("score-native").onclick = () => {
 
 $("design-btn").onclick = runDesign;
 $("profile-btn").onclick = runProfile;
-$("bias-scope").onchange = renderBiasGrid;
 $("bias-reset").onclick = () => {
-  state.bias.fill(0);
-  state.omitted.clear();
-  state.biasOverrides.clear();
-  state.omitOverrides.clear();
-  renderBiasGrid();
+  clearAll(state.constraints);
+  renderConstraints();
 };
 $("bias-clear-overrides").onclick = () => {
-  state.biasOverrides.clear();
-  state.omitOverrides.clear();
-  renderBiasGrid();
+  clearOverrides(state.constraints);
+  renderConstraints();
 };
-// Resolved against the *current* alphabet: NA-MPNN orders amino acids
-// ARNDC..., so ALPHABET's index for "C" is arginine's index over there.
-const omitShortcut = (letter) => () => {
-  toggleOmit(alphabet().indexOf(letter));
-  renderBiasGrid();
-};
-$("omit-cys").onclick = omitShortcut("C");
-$("omit-met").onclick = omitShortcut("M");
-
 $("clear-results").onclick = () => {
   state.designs = [];
   state.activeDesign = -1;
   renderResults();
+  // Without this the panel stayed on screen showing its own empty placeholder.
+  refreshAffordances();
   renderSequenceTrack();
   redraw();
 };
@@ -1460,7 +1513,10 @@ function endBox(event) {
   if (!boxing) return;
   event.stopImmediatePropagation();
   const hits = viewer.pickBox(boxing.from, boxing.to);
-  for (const i of hits) state.designMask[i] = boxing.subtract ? 0 : 1;
+  for (const i of hits) {
+    if (boxing.subtract) state.selection.delete(i);
+    else state.selection.add(i);
+  }
   boxing = null;
   viewer.box = null;
   refreshSelection();
@@ -1475,7 +1531,8 @@ orbit(canvas, viewer.camera, redraw, {
   onClick: (event) => {
     const i = viewer.pick(localPoint(event));
     if (i < 0) return;
-    state.designMask[i] = state.designMask[i] ? 0 : 1;
+    if (state.selection.has(i)) state.selection.delete(i);
+    else state.selection.add(i);
     refreshSelection();
   },
   onReset: () => viewer.resetCamera(),
@@ -1493,7 +1550,8 @@ canvas.addEventListener("pointermove", (event) => {
     const ss = { H: "helix", E: "strand", T: "turn", C: "loop" }[viewer.sec[i]] ?? "loop";
     tooltip.hidden = false;
     tooltip.textContent = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}  ${ss}\n`
-      + `${state.designMask[i] ? "designed" : "fixed"}`
+      + `${state.designMask[i] ? "designed" : "kept"}`
+      + `${state.selection.has(i) ? " · selected" : ""}`
       + (state.profile ? `\n${topAAs(state.profile.probs, i)}` : "");
     tooltip.style.left = `${Math.min(point[0] + 14, canvas.clientWidth - 190)}px`;
     tooltip.style.top = `${point[1] + 14}px`;
@@ -1509,6 +1567,28 @@ canvas.addEventListener("pointerleave", () => {
   redraw();
 });
 
+// Panes change size without the window doing so -- the results table appearing,
+// the inspector scrolling, a tab switching -- and all three canvases size
+// themselves from their pane, so watching the window is not enough.
+const observeResize = (el, run) => {
+  if (!el) return;
+  let queued = false;
+  new ResizeObserver(() => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      run();
+    });
+  }).observe(el);
+};
+observeResize($("viewer").parentElement, () => redraw());
+// The panel, not the view inside it: the panel is sized by the grid, so
+// rebuilding cannot change its height and there is no feedback loop. Watching
+// the view would also mean the first build measures a wrap that has not been
+// laid out yet, which came out as 6px and clipped the track to four chains.
+observeResize($("sequence-panel"), () => renderSequenceTrack());
+observeResize($("pane-profile"), () => { if (state.profile) renderLogo(); });
 window.addEventListener("resize", () => {
   redraw();
   drawTrack();
@@ -1547,9 +1627,21 @@ logoCanvas.addEventListener("click", (event) => {
   const rect = logoCanvas.getBoundingClientRect();
   const i = logo.pick(event.clientX - rect.left);
   if (i < 0) return;
-  state.designMask[i] = state.designMask[i] ? 0 : 1;
+  if (state.selection.has(i)) state.selection.delete(i);
+  else state.selection.add(i);
   refreshSelection();
 });
+
+/** The bottom-right pane holds two read-only analyses; only one at a time. */
+function showTab(which) {
+  for (const name of ["profile", "score"]) {
+    const on = name === which;
+    $(`tab-${name}`).setAttribute("aria-selected", String(on));
+    $(`pane-${name}`).hidden = !on;
+  }
+}
+$("tab-profile").onclick = () => showTab("profile");
+$("tab-score").onclick = () => showTab("score");
 
 $("profile-view").onchange = (event) => {
   logo.mode = event.target.value;
@@ -1572,7 +1664,8 @@ $("logo-narrower").onclick = () => {
 
 // --- boot -----------------------------------------------------------------
 
-renderBiasGrid();
+renderConstraints();
+renderTies();
 loadModelList().then(() => {
   const params = new URLSearchParams(location.search);
   const pdb = params.get("pdb");

@@ -943,7 +943,7 @@ export class Model {
       // One draw per tied group, broadcast to its members.
       pending.length = 0;
       for (let b = 0; b < B; b++) {
-        const t0 = orders[b][step][0];
+        const members = orders[b][step];
         let best = 0;
         let bestVal = -Infinity;
         // Every letter is a candidate, as in the reference; what may not be
@@ -953,7 +953,19 @@ export class Model {
         // nucleotide could never be sampled.
         for (let v = 0; v < V; v++) {
           let x = totalLogits[b * V + v] + omit[v];
-          if (bias) x += bias[t0 * V + v];
+          // Bias is combined over the whole tied group with the same weights
+          // the logits already use, not read from the group's first member.
+          // Reading only the first silently ignored a bias set on any other
+          // member -- invisible while bias was one row applied everywhere, and
+          // a lie as soon as the interface shows bias per position. For a group
+          // whose members share a bias row this is identical to before, since
+          // the weights sum to 1 under the averaging mode.
+          if (bias) {
+            for (let k = 0; k < members.length; k++) {
+              const t = members[k];
+              x += groups.weightOf(t) * bias[t * V + v];
+            }
+          }
           // Gumbel-max draw: same distribution as softmax(x / T) sampling,
           // without building the distribution.
           const g = -Math.log(-Math.log(Math.max(rng(), 1e-20)));

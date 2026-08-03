@@ -8,11 +8,12 @@
 //
 // Two things need translating rather than passing through.
 //
-// **Selection means something different.** py2Dmol's `positions` set is "the
-// residues you have selected"; here the equivalent is "the residues you are
-// designing", which is also an encoder input under side-chain context. So
-// `getSelection` reads the design mask and `setSelection` writes it and then
-// asks the page to refresh -- which is where the encode debounce lives.
+// **Selection is selection.** py2Dmol's `positions` set is "the residues you
+// have selected", and so is this page's `state.selection`. It used to be the
+// design mask instead, which is why this comment used to be an apology.
+// Designing is a separate property, set *on* the selection; the 3D view dims
+// what is not designed, the track saturates what is selected, and the two
+// facts are visible at once.
 //
 // **Heteroatoms are not model positions here.** LigandMPNN reads them as atom
 // context, not as things to design, so they are not in `designMask` and there
@@ -88,16 +89,6 @@ export class SequenceView {
    * `chains` and `selectionMode` are what the chain badges in the track are
    * drawn from, and they follow upstream's own rule in `applySelection`: a
    * chain is listed if anything in it is selected, and when *everything* is
-   * selected the mode goes to "default" with an empty set. Returning an empty
-   * set unconditionally, which is what this did first, left every chain badge
-   * looking unselected no matter what.
-   */
-  /**
-   * The selection, in the shape the viewer expects.
-   *
-   * `chains` and `selectionMode` are what the chain badges in the track are
-   * drawn from, and they follow upstream's own rule in `applySelection`: a
-   * chain is listed if anything in it is selected, and when *everything* is
    * selected the mode goes to "default" with an empty set.
    *
    * Cached, because the viewer reads `selectionModel` several times per render
@@ -115,16 +106,14 @@ export class SequenceView {
     const chains = new Set();
     if (!s) return { positions, chains, selectionMode: "explicit", paeBoxes: [] };
 
-    for (let i = 0; i < s.L; i++) {
-      if (state.designMask[i] > 0) {
-        positions.add(i);
-        chains.add(s.chainIds[i]);
-      }
+    for (const i of state.selection) {
+      positions.add(i);
+      chains.add(s.chainIds[i]);
     }
     // The appended heteroatoms count as selected, always. They are not
-    // designable so the mask says nothing about them, but the viewer dims
-    // anything outside this set, and a permanently greyed-out ligand token
-    // would read as "excluded" rather than "not a position you can design".
+    // selectable positions, but the viewer dims anything outside this set, and
+    // a permanently greyed-out ligand token would read as "excluded" rather
+    // than "not something you can point at".
     for (let i = s.L; i < this.positions; i++) {
       positions.add(i);
       chains.add(this.frame.chains[i]);
@@ -151,7 +140,8 @@ export class SequenceView {
     const state = this.deps.getState();
     const s = state.structure;
     if (!s) return;
-    for (let i = 0; i < s.L; i++) state.designMask[i] = positions.has(i) ? 1 : 0;
+    state.selection.clear();
+    for (const i of positions) if (i < s.L) state.selection.add(i);
     this.invalidate();
     this.deps.onSelectionChange();
   }
@@ -242,6 +232,13 @@ export class SequenceView {
     // off `currentObject.ligandGroups`; same function, same arguments.
     this.ligandGroups = groupLigandAtoms(chains, types, numbers, names);
 
+    // Tell the viewer how tall it may be, in pixels it can actually use: it
+    // otherwise fixes itself at 32 lines, which on a 9-chain structure is
+    // taller than the pane and pushes the structure out of the layout.
+    const wrap = host.parentElement;
+    const budget = Math.max(60, Math.round(wrap?.clientHeight ?? 0));
+    host.style.setProperty("--seq-max-height", `${budget}px`);
+
     window.SEQ?.clear();
     window.SEQ?.buildView();
   }
@@ -269,7 +266,7 @@ export class SequenceView {
     if (!s) return;
     let all = true;
     for (let i = 0; i < s.L; i++) {
-      if (s.chainIds[i] === chain && state.designMask[i] === 0) { all = false; break; }
+      if (s.chainIds[i] === chain && !state.selection.has(i)) { all = false; break; }
     }
     this._setChain(chain, !all);
   }
@@ -279,7 +276,10 @@ export class SequenceView {
     const s = state.structure;
     if (!s) return;
     for (let i = 0; i < s.L; i++) {
-      if (s.chainIds[i] === chain) state.designMask[i] = on ? 1 : 0;
+      if (s.chainIds[i] === chain) {
+        if (on) state.selection.add(i);
+        else state.selection.delete(i);
+      }
     }
     this.invalidate();
     this.deps.onSelectionChange();
