@@ -301,7 +301,7 @@ export class Model {
     const H = this.hidden;
     const M = ligand.M;
     const a = this.arena;
-    const { pairId, count: nPairs } = ligand.pairs;
+    const { pairId, count: nPairs, symOf, symCount } = ligand.pairs;
 
     const wV = w.linear("W_v");
     const wC = w.linear("W_c");
@@ -314,13 +314,17 @@ export class Model {
     const hVC = linear(hV, wC.weight, wC.bias, L, H, H);
 
     // --- pair-pure quantities, once for the whole structure ----------------
-    // LayerNorm(W_y_edges · RBF(d)) then W_edges_y, over distinct pairs.
-    const rbf = pairRbf(ligand.pairs.dist, nPairs);
+    // LayerNorm(W_y_edges · RBF(d)) then W_edges_y. Everything here is a
+    // function of the pair's distance alone, so it runs over the *unordered*
+    // pairs -- half the rows, and half the [nPairs, 128] buffers, which is
+    // what put a side-chain-context encode of a large complex over the
+    // accelerator's memory ceiling.
+    const rbf = pairRbf(ligand.pairs.dist, symCount);
     const yEdgesLin = w.linear("features.y_edges");
     const normYEdges = w.norm("features.norm_y_edges");
-    let yEdges = linear(rbf, yEdgesLin.weight, yEdgesLin.bias, nPairs, 16, H);
-    layerNorm(yEdges, normYEdges.gamma, normYEdges.beta, nPairs, H, yEdges);
-    yEdges = linear(yEdges, wEdgesY.weight, wEdgesY.bias, nPairs, H, H);
+    let yEdges = linear(rbf, yEdgesLin.weight, yEdgesLin.bias, symCount, 16, H);
+    layerNorm(yEdges, normYEdges.gamma, normYEdges.beta, symCount, H, yEdges);
+    yEdges = linear(yEdges, wEdgesY.weight, wEdgesY.bias, symCount, H, H);
 
     // Atom-type node embedding, one row per element rather than per slot.
     const normYNodes = w.norm("features.norm_y_nodes");
@@ -333,21 +337,27 @@ export class Model {
     const [W0v, W0e] = layer0.blocks;
     const pairH1 = a.f32("lig.pairH1", nPairs * H);
     {
-      // W1 · [node(type of a) ‖ edge(pair)] = W1v · node + W1e · edge.
+      // W1 · [node(type of a) ‖ edge(pair)] = W1v · node + W1e · edge. The
+      // edge half is distance-pure, so project it over unordered pairs and
+      // gather; only the node half knows which of the two atoms is `a`, and
+      // that is the only reason this row stays ordered at all.
       const nodePart = linear(nodeByType, W0v, layer0.bias, 120, H, H,
         a.f32("lig.nodePart", 120 * H));
-      linear(yEdges, W0e, null, nPairs, H, H, pairH1);
+      const edgePart = linear(yEdges, W0e, null, symCount, H, H,
+        a.f32("lig.edgePart", symCount * H));
       for (let p = 0; p < nPairs; p++) {
+        const e = symOf[p] * H;
         const t = ligand.pairTypeA[p] * H;
         const o = p * H;
-        for (let d = 0; d < H; d++) pairH1[o + d] += nodePart[t + d];
+        for (let d = 0; d < H; d++) pairH1[o + d] = edgePart[e + d] + nodePart[t + d];
       }
     }
     const pairMsg0 = layer0.tail(pairH1, nPairs, a.f32("lig.pairMsg0", nPairs * H));
 
     const layer1 = this.atomLayers[1];
     const [W1v, W1e] = layer1.blocks;
-    const pairEdge1 = linear(yEdges, W1e, null, nPairs, H, H, a.f32("lig.pairEdge1", nPairs * H));
+    const pairEdge1 = linear(yEdges, W1e, null, symCount, H, H,
+      a.f32("lig.pairEdge1", symCount * H));
 
     // --- per residue -------------------------------------------------------
     const yNodes = a.f32("lig.yNodes", L * M * H);
@@ -407,7 +417,7 @@ export class Model {
           const po = row * H;
           for (let n = 0; n < M; n++) {
             if (ligand.Ym[i * M + n] === 0) continue;
-            const eo = pairId[row * M + n] * H;
+            const eo = symOf[pairId[row * M + n]] * H;
             const to = n1 * H;
             for (let d = 0; d < H; d++) h1[to + d] = pa[po + d] + pairEdge1[eo + d];
             owner[n1++] = row;

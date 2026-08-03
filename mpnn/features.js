@@ -561,8 +561,11 @@ export function sideChainContext(
 export function ligandPairTable(Yg, Y, L, M, A) {
   const pairId = new Int32Array(L * M * M);
   const seen = new Map();
+  const symSeen = new Map();
+  const symOfOrdered = [];
   const dist2Of = [];
   let count = 0;
+  let symCount = 0;
 
   for (let i = 0; i < L; i++) {
     for (let m = 0; m < M; m++) {
@@ -577,13 +580,34 @@ export function ligandPairTable(Yg, Y, L, M, A) {
         if (id === undefined) {
           id = count++;
           seen.set(key, id);
-          dist2Of.push(dist(Y, ao, Y, (i * M + n) * 3));
+          // Everything derived from the pair's *distance* is the same for
+          // (a, b) and (b, a) -- `dist` squares the componentwise differences,
+          // so the two are not merely close but the identical float. Give them
+          // one id and the RBF, its embedding and the second layer's edge
+          // projection are computed once instead of twice.
+          const lo = Math.min(ga, gb);
+          const hi = Math.max(ga, gb);
+          const symKey = (lo + 1) * (A + 1) + (hi + 1);
+          let sym = symSeen.get(symKey);
+          if (sym === undefined) {
+            sym = symCount++;
+            symSeen.set(symKey, sym);
+            dist2Of.push(dist(Y, ao, Y, (i * M + n) * 3));
+          }
+          symOfOrdered.push(sym);
         }
         pairId[(i * M + m) * M + n] = id;
       }
     }
   }
-  return { pairId, count, dist: Float32Array.from(dist2Of) };
+  return {
+    pairId,
+    count,
+    /** [count] ordered pair id -> the unordered id its distance lives at. */
+    symOf: Int32Array.from(symOfOrdered),
+    symCount,
+    dist: Float32Array.from(dist2Of),
+  };
 }
 
 /** RBF expansion of one distance per distinct pair. */
