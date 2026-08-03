@@ -172,6 +172,13 @@ const SS_TUBE_A = 0.27;                   // loop tube radius, angstroms
 const BREAK_A2 = 25;                      // protein: split past 5 A
 const NA_BREAK_A2 = 64;                   // nucleic: split past 8 A
 const NA_TUBE_A = 1.0;                    // fatter backbone, angstroms
+// Samples per residue interval for a nucleic tube. A C1' step is 45% longer
+// than a C-alpha one, so SUB=4 leaves segments long enough that consecutive
+// ones land far apart in the depth sort -- and then a nearer segment's
+// butt-capped halo cuts into its neighbour's fill and the backbone reads as
+// dashes. That notch is invisible on a 0.27 A protein loop and obvious on a
+// 1.0 A one, so sample the coarser geometry more finely instead.
+const NA_SUB = 10;
 // 0.85, not 0.70. Loops should recede, but most of a trace IS loop, so this multiplies almost
 // everything on screen — and stacked on the depth shading it was the largest part of why the render
 // looked washed out. Enough to let a helix or a strand come forward, not enough to bleach the rest.
@@ -433,14 +440,16 @@ export function drawTraces(canvas, layers, opts = {}) {
           const p1 = at(i);
           const p2 = at(i + 1);
           const p3 = at(Math.min(hi, i + 2));
-          for (let k = 0; k <= SUB; k++) {
-            catmull(p0, p1, p2, p3, k / SUB, q0);
+          const na = nucleic ? Boolean(nucleic[i]) : false;
+          const sub = na ? NA_SUB : SUB;
+          for (let k = 0; k <= sub; k++) {
+            catmull(p0, p1, p2, p3, k / sub, q0);
             const A = project(q0);
             if (prevTube) {
               segs.push({
                 x1: prevTube[0], y1: prevTube[1], x2: A[0], y2: A[1],
                 z: (prevTube[2] + A[2]) / 2, pe: (prevTube[3] + A[3]) / 2, c, ss: 'C',
-                na: nucleic ? Boolean(nucleic[i]) : false,
+                na,
               });
             }
             prevTube = A;
