@@ -134,6 +134,21 @@ The next thing in this path is the RBF fill, not the matmul.
 
 ### 2.2 Ideas not yet investigated
 
+- **There is no one owner for "derived once from the weights".** `naEdgeFeatures`
+  caches its column-compacted copies of `edge_embedding.weight` in a module-level
+  `WeakMap` keyed on the weight array. That works, but `Arena` is already the one
+  owner of per-call scratch and `Weights` owns the tensors, so this is a third
+  convention. §2.1 says the same compaction trick wants applying elsewhere; the
+  second user is the point at which a keyed memo slot on `Weights` or `Model`
+  earns itself, and inventing it for one user would not.
+- **`redraw()` runs on every raw pointer move**, with no `requestAnimationFrame`
+  gate, so a rotate drag redraws the structure, the logo and the sequence track
+  once per event rather than once per frame. Pre-existing. The obvious cheap
+  fixes went in with the cleanup — the selection model and the ligand geometry
+  are both cached now rather than rebuilt per event — but the gate itself is
+  still missing and nobody has measured what it costs.
+
+
 - The decoder's `DEFAULT_PREP_BUDGET` fallback is 2.5× slower and triggers
   silently past its ceiling. It logs `prepSkippedBytes` but nothing surfaces it.
 - Multi-threading via `SharedArrayBuffer` + several workers. Needs COOP/COEP

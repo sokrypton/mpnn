@@ -2,8 +2,8 @@
 
 import { ALPHABET, THREE_TO_ONE } from "../mpnn/constants.js";
 import {
-  naDisplaySequence, NA_ALPHABET, NA_DNA_TO_RNA, NA_NUCLEOTIDES, NA_RESTYPES,
-  NA_RNA_TO_DNA, POLYTYPE,
+  naDisplaySequence, naDisplayToken, NA_ALPHABET, NA_DNA_TO_RNA, NA_NUCLEOTIDES,
+  NA_RESTYPES, NA_RNA_TO_DNA, POLYTYPE,
 } from "../mpnn/na.js";
 import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
 import { elementRgb, Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
@@ -73,8 +73,6 @@ const state = {
   biasOverrides: new Map(),
   omitOverrides: new Map(),
   designs: [],
-  /** Whether the current model family reads heteroatoms, so the track shows them. */
-  showLigands: false,
   activeDesign: -1,
   profile: null,
   scorePerPosition: null,
@@ -106,9 +104,26 @@ function alphabet() {
 function numLetters() {
   return alphabet().length;
 }
+/** The selected model's family, before its weights have finished downloading. */
+function modelType() {
+  return $("model-select").selectedOptions[0]?.dataset.type;
+}
 /** True when the selected model treats nucleic acids as model positions. */
 function wantsNucleic() {
-  return ($("model-select").selectedOptions[0]?.dataset.type ?? state.modelType) === "na_mpnn";
+  return (modelType() ?? state.modelType) === "na_mpnn";
+}
+/**
+ * True when the selected model's encoder reads heteroatoms.
+ *
+ * One statement of it, because five things follow from it -- whether the
+ * viewer draws a ligand, whether the sequence track shows ligand tokens,
+ * whether the atom-context and side-chain controls apply, and whether "near
+ * ligand" means anything -- and they have to agree. They were separate
+ * comparisons against the same string, plus two booleans cached in different
+ * places from it.
+ */
+function readsLigands() {
+  return modelType() === "ligand_mpnn";
 }
 /**
  * One residue's letter, in the current alphabet.
@@ -120,11 +135,13 @@ function wantsNucleic() {
  */
 function displayLetter(i, v) {
   const s = state.structure;
-  if (s?.nucleicAsResidues && s.isRNA[i]) {
-    return NA_ALPHABET[NA_DNA_TO_RNA.get(v) ?? v] ?? "X";
-  }
+  if (s?.nucleicAsResidues) return NA_ALPHABET[naDisplayToken(v, s.isRNA[i])] ?? "X";
   return alphabet()[v] ?? "X";
 }
+
+/** The span of NA-MPNN's nucleotide tokens, for telling them from amino acids. */
+const NA_FIRST_NUCLEOTIDE = NA_RESTYPES.indexOf("DA");
+const NA_LAST_NUCLEOTIDE = NA_RESTYPES.indexOf("RX");
 
 /** One-letter code -> the three-letter name, inverted from the parser's table. */
 const ONE_TO_THREE = Object.fromEntries(
@@ -147,11 +164,17 @@ const ONE_TO_THREE = Object.fromEntries(
  */
 function displayName(i, v) {
   const s = state.structure;
-  if (s?.nucleicAsResidues) {
-    const token = s.isRNA[i] ? (NA_DNA_TO_RNA.get(v) ?? v) : v;
-    return NA_RESTYPES[token] ?? "UNK";
-  }
+  if (s?.nucleicAsResidues) return NA_RESTYPES[naDisplayToken(v, s.isRNA[i])] ?? "UNK";
   return ONE_TO_THREE[ALPHABET[v]] ?? "UNK";
+}
+
+/** Hand `text` to the browser as a file download. */
+function download(text, type, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 /** The same, over a whole sequence. */
@@ -215,9 +238,7 @@ const track = new SequenceView({
     if (!s?.nucleicAsResidues) return "P";
     if (s.isRNA[i]) return "R";
     const v = s.S[i];
-    const DA = NA_RESTYPES.indexOf("DA");
-    const RX = NA_RESTYPES.indexOf("RX");
-    return v >= DA && v <= RX ? "D" : "P";
+    return v >= NA_FIRST_NUCLEOTIDE && v <= NA_LAST_NUCLEOTIDE ? "D" : "P";
   },
   chainColour: (chain) => {
     const s = state.structure;
@@ -225,6 +246,8 @@ const track = new SequenceView({
     return hexToRgb(CHAIN_COLORS[(i < 0 ? 0 : s.chainLabels[i]) % CHAIN_COLORS.length]);
   },
   ligandColour: (a) => elementRgb(state.structure.ligandElements[a]),
+  // Only LigandMPNN's encoder reads heteroatoms, so only it shows them.
+  showLigands: readsLigands,
   onSelectionChange: () => refreshSelection(),
   onHoverChange: () => redraw(),
 });
@@ -301,10 +324,10 @@ function updateModelHint() {
     + (model.atom_context_num ? `, ${model.atom_context_num} ligand atoms per residue` : "");
   // Only LigandMPNN reads heteroatoms; every other family's encoder never
   // looks at them, so showing a cofactor would imply context that is not there.
-  viewer.showLigand = type === "ligand_mpnn";
+  viewer.showLigand = readsLigands();
   if (state.structure) redraw();
-  $("atom-context-row").hidden = type !== "ligand_mpnn";
-  $("side-chain-row").hidden = type !== "ligand_mpnn";
+  $("atom-context-row").hidden = !readsLigands();
+  $("side-chain-row").hidden = !readsLigands();
   refreshAffordances();
   $("membrane-global-row").hidden = type !== "global_label_membrane_mpnn";
   $("membrane-perres-row").hidden = type !== "per_residue_label_membrane_mpnn";
@@ -436,8 +459,7 @@ async function runEncode() {
   // Side-chain context reads the fixed residues' side chains, so unlike every
   // other input the encoding depends on the selection -- changing it has to
   // invalidate the cache.
-  const type = $("model-select").selectedOptions[0]?.dataset.type;
-  const useSideChains = $("use-side-chains").checked && type === "ligand_mpnn";
+  const useSideChains = $("use-side-chains").checked && readsLigands();
   const selection = useSideChains ? state.designMask.join("") : "";
   const key = `${name}|${useAtomContext}|${useSideChains}|${selection}`
     + `|${state.structureId}|${state.membraneVersion}`;
@@ -538,7 +560,7 @@ function hideProgress() {
  */
 function refreshAffordances() {
   const s = state.structure;
-  const type = $("model-select").selectedOptions[0]?.dataset.type;
+  const type = modelType();
   const show = (sel, on) => {
     const el = typeof sel === "string" ? $(sel) : sel;
     if (el) el.hidden = !on;
@@ -549,7 +571,7 @@ function refreshAffordances() {
   show(option("score"), Boolean(state.scorePerPosition));
   show(option("membrane"), type === "per_residue_label_membrane_mpnn"
     || type === "global_label_membrane_mpnn");
-  show("select-interface", Boolean(s?.ligandType.length) && type === "ligand_mpnn");
+  show("select-interface", Boolean(s?.ligandType.length) && readsLigands());
   show("homo-oligomer-row", (s?.chainList.length ?? 0) > 1);
   show("results-panel", state.designs.length > 0);
 
@@ -563,6 +585,7 @@ function refreshAffordances() {
 }
 
 function refreshSelection() {
+  track.invalidate();
   if ($("bias-scope").value === "selected") renderBiasGrid();
   renderSequenceTrack();
   if (state.profile) renderLogo();
@@ -688,8 +711,6 @@ function redraw() {
  * token for something the model cannot see would misrepresent the input.
  */
 function renderSequenceTrack() {
-  const type = $("model-select").selectedOptions[0]?.dataset.type;
-  state.showLigands = type === "ligand_mpnn";
   track.build();
 }
 
@@ -1395,14 +1416,9 @@ $("clear-results").onclick = () => {
   redraw();
 };
 $("copy-fasta").onclick = () => navigator.clipboard.writeText(fastaText());
-$("download-fasta").onclick = () => {
-  const blob = new Blob([fastaText()], { type: "text/plain" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `${$("pdb-id").value.trim() || "designs"}.fasta`;
-  a.click();
-  URL.revokeObjectURL(a.href);
-};
+$("download-fasta").onclick = () => download(
+  fastaText(), "text/plain", `${$("pdb-id").value.trim() || "designs"}.fasta`,
+);
 
 // --- viewer interaction ---------------------------------------------------
 
@@ -1542,12 +1558,7 @@ $("profile-view").onchange = (event) => {
 
 $("logo-csv").onclick = () => {
   if (!state.profile) return;
-  const blob = new Blob([logo.toCsv()], { type: "text/csv" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `${state.structureLabel || "profile"}-profile.csv`;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  download(logo.toCsv(), "text/csv", `${state.structureLabel || "profile"}-profile.csv`);
 };
 
 $("logo-wider").onclick = () => {

@@ -98,10 +98,21 @@ export const NA_NUCLEOTIDES = [...NA_DNA_TO_RNA.keys()];
 export function naDisplaySequence(S, isRNA) {
   let out = "";
   for (let i = 0; i < S.length; i++) {
-    const v = isRNA && isRNA[i] ? (NA_DNA_TO_RNA.get(S[i]) ?? S[i]) : S[i];
-    out += NA_ALPHABET[v] ?? "?";
+    out += NA_ALPHABET[naDisplayToken(S[i], isRNA && isRNA[i])] ?? "?";
   }
   return out;
+}
+
+/**
+ * The token to *display* at a position, given whether it is really RNA.
+ *
+ * Shared tokens store an RNA base as the corresponding DNA one, so every
+ * display path -- letter, three-letter name, whole sequence -- has to undo that
+ * before it looks anything up. Undoing it in each of them separately is three
+ * copies of one rule.
+ */
+export function naDisplayToken(v, isRNA) {
+  return isRNA ? (NA_DNA_TO_RNA.get(v) ?? v) : v;
 }
 
 /** Polymer type of each residue, the 6 classes the node embedding takes. */

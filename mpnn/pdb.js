@@ -268,7 +268,7 @@ export function parseAtoms(text) {
  *   residueIdx: Int32Array, chainLabels: Int32Array, L: number,
  *   chainIds: string[], resSeq: Int32Array, iCodes: string[], resNames: string[],
  *   ligandXyz: Float32Array, ligandType: Int32Array, ligandMask: Float32Array,
- *   ligandNames: string[], ligandElements: string[], ligandResidues: string[],
+ *   ligandNames: string[], ligandElements: string[],
  *   chainList: string[], sequence: string,
  * }}
  */
@@ -433,9 +433,8 @@ export function structureFromText(text, opts = {}) {
     ligandXyz, ligandType, ligandMask,
     ligandNames: ligandAtoms.map((a) => a.name),
     ligandElements: ligandAtoms.map((a) => a.element),
-    ligandResidues: ligandAtoms.map((a) => `${a.resName} ${a.chain}${a.resSeq}`),
-    // The same three fields unpacked, because grouping atoms into ligands wants
-    // them separately rather than as one label to parse back apart.
+    // Grouping atoms into ligands wants these separately; there used to be a
+    // packed `"BTN A300"` label as well, which nothing ever read.
     ligandChains: ligandAtoms.map((a) => a.chain),
     ligandResSeq: ligandAtoms.map((a) => a.resSeq),
     ligandResNames: ligandAtoms.map((a) => a.resName),

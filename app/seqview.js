@@ -32,6 +32,7 @@ export class SequenceView {
    * @param {(i: number) => {rgb: number[], dim: number}} deps.colourFor
    * @param {(i: number) => string} deps.nameAt
    * @param {(i: number) => string} deps.typeAt "P", "D" or "R"
+   * @param {() => boolean} deps.showLigands whether heteroatoms are in scope
    * @param {(chain: string) => number[]} deps.chainColour
    * @param {() => void} deps.onSelectionChange called after the mask is written
    * @param {() => void} deps.onHoverChange
@@ -39,6 +40,8 @@ export class SequenceView {
   constructor(deps) {
     this.deps = deps;
     this.frame = null;
+    /** Total display positions: the L residues, then the heteroatoms. */
+    this.positions = 0;
     this.ligandGroups = new Map();
     /** py2Dmol reads this off a `<select>`; one structure, so one option. */
     this.objectSelect = { value: OBJECT };
@@ -89,7 +92,23 @@ export class SequenceView {
    * set unconditionally, which is what this did first, left every chain badge
    * looking unselected no matter what.
    */
+  /**
+   * The selection, in the shape the viewer expects.
+   *
+   * `chains` and `selectionMode` are what the chain badges in the track are
+   * drawn from, and they follow upstream's own rule in `applySelection`: a
+   * chain is listed if anything in it is selected, and when *everything* is
+   * selected the mode goes to "default" with an empty set.
+   *
+   * Cached, because the viewer reads `selectionModel` several times per render
+   * -- its own comment there says it does so to avoid "the expensive
+   * getSelection() copy" -- and the page redraws on every pointer move while
+   * rotating, when the selection has not changed at all. Rebuilding two sets
+   * over L + heteroatoms each time is exactly the copy that comment is trying
+   * to dodge. `invalidate()` is the one way it goes stale.
+   */
   getSelection() {
+    if (this._selection) return this._selection;
     const state = this.deps.getState();
     const s = state.structure;
     const positions = new Set();
@@ -106,21 +125,26 @@ export class SequenceView {
     // designable so the mask says nothing about them, but the viewer dims
     // anything outside this set, and a permanently greyed-out ligand token
     // would read as "excluded" rather than "not a position you can design".
-    const het = this.frame ? this.frame.chains.length - s.L : 0;
-    for (let a = 0; a < het; a++) positions.add(s.L + a);
+    for (let i = s.L; i < this.positions; i++) {
+      positions.add(i);
+      chains.add(this.frame.chains[i]);
+    }
 
-    const total = s.L + het;
-    const partial = positions.size > 0 && positions.size < total;
+    const partial = positions.size > 0 && positions.size < this.positions;
     const allChains = new Set(this.frame ? this.frame.chains : s.chainIds);
-    for (let a = 0; a < het; a++) chains.add(this.frame.chains[s.L + a]);
-    const everyChain = chains.size === allChains.size;
-    const whole = everyChain && !partial && positions.size > 0;
-    return {
+    const whole = chains.size === allChains.size && !partial && positions.size > 0;
+    this._selection = {
       positions,
       chains: whole ? new Set() : chains,
       selectionMode: whole ? "default" : "explicit",
       paeBoxes: [],
     };
+    return this._selection;
+  }
+
+  /** The cached selection is stale; the mask changed. */
+  invalidate() {
+    this._selection = null;
   }
 
   setSelection({ positions }) {
@@ -128,10 +152,16 @@ export class SequenceView {
     const s = state.structure;
     if (!s) return;
     for (let i = 0; i < s.L; i++) state.designMask[i] = positions.has(i) ? 1 : 0;
+    this.invalidate();
     this.deps.onSelectionChange();
   }
 
   get selectionModel() { return this.getSelection(); }
+
+  /** True where the position is an appended heteroatom, not a residue. */
+  _isLigand(i) {
+    return i >= this.deps.getState().structure.L;
+  }
 
   /**
    * The colour of a position, in whatever mode the 3D view is using.
@@ -142,7 +172,7 @@ export class SequenceView {
    */
   getAtomColor(i) {
     const s = this.deps.getState().structure;
-    if (s && i >= s.L) {
+    if (s && this._isLigand(i)) {
       const rgb = this.deps.ligandColour(i - s.L);
       return { r: rgb[0], g: rgb[1], b: rgb[2] };
     }
@@ -166,11 +196,15 @@ export class SequenceView {
     if (!s) {
       host.innerHTML = "";
       this.frame = null;
+      this.positions = 0;
+      this.invalidate();
       return;
     }
 
-    const het = state.showLigands ? s.ligandType.length : 0;
+    const het = this.deps.showLigands() ? s.ligandType.length : 0;
     const n = s.L + het;
+    this.positions = n;
+    this.invalidate();
     const coords = new Float32Array(n * 3);
     const chains = new Array(n);
     const names = new Array(n);
@@ -223,7 +257,7 @@ export class SequenceView {
     const s = state.structure;
     // A ligand token hover reports one of the appended positions; there is no
     // residue to highlight in 3D for it.
-    const at = s && i >= 0 && i < s.L ? i : -1;
+    const at = s && i >= 0 && !this._isLigand(i) ? i : -1;
     if (at === state.hover) return;
     state.hover = at;
     this.deps.onHoverChange();
@@ -247,6 +281,7 @@ export class SequenceView {
     for (let i = 0; i < s.L; i++) {
       if (s.chainIds[i] === chain) state.designMask[i] = on ? 1 : 0;
     }
+    this.invalidate();
     this.deps.onSelectionChange();
   }
 }

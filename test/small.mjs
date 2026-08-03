@@ -17,21 +17,14 @@
 
 import { readFileSync } from "node:fs";
 
-import { Model } from "../mpnn/model.js";
 import { NA_ALPHABET } from "../mpnn/na.js";
 import { structureFromText } from "../mpnn/pdb.js";
-import { Weights } from "../mpnn/weights.js";
-import { startKernel } from "./harness.mjs";
+import { loadModel, startKernel } from "./harness.mjs";
 
 const weightsDir = process.argv[2] ?? new URL("../weights", import.meta.url).pathname;
 await startKernel();
 
-function load(name) {
-  const buf = readFileSync(`${weightsDir}/${name}.mpnn`);
-  return new Model(Weights.fromArrayBuffer(
-    buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
-  ));
-}
+const load = (name) => loadModel(weightsDir, name, { anyDtype: true });
 
 /** 1UBQ truncated to its first `n` residues. */
 const ubq = readFileSync(new URL("../assets/1ubq.pdb", import.meta.url), "utf8");

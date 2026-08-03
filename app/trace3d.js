@@ -335,7 +335,7 @@ export function drawTraces(canvas, layers, opts = {}) {
         const A = project(at(0));
         segs.push({
           dot: true, x1: A[0], y1: A[1], z: A[2], pe: A[3], c,
-          rad: layer.tubeA ?? SS_TUBE_A,
+          tube: layer.tubeA,
         });
       }
       continue;
@@ -483,6 +483,10 @@ export function drawTraces(canvas, layers, opts = {}) {
     }
   }
 
+  // One rule for how thick a round primitive is, shared by the tube and the
+  // dot: the layer's own radius if it set one, else the default for its kind.
+  const radiusOf = (g) => g.tube ?? (g.na ? NA_TUBE_A : SS_TUBE_A);
+
   segs.sort((a2, b2) => a2.z - b2.z);
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
@@ -500,7 +504,7 @@ export function drawTraces(canvas, layers, opts = {}) {
     // darker tint so a ribbon reads as a surface rather than a flat patch.
     const dark = shade(g.c.rgb, near, weight, 0.62);
     if (g.dot) {
-      const rad = Math.max(2, (g.rad / r) * 2 * R * g.pe);
+      const rad = Math.max(2, (radiusOf(g) / r) * R * g.pe);
       ctx.beginPath();
       ctx.arc(g.x1, g.y1, rad + HALO / 2, 0, Math.PI * 2);
       ctx.fillStyle = PAPER_CSS;
@@ -560,8 +564,7 @@ export function drawTraces(canvas, layers, opts = {}) {
       ctx.stroke();
       ctx.lineCap = 'round';
     } else {
-      const tube = g.tube ?? (g.na ? NA_TUBE_A : SS_TUBE_A);
-      const lw = Math.max(1.5, (tube / r) * 2 * R * g.pe);
+      const lw = Math.max(1.5, (radiusOf(g) / r) * 2 * R * g.pe);
       ctx.beginPath();
       ctx.moveTo(g.x1, g.y1);
       ctx.lineTo(g.x2, g.y2);

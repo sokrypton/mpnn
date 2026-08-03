@@ -65,6 +65,7 @@ export class Logo {
     this.isDesigned = () => true;
     this.theme = { ink: "#e6edf7", dim: "#93a4c0", line: "#24324f", bg: "#111a2e" };
     this._ink = new Map();
+    this._rows = null;
     /** The model's alphabet, its width, and which letters get a glyph. */
     this.alphabet = ALPHABET;
     this.V = ALPHABET.length;
@@ -80,8 +81,10 @@ export class Logo {
    * 20 -- NA-MPNN's has nucleotides in it and no chemistry grouping to apply.
    */
   _pssmRows() {
+    if (this._rows) return this._rows;
     if (this.alphabet !== ALPHABET) {
-      return { rows: this.letters, breaks: new Set() };
+      this._rows = { rows: this.letters, breaks: new Set() };
+      return this._rows;
     }
     const rows = [];
     const breaks = new Set();
@@ -90,7 +93,8 @@ export class Logo {
       breaks.add(rows.length);
     }
     breaks.delete(rows.length);
-    return { rows, breaks };
+    this._rows = { rows, breaks };
+    return this._rows;
   }
 
   get totalHeight() {
@@ -108,6 +112,7 @@ export class Logo {
     this.V = alphabet.length;
     this.letters = letters;
     this._ink.clear();
+    this._rows = null;
   }
 
   /**

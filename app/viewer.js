@@ -256,6 +256,8 @@ export class Viewer {
       this._bondCache = { n, xyz: s.ligandXyz, bonds: Int32Array.from(bonds), bonded };
     }
 
+    if (this._bondCache.layers) return this._bondCache.layers;
+
     const { bonds, bonded } = this._bondCache;
     const layers = [];
     const rgbOf = (a) => ELEMENT_RGB[s.ligandElements[a]] ?? ELEMENT_FALLBACK;
@@ -295,6 +297,11 @@ export class Viewer {
         colourAt: () => ({ rgb, dim: 1 }),
       });
     }
+    // Cached with the bonds. The geometry does not change with the camera, and
+    // `draw()` runs on every pointer move while rotating -- rebuilding a layer
+    // object, a Float64Array and a closure per half-bond each time is thousands
+    // of allocations per frame on a structure like 4KT0.
+    this._bondCache.layers = layers;
     return layers;
   }
 

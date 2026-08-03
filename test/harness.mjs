@@ -28,12 +28,14 @@ export async function startKernel() {
  * as a broken port; `weights/` is the fp16 build the page ships, so parity
  * needs `convert_weights.py --dtype float32` into a scratch directory.
  */
-export function loadModel(weightsDir, name) {
+export function loadModel(weightsDir, name, { anyDtype = false } = {}) {
   const buffer = readFileSync(`${weightsDir}/${name}.mpnn`);
   const weights = Weights.fromArrayBuffer(
     buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
   );
-  if (weights.dtype !== "float32") {
+  // `anyDtype` is for tests that assert shapes and ranges rather than numbers,
+  // which the shipped float16 weights serve perfectly well.
+  if (!anyDtype && weights.dtype !== "float32") {
     console.log(`\n${weightsDir} holds ${weights.dtype} weights. `
       + "Parity needs float32 -- rerun tools/convert_weights.py --dtype float32.");
     process.exit(2);
