@@ -64,7 +64,7 @@ export class Logo {
     /** (i) => boolean */
     this.isDesigned = () => true;
     this.theme = { ink: "#e6edf7", dim: "#93a4c0", line: "#24324f", bg: "#111a2e" };
-    this._ascent = new Map();
+    this._ink = new Map();
     /** The model's alphabet, its width, and which letters get a glyph. */
     this.alphabet = ALPHABET;
     this.V = ALPHABET.length;
@@ -107,7 +107,7 @@ export class Logo {
     this.alphabet = alphabet;
     this.V = alphabet.length;
     this.letters = letters;
-    this._ascent.clear();
+    this._ink.clear();
   }
 
   /**
@@ -122,15 +122,36 @@ export class Logo {
     return GUTTER + (this.data ? this.data.L * this.columnWidth : 0) + 8;
   }
 
-  /** Cached ascent of a glyph at BASE_FONT, used to scale it to a target height. */
-  _ascentOf(letter) {
-    if (this._ascent.has(letter)) return this._ascent.get(letter);
+  /**
+   * The glyph's *ink* box at BASE_FONT: how far it actually extends from the
+   * draw point, on all four sides.
+   *
+   * Not the advance width and not the font's ascent. A logo stretches every
+   * letter to exactly fill its column, so what has to be measured is the mark
+   * on the page. Bold `W` and `Q` ink wider than a monospace advance, which
+   * spilled them into the neighbouring columns; `Q` and `J` ink below the
+   * baseline, which spilled them over the letter underneath. Scaling by the
+   * advance and positioning by the ascent got both wrong.
+   */
+  _inkOf(letter) {
+    if (this._ink.has(letter)) return this._ink.get(letter);
     const ctx = this.ctx;
     ctx.font = `700 ${BASE_FONT}px ui-monospace, Menlo, Consolas, monospace`;
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
     const m = ctx.measureText(letter);
-    const a = m.actualBoundingBoxAscent || BASE_FONT * 0.72;
-    this._ascent.set(letter, a);
-    return a;
+    // The fallbacks are for engines without the actualBoundingBox* metrics;
+    // they put the glyph roughly right rather than not at all.
+    const ink = {
+      left: m.actualBoundingBoxLeft ?? 0,
+      right: m.actualBoundingBoxRight ?? m.width,
+      ascent: m.actualBoundingBoxAscent || BASE_FONT * 0.72,
+      descent: m.actualBoundingBoxDescent || 0,
+    };
+    ink.width = ink.right + ink.left || m.width || BASE_FONT * 0.6;
+    ink.height = ink.ascent + ink.descent;
+    this._ink.set(letter, ink);
+    return ink;
   }
 
   readTheme(element) {
@@ -192,15 +213,18 @@ export class Logo {
         const h = p * height;
         if (h < 0.7) continue;
         const letter = this.alphabet[v];
+        const ink = this._inkOf(letter);
+        // Map the ink box onto the cell exactly: [x, x+columnWidth] across and
+        // [y-h, y] down. Anything less and neighbouring letters collide.
         ctx.save();
         ctx.globalAlpha = designed ? 1 : 0.4;
         ctx.fillStyle = AA_COLORS[letter] ?? "#64748b";
-        ctx.translate(x + this.columnWidth / 2, y);
-        ctx.scale(this.columnWidth / (BASE_FONT * 0.62), h / this._ascentOf(letter));
+        ctx.translate(x, y);
+        ctx.scale(this.columnWidth / ink.width, h / ink.height);
         ctx.font = `700 ${BASE_FONT}px ui-monospace, Menlo, Consolas, monospace`;
-        ctx.textAlign = "center";
+        ctx.textAlign = "left";
         ctx.textBaseline = "alphabetic";
-        ctx.fillText(letter, 0, 0);
+        ctx.fillText(letter, ink.left, -ink.descent);
         ctx.restore();
         y -= h;
       }
