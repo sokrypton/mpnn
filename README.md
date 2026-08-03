@@ -20,8 +20,11 @@ first load.
   noise levels, four LigandMPNN variants, the two membrane models, and NA-MPNN
   for RNA and protein–DNA.
 - **Choose what to design** by clicking residues in the 3D view or the sequence
-  track, shift-dragging a box, toggling whole chains, or selecting everything
-  within 6 Å of a ligand.
+  track, dragging across a run of them in the track, shift-dragging a box in 3D,
+  toggling whole chains, or selecting everything within 6 Å of a ligand. The
+  track wraps to the panel and is painted in whatever colour mode the 3D view
+  is using, so it doubles as a legend; designed residues are saturated and kept
+  ones washed out.
 - **Design** with a temperature, a batch size, per-amino-acid bias and
   omissions, tied/symmetric positions, and a seed that makes a run reproducible.
   Bias can be global or scoped to the residues you have selected.
@@ -32,14 +35,56 @@ first load.
   is the only family whose encoder reads them.
 - **Tie a homo-oligomer** with one checkbox, or tie arbitrary positions by hand.
 - **Read a position profile** as a sequence logo -- bits on the y axis, glyphs
-  stretched to their share of the column, the native residue underneath -- in
-  three flavours (see *Conditioning* below). Hovering a column highlights that
-  residue in 3D and vice versa; clicking one toggles whether it is designed.
-  The structure can also be coloured by the model's confidence.
+  stretched to their share of the column, the native residue underneath -- or as
+  a heatmap with one row per letter, in three flavours (see *Conditioning*
+  below). Hovering a column highlights that residue in 3D and vice versa;
+  clicking one toggles whether it is designed. The whole matrix downloads as
+  CSV, and the structure can be coloured by the model's confidence.
 
 Everything is plain ES modules. There is no bundler, no framework, and no
 runtime dependency — the only external resource the page ever fetches is a
 structure file, and only when you ask it to.
+
+## Two views borrowed from py2Dmol
+
+The sequence track and the profile display follow
+[py2Dmol](https://github.com/sokrypton/py2Dmol)'s, which had already solved
+both problems.
+
+**The track is a wrapped grid, not a line.** It used to be one non-wrapping row
+of DOM spans: 2916 residues meant thirty screens of sideways scrolling, and the
+whole point of a selection track is seeing the selection at once. It is now a
+canvas that wraps to the panel, breaks at chain boundaries, and numbers each row
+in the gutter. Every cell is painted in the *current colour mode* -- the same
+`colourAt(i)` the 3D view uses -- so the track is a legend for the structure
+rather than a second scheme to learn, and the selection rides on that colour's
+alpha: designed saturated, kept washed out. That is py2Dmol's mechanism and it
+works under every colour mode without reserving a hue.
+
+Dragging sweeps a run. The direction is set by the residue the drag starts on --
+start on a kept one and the sweep selects, start on a designed one and it
+deselects -- and the range is in *sequence* order, so it wraps across rows the
+way selecting text does. A box would have been the wrong shape for a wrapped
+grid.
+
+The canvas is also why it is fast. The DOM version rebuilt every span on every
+selection change, about a second per click at L = 121 before any model work;
+six clicks now take 31 ms at that size and 295 ms at L = 2916, redrawing the
+structure each time.
+
+**The profile has a heatmap as well as a logo.** Same numbers, different
+question. A logo answers "how sure is the model here" at a glance and buries
+everything below a few percent -- a glyph under a pixel tall is not drawn. The
+heatmap answers "which letters are in play across this whole run", quiet ones
+included. Rows are grouped by chemistry rather than alphabetically, so
+"something hydrophobic here" reads as one bright band, and the groups are the
+ones `AA_COLORS` already shares a hue within. On a protein--DNA complex under
+NA-MPNN the two halves of the alphabet separate cleanly, which is a quick sanity
+check on the model as much as on the structure.
+
+Under both, the native sequence is a colour-coded strip rather than plain text,
+and `CSV` writes the whole matrix out -- probabilities, bits, and which
+positions were designed -- so nobody has to reverse numbers out of pixels.
 
 ## The renderer is vendored, not reimplemented
 
@@ -93,7 +138,8 @@ app/                UI
   trace3d.js          cartoon renderer -- VENDORED from CIRPIN-web
   sec.js              C-alpha secondary structure -- VENDORED from CIRPIN-web
   viewer.js           adapter: colours, ligand discs, residue picking
-  logo.js             sequence logo on a canvas
+  logo.js             position profile: sequence logo and heatmap, on a canvas
+  seqtrack.js         the sequence as a wrapped, selectable grid
   style.css
 mpnn/               the engine, usable on its own from Node or a browser
   constants.js        generated tables (see tools/gen_constants.py)

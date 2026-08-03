@@ -281,28 +281,22 @@ details > summary {
 
 /* --- sequence track ----------------------------------------------------- */
 
-.sequence-track {
+.sequence-wrap {
   margin-top: 12px;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.35;
-  overflow-x: auto;
-  white-space: nowrap;
-  padding-bottom: 6px;
+  /* Tall enough to show a small protein whole, capped so a 20-chain complex
+     does not push everything below it off the page. */
+  max-height: 38vh;
+  overflow-y: auto;
 }
 
-.sequence-track .res {
-  display: inline-block;
-  width: 1ch;
+#sequence-track {
+  display: block;
   cursor: pointer;
-  border-bottom: 2px solid transparent;
+  /* A drag across residues must not start a text selection on the page. */
+  user-select: none;
 }
 
-.sequence-track .res.fixed { color: var(--ink-dim); }
-.sequence-track .res.designed { color: var(--ink); border-bottom-color: var(--accent); }
-.sequence-track .res.hover { background: var(--accent-2); color: #04121e; }
-.sequence-track .res.changed { color: var(--accent-2); }
-.sequence-track .chain-label { color: var(--ink-dim); padding: 0 8px; }
+.seq-hint { margin-top: 8px; }
 
 /* --- results ------------------------------------------------------------ */
 

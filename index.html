@@ -120,7 +120,11 @@
       <div id="tooltip" class="tooltip" hidden></div>
     </div>
     <div id="chain-toggles" class="chain-toggles"></div>
-    <div id="sequence-track" class="sequence-track"></div>
+    <div class="sequence-wrap">
+      <canvas id="sequence-track" hidden></canvas>
+    </div>
+    <p class="hint seq-hint">Click a residue to keep or design it; drag to sweep a run.
+      Saturated is designed, faded is kept.</p>
   </section>
 
   <!-- ------------------------------------------------------------------ -->
@@ -241,8 +245,13 @@
           <option value="all-but-self">pseudo-likelihood (1 pass)</option>
           <option value="exact">one pass per position (L passes)</option>
         </select>
+        <select id="profile-view">
+          <option value="logo">view: logo</option>
+          <option value="pssm">view: heatmap</option>
+        </select>
         <button id="logo-wider" title="wider columns">&plus;</button>
         <button id="logo-narrower" title="narrower columns">&minus;</button>
+        <button id="logo-csv" title="download the matrix as CSV">CSV</button>
       </div>
     </div>
     <p class="hint" id="profile-hint"></p>

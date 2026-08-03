@@ -206,13 +206,27 @@ absent data; what remains:
    Disable it, or fold the seed control into the advanced `<details>`.
 5. **The numbered headings imply a wizard.** "1 · Structure … 4 · Design", then
    Results, Score and Profile unnumbered. Number all or none.
-6. **Redundant text.** Every colour option repeats "colour:"; `#score-hint`
-   reprints a full mode description plus paste instructions on every change.
+6. **Redundant text.** Every colour option repeats "colour:" and every profile
+   view repeats "view:" — the second was added knowingly, to match the first
+   rather than leave one bare dropdown next to one labelled one, so fix them
+   together. `#score-hint` reprints a full mode description plus paste
+   instructions on every change.
 7. **Stale examples.** 1UBQ, 1STP, 4KT0, 1BL8 — none nucleic, though 4OQU is
    already in `assets/`. 4KT0 and 1BL8 only make sense with particular models.
 
 Biggest win for least risk: 1–3 together, since they are one idea (a single
 status/progress area instead of five scattered ones).
+
+The sequence track and the profile display were reworked after py2Dmol's; the
+README has what changed and why. Two things left in that area:
+
+- **A drag does not auto-scroll the track.** `.sequence-wrap` caps at 38vh, so
+  sweeping a selection past the visible rows on a large complex means scrolling
+  first. Everything else about the drag wraps across rows correctly.
+- **The heatmap has no scale.** Cell alpha is `sqrt(p)` and nothing says so, so
+  it reads as ordering rather than magnitude. A short legend, or numbers in the
+  tooltip, would fix it — the tooltip already reports the top few letters with
+  percentages, so the information is one step away.
 
 ### 4.1 Rendering
 

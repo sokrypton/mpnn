@@ -7,6 +7,7 @@ import {
 import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
 import { Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
 import { AA_COLORS, Logo } from "./logo.js";
+import { SequenceTrack } from "./seqtrack.js";
 
 const WEIGHTS_BASE = new URL("../weights", import.meta.url).href;
 
@@ -159,6 +160,7 @@ const ENCODE_DEBOUNCE_MS = 350;
 
 const viewer = new Viewer($("viewer"));
 const logo = new Logo($("logo"));
+const track = new SequenceTrack($("sequence-track"));
 
 const CHAIN_COLORS = [
   "#38bdf8", "#f472b6", "#4ade80", "#fbbf24", "#a78bfa",
@@ -622,45 +624,111 @@ function redraw() {
     logo.hover = state.hover;
     logo.draw();
   }
+  drawTrack();
 }
 
 function renderSequenceTrack() {
-  const track = $("sequence-track");
-  track.innerHTML = "";
   const s = state.structure;
+  const canvas = $("sequence-track");
+  canvas.hidden = !s;
   if (!s) return;
   const seq = activeSequence();
-  let lastChain = null;
+  track.setData({
+    L: s.L,
+    chainIds: s.chainIds,
+    resSeq: s.resSeq,
+    letterAt: (i) => displayLetter(i, seq ? seq[i] : s.S[i]),
+    isDesigned: (i) => state.designMask[i] > 0,
+    isChanged: (i) => Boolean(seq) && seq[i] !== s.S[i],
+    colourAt: colourFor,
+  });
+  drawTrack();
+}
 
-  for (let i = 0; i < s.L; i++) {
-    if (s.chainIds[i] !== lastChain) {
-      const label = document.createElement("span");
-      label.className = "chain-label";
-      label.textContent = `${lastChain === null ? "" : " "}${s.chainIds[i]}:`;
-      track.appendChild(label);
-      lastChain = s.chainIds[i];
-    }
-    const span = document.createElement("span");
-    span.className = "res " + (state.designMask[i] ? "designed" : "fixed");
-    if (seq && seq[i] !== s.S[i]) span.classList.add("changed");
-    span.textContent = displayLetter(i, seq ? seq[i] : s.S[i]);
-    span.dataset.i = i;
-    span.title = `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}`;
-    track.appendChild(span);
-  }
+function drawTrack() {
+  if (!state.structure) return;
+  track.readTheme(document.body);
+  track.hover = state.hover;
+  track.draw($("sequence-track").parentElement.clientWidth);
+}
 
-  track.onclick = (event) => {
-    const i = event.target?.dataset?.i;
-    if (i === undefined) return;
-    state.designMask[+i] = state.designMask[+i] ? 0 : 1;
-    refreshSelection();
+/**
+ * Click to toggle one residue, drag to sweep a run of them.
+ *
+ * The drag's direction is decided by the residue it starts on -- start on a
+ * fixed one and the sweep selects, start on a designed one and it deselects --
+ * so one gesture does both and there is nothing to hold down. The range is in
+ * *sequence* order, not screen order, so it wraps across rows the way selecting
+ * text does; a box would have been the wrong shape for a wrapped grid.
+ *
+ * Every move recomputes from the mask as it was at mousedown rather than
+ * accumulating, which is what lets a drag shrink again when you pull back.
+ */
+function bindTrack() {
+  const canvas = $("sequence-track");
+  let anchor = -1;
+  let want = 1;
+  let base = null;
+
+  const at = (event) => {
+    const r = canvas.getBoundingClientRect();
+    return { x: event.clientX - r.left, y: event.clientY - r.top };
   };
-  track.onmousemove = (event) => {
-    const i = event.target?.dataset?.i;
-    state.hover = i === undefined ? -1 : +i;
+
+  const applyTo = (i) => {
+    const lo = Math.min(anchor, i);
+    const hi = Math.max(anchor, i);
+    state.designMask.set(base);
+    for (let k = lo; k <= hi; k++) state.designMask[k] = want;
+  };
+
+  canvas.onmousedown = (event) => {
+    if (!state.structure || event.button !== 0) return;
+    const { x, y } = at(event);
+    const i = track.pick(x, y);
+    if (i < 0) return;
+    event.preventDefault();
+    anchor = i;
+    want = state.designMask[i] > 0 ? 0 : 1;
+    base = state.designMask.slice();
+    applyTo(i);
     redraw();
+
+    const onMove = (moveEvent) => {
+      const p = at(moveEvent);
+      const j = track.nearest(p.x, p.y);
+      if (j < 0) return;
+      state.hover = j;
+      applyTo(j);
+      redraw();
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      anchor = -1;
+      base = null;
+      // One refresh at the end, not one per pointer sample: this is what feeds
+      // the encoder when side-chain context is on.
+      refreshSelection();
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   };
-  track.onmouseleave = () => {
+
+  canvas.onmousemove = (event) => {
+    if (anchor >= 0 || !state.structure) return;
+    const { x, y } = at(event);
+    const i = track.pick(x, y);
+    if (i === state.hover) return;
+    state.hover = i;
+    redraw();
+    const s = state.structure;
+    canvas.title = i < 0 ? ""
+      : `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}`;
+  };
+
+  canvas.onmouseleave = () => {
+    if (anchor >= 0) return;
     state.hover = -1;
     redraw();
   };
@@ -1457,7 +1525,10 @@ canvas.addEventListener("pointerleave", () => {
   redraw();
 });
 
-window.addEventListener("resize", redraw);
+window.addEventListener("resize", () => {
+  redraw();
+  drawTrack();
+});
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", redraw);
 
 // --- logo interaction ------------------------------------------------------
@@ -1496,6 +1567,21 @@ logoCanvas.addEventListener("click", (event) => {
   refreshSelection();
 });
 
+$("profile-view").onchange = (event) => {
+  logo.mode = event.target.value;
+  renderLogo();
+};
+
+$("logo-csv").onclick = () => {
+  if (!state.profile) return;
+  const blob = new Blob([logo.toCsv()], { type: "text/csv" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${state.structureLabel || "profile"}-profile.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+
 $("logo-wider").onclick = () => {
   logo.columnWidth = Math.min(logo.columnWidth + 4, 48);
   renderLogo();
@@ -1507,6 +1593,7 @@ $("logo-narrower").onclick = () => {
 
 // --- boot -----------------------------------------------------------------
 
+bindTrack();
 renderBiasGrid();
 loadModelList().then(() => {
   const params = new URLSearchParams(location.search);

@@ -33,8 +33,26 @@ const GUTTER = 38;      // y-axis
 const LOGO_H = 118;
 const NATIVE_H = 18;
 const RULER_H = 16;
-const TOTAL_H = LOGO_H + NATIVE_H + RULER_H;
 const BASE_FONT = 100;  // glyphs are measured at this size then scaled
+const PSSM_ROW_H = 13;
+
+/**
+ * Row order for the heatmap, grouped by chemistry.
+ *
+ * Alphabetical order would scatter the answer: the interesting thing about a
+ * position is usually "the model wants something hydrophobic here", and that
+ * reads off a grouped axis as one bright band. The groups are the ones
+ * `AA_COLORS` already shares a hue within, so the letters down the side band
+ * together as well.
+ */
+const PSSM_GROUPS = [
+  ["A", "V", "L", "I", "M"],
+  ["F", "W", "Y"],
+  ["S", "T", "N", "Q"],
+  ["D", "E"],
+  ["K", "R", "H"],
+  ["C", "G", "P"],
+];
 
 export class Logo {
   constructor(canvas) {
@@ -51,6 +69,33 @@ export class Logo {
     this.alphabet = ALPHABET;
     this.V = ALPHABET.length;
     this.letters = [...Array(20).keys()];
+    /** "logo" or "pssm". */
+    this.mode = "logo";
+  }
+
+  /**
+   * The rows of the heatmap: letter indices, plus where to rule a line.
+   *
+   * Falls back to whatever `letters` holds when the alphabet is not the usual
+   * 20 -- NA-MPNN's has nucleotides in it and no chemistry grouping to apply.
+   */
+  _pssmRows() {
+    if (this.alphabet !== ALPHABET) {
+      return { rows: this.letters, breaks: new Set() };
+    }
+    const rows = [];
+    const breaks = new Set();
+    for (const group of PSSM_GROUPS) {
+      for (const letter of group) rows.push(this.alphabet.indexOf(letter));
+      breaks.add(rows.length);
+    }
+    breaks.delete(rows.length);
+    return { rows, breaks };
+  }
+
+  get totalHeight() {
+    if (this.mode !== "pssm") return LOGO_H + NATIVE_H + RULER_H;
+    return this._pssmRows().rows.length * PSSM_ROW_H + NATIVE_H + RULER_H;
   }
 
   /**
@@ -103,14 +148,23 @@ export class Logo {
     if (!d) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const w = this.width;
+    const total = this.totalHeight;
     this.canvas.style.width = `${w}px`;
-    this.canvas.style.height = `${TOTAL_H}px`;
+    this.canvas.style.height = `${total}px`;
     this.canvas.width = w * dpr;
-    this.canvas.height = TOTAL_H * dpr;
+    this.canvas.height = total * dpr;
     const ctx = this.ctx;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, TOTAL_H);
+    ctx.clearRect(0, 0, w, total);
 
+    const bodyH = total - NATIVE_H - RULER_H;
+    if (this.mode === "pssm") this._drawPssm(ctx, w, bodyH);
+    else this._drawLogo(ctx, w);
+    this._drawFooter(ctx, bodyH);
+  }
+
+  _drawLogo(ctx, w) {
+    const d = this.data;
     this._drawAxis(ctx, w);
 
     for (let i = 0; i < d.L; i++) {
@@ -119,7 +173,7 @@ export class Logo {
 
       if (i === this.hover) {
         ctx.fillStyle = this.theme.line;
-        ctx.fillRect(x, 0, this.columnWidth, TOTAL_H);
+        ctx.fillRect(x, 0, this.columnWidth, LOGO_H);
       }
 
       // Information content: the column's total height.
@@ -150,27 +204,103 @@ export class Logo {
         ctx.restore();
         y -= h;
       }
+    }
+  }
 
-      // Native residue.
-      ctx.font = "11px ui-monospace, Menlo, Consolas, monospace";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillStyle = designed ? this.theme.ink : this.theme.dim;
-      ctx.fillText(this.alphabet[d.native[i]] ?? "X",
-        x + this.columnWidth / 2, LOGO_H + NATIVE_H / 2);
+  /**
+   * The same distribution as a heatmap: one row per letter, one column per
+   * position, cell brightness the probability.
+   *
+   * The logo answers "how sure is the model here" at a glance and buries
+   * everything below a few percent -- a glyph under about a pixel is not drawn
+   * at all. The heatmap answers the other question: which letters are in play
+   * across a whole run of positions, including the quiet ones. Same numbers,
+   * and the mode switch is the cheapest way to have both.
+   */
+  _drawPssm(ctx, w, bodyH) {
+    const d = this.data;
+    const { rows, breaks } = this._pssmRows();
+    const h = PSSM_ROW_H;
+
+    ctx.fillStyle = this.theme.bg;
+    ctx.fillRect(GUTTER, 0, w - GUTTER, bodyH);
+
+    ctx.font = "10px ui-monospace, Menlo, Consolas, monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    rows.forEach((v, r) => {
+      const letter = this.alphabet[v];
+      ctx.fillStyle = AA_COLORS[letter] ?? "#64748b";
+      ctx.fillRect(GUTTER - 14, r * h, 12, h - 1);
+      ctx.fillStyle = "#04121e";
+      ctx.fillText(letter, GUTTER - 8, r * h + h / 2);
+    });
+
+    for (let i = 0; i < d.L; i++) {
+      const x = GUTTER + i * this.columnWidth;
+      const designed = this.isDesigned(i);
+      rows.forEach((v, r) => {
+        const p = d.probs[i * this.V + v];
+        if (p > 0.004) {
+          // sqrt, because the interesting range is the bottom of it: a 4%
+          // alternative is worth seeing and would be invisible on a linear ramp.
+          ctx.globalAlpha = (designed ? 1 : 0.45) * Math.min(1, Math.sqrt(p));
+          ctx.fillStyle = AA_COLORS[this.alphabet[v]] ?? "#64748b";
+          ctx.fillRect(x, r * h, this.columnWidth, h - 1);
+          ctx.globalAlpha = 1;
+        }
+      });
+      if (i === this.hover) {
+        ctx.strokeStyle = this.theme.ink;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 0.5, 0.5, this.columnWidth - 1, bodyH - 1);
+      }
+    }
+
+    ctx.strokeStyle = this.theme.line;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (const r of breaks) {
+      ctx.moveTo(GUTTER - 14, r * h - 0.5);
+      ctx.lineTo(w, r * h - 0.5);
+    }
+    ctx.stroke();
+  }
+
+  /** The native sequence and the residue-number ruler, under either view. */
+  _drawFooter(ctx, bodyH) {
+    const d = this.data;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i < d.L; i++) {
+      const x = GUTTER + i * this.columnWidth;
+      const designed = this.isDesigned(i);
+      const letter = this.alphabet[d.native[i]] ?? "X";
+
+      // Coloured like the logo's glyphs, so the eye can match a column to the
+      // residue that is actually there without reading the letter.
+      ctx.globalAlpha = designed ? 1 : 0.35;
+      ctx.fillStyle = AA_COLORS[letter] ?? "#64748b";
+      ctx.fillRect(x, bodyH + 1, Math.max(1, this.columnWidth - 1), NATIVE_H - 4);
+      ctx.globalAlpha = 1;
+
+      if (this.columnWidth >= 8) {
+        ctx.font = "11px ui-monospace, Menlo, Consolas, monospace";
+        ctx.fillStyle = designed ? "#04121e" : this.theme.dim;
+        ctx.fillText(letter, x + this.columnWidth / 2, bodyH + NATIVE_H / 2);
+      }
 
       // A tick under every position the design is allowed to change.
       if (designed) {
         ctx.fillStyle = "#38bdf8";
-        ctx.fillRect(x + 1, LOGO_H + NATIVE_H - 2, this.columnWidth - 2, 2);
+        ctx.fillRect(x + 1, bodyH + NATIVE_H - 2, this.columnWidth - 2, 2);
       }
 
       if (i % 10 === 0 || i === d.L - 1) {
         ctx.fillStyle = this.theme.dim;
         ctx.font = "9px ui-monospace, Menlo, Consolas, monospace";
-        ctx.fillText(
-          String(d.resSeq[i]), x + this.columnWidth / 2, LOGO_H + NATIVE_H + RULER_H / 2,
-        );
+        ctx.fillText(String(d.resSeq[i]),
+          x + this.columnWidth / 2, bodyH + NATIVE_H + RULER_H / 2);
       }
     }
   }
@@ -211,6 +341,33 @@ export class Logo {
     if (!this.data) return -1;
     const i = Math.floor((x - GUTTER) / this.columnWidth);
     return i >= 0 && i < this.data.L ? i : -1;
+  }
+
+  /**
+   * The whole matrix as CSV: one row per position, one column per letter.
+   *
+   * The heatmap is for reading; this is for everything else people do with a
+   * profile -- a logo of their own, a threshold, a comparison against another
+   * run. Writing the probabilities out means nobody has to reverse them out of
+   * pixel values.
+   */
+  toCsv() {
+    const d = this.data;
+    if (!d) return "";
+    const letters = this.mode === "pssm" ? this._pssmRows().rows : this.letters;
+    const lines = [
+      ["chain", "resSeq", "native", "designed", "bits",
+        ...letters.map((v) => this.alphabet[v])].join(","),
+    ];
+    for (let i = 0; i < d.L; i++) {
+      const bits = Math.max(0, MAX_BITS - d.entropy[i] / Math.LN2);
+      lines.push([
+        d.chainIds[i], d.resSeq[i], this.alphabet[d.native[i]] ?? "X",
+        this.isDesigned(i) ? 1 : 0, bits.toFixed(4),
+        ...letters.map((v) => d.probs[i * this.V + v].toFixed(6)),
+      ].join(","));
+    }
+    return `${lines.join("\n")}\n`;
   }
 
   /** Text summary of a position, for a tooltip. */
