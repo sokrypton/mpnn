@@ -50,6 +50,11 @@ const ELEMENT_RGB = {
 };
 const ELEMENT_FALLBACK = [192, 132, 252];
 
+/** The colour this element is drawn in, for anything that has to agree. */
+export function elementRgb(element) {
+  return ELEMENT_RGB[element] ?? ELEMENT_FALLBACK;
+}
+
 export class Viewer {
   constructor(canvas) {
     this.canvas = canvas;

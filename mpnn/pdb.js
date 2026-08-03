@@ -434,6 +434,11 @@ export function structureFromText(text, opts = {}) {
     ligandNames: ligandAtoms.map((a) => a.name),
     ligandElements: ligandAtoms.map((a) => a.element),
     ligandResidues: ligandAtoms.map((a) => `${a.resName} ${a.chain}${a.resSeq}`),
+    // The same three fields unpacked, because grouping atoms into ligands wants
+    // them separately rather than as one label to parse back apart.
+    ligandChains: ligandAtoms.map((a) => a.chain),
+    ligandResSeq: ligandAtoms.map((a) => a.resSeq),
+    ligandResNames: ligandAtoms.map((a) => a.resName),
     sequence: nucleicAsResidues
       ? naDisplaySequence(S, isRNA)
       : [...S].map((v) => "ACDEFGHIKLMNPQRSTVWYX"[v]).join(""),

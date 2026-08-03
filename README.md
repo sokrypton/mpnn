@@ -67,6 +67,28 @@ deselects -- and the range is in *sequence* order, so it wraps across rows the
 way selecting text does. A box would have been the wrong shape for a wrapped
 grid.
 
+**A chain is not a contiguous run of model positions**, and the track says so,
+because the layout is a list of display *items* rather than a range of indices
+-- again py2Dmol's shape.
+
+- **Gaps.** A residue the file numbers but does not contain gets a dash. The
+  model does not see a hole: the k-nearest graph simply joins the two sides, so
+  two positions that look adjacent may be 30 Å apart. Drawing the missing
+  residues puts the track on *residue numbering*, which is the numbering people
+  talk in. 4KT0's chain K has a 20-residue break in the middle that the old
+  single-line track hid completely.
+- **Ligands.** One token per heteroatom residue rather than one cell per atom,
+  on its own `lig <chain>` row, labelled with the PDB chemical id and coloured
+  by the group's commonest *hetero* element -- so an Fe-S cluster is orange and
+  a chloride green rather than everything looking like carbon. 4KT0 comes back
+  as rows of CLA, BCR, PQN, SF4. Clicking one selects the residues within 6 Å
+  of *that* ligand, which is the "Near ligand" button narrowed to one of them.
+  Only shown for LigandMPNN, the only family whose encoder reads heteroatoms;
+  a token for something the model cannot see would misrepresent the input.
+
+The grouping itself is **vendored** in `app/ligandgroups.js`, not rewritten --
+see below.
+
 The canvas is also why it is fast. The DOM version rebuilt every span on every
 selection change, about a second per click at L = 121 before any model work;
 six clicks now take 31 ms at that size and 295 ms at L = 2916, redrawing the
@@ -85,6 +107,29 @@ check on the model as much as on the structure.
 Under both, the native sequence is a colour-coded strip rather than plain text,
 and `CSV` writes the whole matrix out -- probabilities, bits, and which
 positions were designed -- so nobody has to reverse numbers out of pixels.
+
+### What is vendored and what is not
+
+`app/ligandgroups.js` is copied verbatim from py2Dmol's `web/utils.js` (two
+functions, byte-identical apart from `export`). It is a pure function over four
+parallel arrays, and its value is not the mechanics but the *priority order*:
+name + number, then number, then a fallback that lumps a chain's heteroatoms
+together when the file numbers them 1, 2, 3... or calls them all UNK. That last
+branch is the one a paraphrase drops and the file you meet in the wild needs.
+
+`viewer-seq.js` itself is **not** vendored, and that is a considered call rather
+than a preference for writing code. Unlike `trace3d.js` -- coordinates and
+colours in, pixels out -- it is not a drawing function: 2257 lines that reach
+into sixteen properties of py2Dmol's renderer across eighty-five references
+(`visibilityMask`, `selectionModel`, `positionScreenPositions`, `coords`,
+`objectsData[name].frames`, `currentFrame`, `getAtomColor`, ...), take
+thirty-eight host callbacks, draw a highlight overlay onto the *molecular*
+canvas, and own their own virtual scrolling. Vendoring it means supplying
+py2Dmol's object/frame model, its screen-projection cache and its selection
+model from this page's typed arrays and design mask -- an adapter larger and
+more brittle than the 290-line track, for a viewer whose selection means
+"selected" where this one means "designed, and the encoder reads it". So: the
+pure part is copied, the coupled part is borrowed as design.
 
 ## The renderer is vendored, not reimplemented
 
@@ -140,6 +185,7 @@ app/                UI
   viewer.js           adapter: colours, ligand discs, residue picking
   logo.js             position profile: sequence logo and heatmap, on a canvas
   seqtrack.js         the sequence as a wrapped, selectable grid
+  ligandgroups.js     heteroatoms -> ligands -- VENDORED from py2Dmol
   style.css
 mpnn/               the engine, usable on its own from Node or a browser
   constants.js        generated tables (see tools/gen_constants.py)

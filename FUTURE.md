@@ -223,6 +223,14 @@ README has what changed and why. Two things left in that area:
 - **A drag does not auto-scroll the track.** `.sequence-wrap` caps at 38vh, so
   sweeping a selection past the visible rows on a large complex means scrolling
   first. Everything else about the drag wraps across rows correctly.
+- **The polymer-type spacer is untested.** The track inserts a blank cell where
+  `polytype` changes inside one chain with no numbering gap. No structure to
+  hand does that — 3HDD keeps its protein and DNA in separate chains — so the
+  branch is written and only reasoned through.
+- **Gap dashes are uncapped.** One cell per missing residue, as py2Dmol does.
+  Fine for a disordered loop and fine for 4KT0's 20-residue break; a file whose
+  chain jumps from residue 100 to 5000 would draw 4900 dashes. Nothing in the
+  PDB does that, so this is a note, not a fix waiting to happen.
 - **The heatmap has no scale.** Cell alpha is `sqrt(p)` and nothing says so, so
   it reads as ordering rather than magnitude. A short legend, or numbers in the
   tooltip, would fix it — the tooltip already reports the top few letters with

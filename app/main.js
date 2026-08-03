@@ -5,8 +5,9 @@ import {
   naDisplaySequence, NA_ALPHABET, NA_DNA_TO_RNA, NA_NUCLEOTIDES, NA_RNA_TO_DNA, POLYTYPE,
 } from "../mpnn/na.js";
 import { fetchPDB, structureFromText } from "../mpnn/pdb.js";
-import { Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
+import { elementRgb, Viewer, hexToRgb, orbit, spectrumRgb } from "./viewer.js";
 import { AA_COLORS, Logo } from "./logo.js";
+import { groupLigandAtoms } from "./ligandgroups.js";
 import { SequenceTrack } from "./seqtrack.js";
 
 const WEIGHTS_BASE = new URL("../weights", import.meta.url).href;
@@ -72,6 +73,8 @@ const state = {
   biasOverrides: new Map(),
   omitOverrides: new Map(),
   designs: [],
+  /** Heteroatoms grouped per residue, for the track's ligand tokens. */
+  ligands: [],
   activeDesign: -1,
   profile: null,
   scorePerPosition: null,
@@ -528,16 +531,23 @@ function refreshSelection() {
   }
 }
 
-/** Residues with any backbone atom within `cutoff` of a heteroatom. */
-function nearLigand(cutoff = 6.0) {
+/**
+ * Residues with any backbone atom within `cutoff` of a heteroatom.
+ *
+ * `atoms` narrows it to one ligand -- what clicking a token in the track does.
+ * Omitted, it is every heteroatom in the structure, which is the toolbar
+ * button.
+ */
+function nearLigand(cutoff = 6.0, atoms = null) {
   const s = state.structure;
   const hits = new Set();
   if (!s || !s.ligandType.length) return hits;
+  const pool = atoms ?? Array.from({ length: s.ligandType.length }, (_, a) => a);
   for (let i = 0; i < s.L; i++) {
     const cx = s.X[i * 12 + 3];
     const cy = s.X[i * 12 + 4];
     const cz = s.X[i * 12 + 5];
-    for (let a = 0; a < s.ligandType.length; a++) {
+    for (const a of pool) {
       const dx = cx - s.ligandXyz[a * 3];
       const dy = cy - s.ligandXyz[a * 3 + 1];
       const dz = cz - s.ligandXyz[a * 3 + 2];
@@ -627,12 +637,64 @@ function redraw() {
   drawTrack();
 }
 
+/**
+ * Heteroatoms grouped into the residues they came from.
+ *
+ * The grouping itself is py2Dmol's, vendored in `ligandgroups.js` rather than
+ * paraphrased -- it carries a fallback for files whose heteroatoms are numbered
+ * 1, 2, 3... or all called UNK, which is the case a rewrite would have missed.
+ * All this does is present the parser's arrays in the shape it wants and put a
+ * colour and a count on each group.
+ *
+ * The token is coloured by the group's commonest *hetero* element, so a haem
+ * reads as iron-orange and a sulfate as sulfur-yellow rather than every ligand
+ * looking like carbon.
+ *
+ * Empty unless the selected model actually reads heteroatoms -- the viewer
+ * already only draws them for LigandMPNN, and a token for something the model
+ * cannot see would be a lie about what is in the calculation.
+ */
+function ligandGroups() {
+  const s = state.structure;
+  const type = $("model-select").selectedOptions[0]?.dataset.type;
+  if (!s || type !== "ligand_mpnn" || !s.ligandType.length) return [];
+  const groups = groupLigandAtoms(
+    s.ligandChains,
+    s.ligandChains.map(() => "L"),
+    s.ligandResSeq,
+    s.ligandResNames,
+  );
+  return [...groups.entries()].map(([key, atoms]) => {
+    const counts = new Map();
+    for (const a of atoms) {
+      const element = s.ligandElements[a];
+      counts.set(element, (counts.get(element) ?? 0) + 1);
+    }
+    // Carbon is the commonest element in most organics and says nothing.
+    const element = [...counts.entries()]
+      .filter(([e]) => e !== "C")
+      .sort((a, b) => b[1] - a[1])[0]?.[0] ?? "C";
+    const name = s.ligandResNames[atoms[0]] ?? "LIG";
+    const chain = s.ligandChains[atoms[0]] ?? "?";
+    return {
+      key,
+      atoms,
+      name,
+      chain,
+      label: `${name} ${chain}${s.ligandResSeq[atoms[0]] ?? ""}`,
+      count: atoms.length,
+      rgb: elementRgb(element),
+    };
+  });
+}
+
 function renderSequenceTrack() {
   const s = state.structure;
   const canvas = $("sequence-track");
   canvas.hidden = !s;
   if (!s) return;
   const seq = activeSequence();
+  state.ligands = ligandGroups();
   track.setData({
     L: s.L,
     chainIds: s.chainIds,
@@ -641,6 +703,8 @@ function renderSequenceTrack() {
     isDesigned: (i) => state.designMask[i] > 0,
     isChanged: (i) => Boolean(seq) && seq[i] !== s.S[i],
     colourAt: colourFor,
+    polytypeAt: s.polytype ? (i) => s.polytype[i] : null,
+    ligands: state.ligands,
   });
   drawTrack();
 }
@@ -685,9 +749,30 @@ function bindTrack() {
   canvas.onmousedown = (event) => {
     if (!state.structure || event.button !== 0) return;
     const { x, y } = at(event);
-    const i = track.pick(x, y);
-    if (i < 0) return;
+    const item = track.pick(x, y);
+    if (item === null) return;
     event.preventDefault();
+
+    // A ligand token is not a designable position, so clicking one cannot
+    // toggle it. It selects the residues that see it instead -- the "Near
+    // ligand" button, narrowed to this one ligand, which is the thing you
+    // actually want on a structure with a cofactor and a substrate.
+    if (item.kind === "ligand") {
+      const lig = state.ligands[item.g];
+      const hits = nearLigand(6.0, lig.atoms);
+      if (!hits.size) {
+        setStatus("load-status", `Nothing within 6 Å of ${lig.label}.`, "error");
+        return;
+      }
+      state.designMask.fill(0);
+      for (const k of hits) state.designMask[k] = 1;
+      setStatus("load-status", `${hits.size} residues within 6 Å of ${lig.label}.`);
+      refreshSelection();
+      return;
+    }
+    if (item.kind !== "res") return;
+
+    const i = item.i;
     anchor = i;
     want = state.designMask[i] > 0 ? 0 : 1;
     base = state.designMask.slice();
@@ -718,18 +803,29 @@ function bindTrack() {
   canvas.onmousemove = (event) => {
     if (anchor >= 0 || !state.structure) return;
     const { x, y } = at(event);
-    const i = track.pick(x, y);
-    if (i === state.hover) return;
+    const item = track.pick(x, y);
+    const i = item !== null && item.kind === "res" ? item.i : -1;
+    const g = item !== null && item.kind === "ligand" ? item.g : -1;
+    if (i === state.hover && g === track.hoverLigand) return;
     state.hover = i;
+    track.hoverLigand = g;
     redraw();
+
     const s = state.structure;
-    canvas.title = i < 0 ? ""
-      : `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}`;
+    canvas.title = item === null ? ""
+      : item.kind === "res"
+        ? `${s.resNames[i]} ${s.chainIds[i]}${s.resSeq[i]}${s.iCodes[i]}`
+        : item.kind === "gap"
+          ? `${item.chain}${item.resSeq} — not in the structure; `
+            + "the neighbour graph joins across the hole"
+          : `${state.ligands[g].label} — ${state.ligands[g].count} atoms; `
+            + "click to select what is within 6 Å";
   };
 
   canvas.onmouseleave = () => {
     if (anchor >= 0) return;
     state.hover = -1;
+    track.hoverLigand = -1;
     redraw();
   };
 }
@@ -1299,6 +1395,9 @@ $("model-select").onchange = async () => {
     await loadStructureText(state.structureText, state.structureLabel);
     return;
   }
+  // Which heteroatoms the track shows depends on the family, so the item list
+  // has to be rebuilt and not merely redrawn.
+  renderSequenceTrack();
   ensureEncoded();
 };
 
