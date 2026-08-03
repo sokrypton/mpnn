@@ -214,6 +214,7 @@ function updateModelHint() {
   if (state.structure) redraw();
   $("atom-context-row").hidden = type !== "ligand_mpnn";
   $("side-chain-row").hidden = type !== "ligand_mpnn";
+  refreshAffordances();
   $("membrane-global-row").hidden = type !== "global_label_membrane_mpnn";
   $("membrane-perres-row").hidden = type !== "per_residue_label_membrane_mpnn";
 }
@@ -267,6 +268,7 @@ async function loadStructureText(text, label) {
   renderChainToggles();
   renderSequenceTrack();
   renderResults();
+  refreshAffordances();
   redraw();
 
   const ligand = structure.ligandType.length;
@@ -426,6 +428,41 @@ function renderChainToggles() {
       refreshSelection();
     };
     wrap.appendChild(button);
+  }
+}
+
+/**
+ * Show only the controls that can currently do something.
+ *
+ * Three colour modes read data that may not exist yet, "Near ligand" needs
+ * heteroatoms, chain tying needs chains, and the results panel is an empty box
+ * until a design run fills it. Leaving them all visible made the page look far
+ * busier than the number of decisions actually on offer, and picking an inert
+ * one did nothing with no explanation.
+ */
+function refreshAffordances() {
+  const s = state.structure;
+  const type = $("model-select").selectedOptions[0]?.dataset.type;
+  const show = (sel, on) => {
+    const el = typeof sel === "string" ? $(sel) : sel;
+    if (el) el.hidden = !on;
+  };
+  const option = (value) => $("color-mode").querySelector(`option[value="${value}"]`);
+
+  show(option("confidence"), Boolean(state.profile));
+  show(option("score"), Boolean(state.scorePerPosition));
+  show(option("membrane"), type === "per_residue_label_membrane_mpnn"
+    || type === "global_label_membrane_mpnn");
+  show("select-interface", Boolean(s?.ligandType.length) && type === "ligand_mpnn");
+  show("homo-oligomer-row", (s?.chainList.length ?? 0) > 1);
+  show("results-panel", state.designs.length > 0);
+
+  // A hidden option stays selected if it was already chosen, which would leave
+  // the viewer painting from data that is gone.
+  const mode = $("color-mode");
+  if (mode.selectedOptions[0]?.hidden) {
+    mode.value = s && s.chainList.length > 1 ? "chain" : "rainbow";
+    redraw();
   }
 }
 
@@ -923,6 +960,7 @@ async function runDesign() {
     }
     state.designs.sort((a, b) => a.score - b.score);
     renderResults();
+    refreshAffordances();
     setStatus(
       "design-status",
       `${result.S.length} sequences in ${(result.ms / 1000).toFixed(2)} s `
@@ -972,6 +1010,7 @@ async function runProfile() {
     }
     state.profile = { probs, entropy };
     $("profile-panel").hidden = false;
+    refreshAffordances();
     $("profile-hint").textContent = MODE_TEXT[mode] ?? "";
     renderLogo();
     redraw();
@@ -1039,6 +1078,7 @@ async function runScore() {
       seed: 0,
     });
     state.scorePerPosition = new Float32Array(result.perPosition);
+    refreshAffordances();
     const native = state.structure.S;
     let same = 0;
     for (let i = 0; i < S.length; i++) if (S[i] === native[i]) same++;

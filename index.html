@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LigandMPNN in the browser</title>
-<meta name="description" content="ProteinMPNN, SolubleMPNN, LigandMPNN and MembraneMPNN running entirely client side. Nothing is uploaded.">
+<meta name="description" content="ProteinMPNN, SolubleMPNN, LigandMPNN, MembraneMPNN and NA-MPNN running entirely client side. Nothing is uploaded.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>🧬</text></svg>">
 <link rel="stylesheet" href="app/style.css">
 </head>
@@ -13,8 +13,8 @@
 <header>
   <h1>mpnn<span class="dot">.</span>web</h1>
   <p class="tagline">
-    ProteinMPNN &middot; SolubleMPNN &middot; LigandMPNN &middot; MembraneMPNN,
-    running in this tab. Nothing is uploaded &mdash; the weights come down once and
+    ProteinMPNN &middot; SolubleMPNN &middot; LigandMPNN &middot; MembraneMPNN &middot;
+    NA-MPNN, running in this tab. Nothing is uploaded &mdash; the weights come down once and
     every forward pass happens on your machine.
   </p>
 </header>
@@ -102,16 +102,16 @@
         <select id="color-mode">
           <option value="chain">colour: chain</option>
           <option value="design">colour: designed / fixed</option>
-          <option value="confidence">colour: model confidence</option>
+          <option value="confidence" hidden>colour: model confidence</option>
           <option value="identity">colour: identity to input</option>
           <option value="rainbow">colour: N → C</option>
-          <option value="membrane">colour: membrane label</option>
-          <option value="score">colour: per-position score</option>
+          <option value="membrane" hidden>colour: membrane label</option>
+          <option value="score" hidden>colour: per-position score</option>
         </select>
         <button id="select-all">All</button>
         <button id="select-none">None</button>
         <button id="select-invert">Invert</button>
-        <button id="select-interface">Near ligand</button>
+        <button id="select-interface" hidden>Near ligand</button>
       </div>
     </div>
     <div class="viewer-wrap">
@@ -167,13 +167,15 @@
 
     <details class="control">
       <summary>Symmetry / tied positions</summary>
-      <div class="row">
-        <label class="check">
-          <input type="checkbox" id="homo-oligomer">
-          Homo-oligomer: tie every chain to every other
-        </label>
+      <div id="homo-oligomer-row" hidden>
+        <div class="row">
+          <label class="check">
+            <input type="checkbox" id="homo-oligomer">
+            Homo-oligomer: tie every chain to every other
+          </label>
+        </div>
+        <p class="hint" id="homo-summary"></p>
       </div>
-      <p class="hint" id="homo-summary"></p>
       <p class="hint">
         Or list comma-separated groups of 1-based positions that must share an
         identity, e.g. <code>10+40, 11+41</code>. Tied positions are decoded
@@ -191,7 +193,7 @@
   </section>
 
   <!-- ------------------------------------------------------------------ -->
-  <section class="panel" id="results-panel">
+  <section class="panel" id="results-panel" hidden>
     <div class="viewer-head">
       <h2>Results</h2>
       <div class="viewer-tools">
