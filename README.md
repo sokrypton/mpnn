@@ -550,6 +550,13 @@ a per-residue sum and is no longer pair-pure, but its edge half still is, and
 its rows are restricted to pairs whose mask is 1 (59% of biotin's slots are zero
 padding). 3.1x on LigandMPNN's encode.
 
+The distinct-pair count is a property of the structure, not of the model, and
+side-chain context makes it large — every fixed residue's atoms join the pool,
+730,805 pairs on 6VXX with all 2916 residues fixed. So both atom layers run
+their message MLP over a fixed 8192-row window (`PAIR_CHUNK`) rather than over
+one row per pair; without that, staging the first layer's pre-activation asked
+for 1.1 GB and the encode died on `WebAssembly.Memory.grow`.
+
 **4. A WebAssembly SIMD kernel.** After all of that, a CPU profile put 90% of
 the remaining time in a single function. `wasm/kernels.c` is ~200 lines of
 `-msimd128` C, built with plain clang and wasm-ld — no Emscripten — and reaches
@@ -635,9 +642,9 @@ converted; nothing here runs it.
 ## What is not done
 
 [`FUTURE.md`](FUTURE.md) lists everything known-open with the evidence for each
-— a memory ceiling on side-chain context at the worst case, the NA-MPNN edge
-matmul spending 92% of its FLOPs on structural zeros, side-chain packing and
-NA-MPNN's specificity mode, and a pass of UI cleanup.
+— the NA-MPNN edge matmul spending 92% of its FLOPs on structural zeros,
+what memory side-chain context still holds proportional to the structure,
+side-chain packing and NA-MPNN's specificity mode, and a pass of UI cleanup.
 
 ## Credit
 

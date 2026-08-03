@@ -35,6 +35,17 @@ const LIGAND_CHUNK = 32;
 const DECODE_CHUNK = 96;
 
 /**
+ * Rows per atom-pair message batch, in both atom-context layers.
+ *
+ * The pair count is a property of the structure, not of the model, so anything
+ * sized by it has no ceiling: see `_encodeLigandContext`. 8192 rows is 4 MB of
+ * [rows, 128] scratch, small enough that the accelerator's three staging
+ * copies stay under 13 MB, large enough that the per-call overhead is lost
+ * against 8192 x 128 x 128 x 2 multiply-adds.
+ */
+const PAIR_CHUNK = 8192;
+
+/**
  * Budget for the cached per-edge W1 projection, [3, L·K, 128] floats.
  *
  * Past this the decoder falls back to building the concatenation, which is
@@ -335,7 +346,7 @@ export class Model {
     // --- layer 0: the whole message is a function of the pair --------------
     const layer0 = this.atomLayers[0];
     const [W0v, W0e] = layer0.blocks;
-    const pairH1 = a.f32("lig.pairH1", nPairs * H);
+    const pairMsg0 = a.f32("lig.pairMsg0", nPairs * H);
     {
       // W1 · [node(type of a) ‖ edge(pair)] = W1v · node + W1e · edge. The
       // edge half is distance-pure, so project it over unordered pairs and
@@ -345,14 +356,27 @@ export class Model {
         a.f32("lig.nodePart", 120 * H));
       const edgePart = linear(yEdges, W0e, null, symCount, H, H,
         a.f32("lig.edgePart", symCount * H));
-      for (let p = 0; p < nPairs; p++) {
-        const e = symOf[p] * H;
-        const t = ligand.pairTypeA[p] * H;
-        const o = p * H;
-        for (let d = 0; d < H; d++) pairH1[o + d] = edgePart[e + d] + nodePart[t + d];
+      // Chunked, because `nPairs` is not bounded by anything: side-chain
+      // context puts every fixed residue's atoms in the pool, and 6VXX with
+      // all 2916 residues fixed reaches 730805 ordered pairs. Materialising
+      // W1's pre-activation for all of them is 374 MB here and asks the
+      // accelerator to stage three times that -- which is what put the encode
+      // over the WASM memory ceiling. The rows are independent, so a fixed
+      // window costs nothing but the loop.
+      const span = Math.min(nPairs, PAIR_CHUNK);
+      const h1 = a.f32("lig.pairH1", span * H);
+      for (let p0 = 0; p0 < nPairs; p0 += span) {
+        const n = Math.min(span, nPairs - p0);
+        for (let p = 0; p < n; p++) {
+          const e = symOf[p0 + p] * H;
+          const t = ligand.pairTypeA[p0 + p] * H;
+          const o = p * H;
+          for (let d = 0; d < H; d++) h1[o + d] = edgePart[e + d] + nodePart[t + d];
+        }
+        layer0.tail(h1.subarray(0, n * H), n,
+          pairMsg0.subarray(p0 * H, (p0 + n) * H));
       }
     }
-    const pairMsg0 = layer0.tail(pairH1, nPairs, a.f32("lig.pairMsg0", nPairs * H));
 
     const layer1 = this.atomLayers[1];
     const [W1v, W1e] = layer1.blocks;
@@ -395,7 +419,7 @@ export class Model {
     dh.fill(0, 0, L * M * H);
     {
       // Only unmasked pairs contribute, so build a compacted batch of rows.
-      const CAP = 8192;
+      const CAP = PAIR_CHUNK;
       const h1 = a.f32("lig.h1", CAP * H);
       const msg = a.f32("lig.msg", CAP * H);
       const owner = new Int32Array(CAP);

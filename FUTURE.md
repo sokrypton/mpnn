@@ -10,30 +10,49 @@ order of magnitude.
 
 ## 1. Defects
 
-### 1.1 Side-chain context runs out of WASM memory on a large complex
+### 1.1 Side-chain context runs out of WASM memory on a large complex — *fixed*
 
-**Reproduce:** encode 6VXX (L = 2916) with LigandMPNN, `useSideChains: true`,
-and `chainMask` all zeros — every residue fixed, so every side chain
-contributes.
+**Was:** encoding 6VXX (L = 2916) with LigandMPNN, `useSideChains: true` and
+`chainMask` all zeros — every residue fixed, so every side chain contributes —
+died after 4.7 s with
 
 ```
 RangeError: WebAssembly.Memory.grow(): Maximum memory size exceeded
 ```
 
-It needs the worst case. The same structure with half the residues fixed
-encodes fine (49.7 s), before and after the partial fix below — so this is not
-simply "L = 2916 crashes".
+It needed the worst case; half the residues fixed encoded fine either way.
+The overflowing call was the accelerator's `tail2` on `pairH1`: 730805 ordered
+pairs at that selection, so 374 MB of pre-activation and three staged copies of
+it, 1.12 GB, on top of the 383 MB already resident.
 
-**What overflows:** the two per-pair buffers that must stay *ordered*,
-`pairH1` and the layer-0 message, at `count × 128 × 4` bytes each.
-`e3e3c39` already halved the four *distance-pure* buffers by keying them on the
-unordered pair (measured 51% of the ordered count on both 4HHB and 6VXX), which
-was worth doing on its own but does not save these two.
+`pairH1`'s rows are independent, so the fix is a fixed 8192-row window over
+them (`PAIR_CHUNK`), each batch written straight into its slice of the layer-0
+message. Same arithmetic in the same order on the same rows: encoder output is
+**bit-identical**, checked by sha256 over `hV`, `hE` and `mask` before and
+after on 1STP all-fixed (WASM and JS kernels), 1UBQ all-fixed, and 6VXX
+half-fixed. The worst case now encodes in 14.2 s in node and 86.4 s in the
+page.
 
-**Fix:** chunk `pairH1` and the layer-0 message the way `edgeFeatures` and
-`naEdgeFeatures` already chunk their scratch, instead of materialising one row
-per ordered pair. The reduction is bounded by the chunk size, not by the
-structure.
+**Still scaled by the structure**, and the reason this is not the clean
+"bounded by the chunk size" the section originally claimed — arena at 6VXX
+all-fixed, 978 MB total:
+
+| slot | size | keyed on |
+| --- | --- | --- |
+| `lig.pairMsg0` | 374 MB | ordered pairs (730805) |
+| `lig.edgePart` | 189 MB | unordered pairs (373k) |
+| `lig.pairEdge1` | 189 MB | unordered pairs |
+
+`pairMsg0` is the one worth taking next. It is consumed exactly once, by the
+layer-0 gather loop, so it does not have to exist globally: dedup pairs within
+a block of residues instead of across the whole structure, and hold only that
+block's messages. Blocking preserves the per-row summation order, so it stays
+bit-identical, and the extra tail work is small — measured on 6VXX all-fixed,
+a 256-residue block needs 734463 tail rows against the global 730805, **1.01×**
+(64 residues is 1.19×, and 1024 is 0.86× because unused pairs never get
+computed at all). That caps the block at 256 × 25² = 160000 pairs, 82 MB.
+It does not touch the other two, which are keyed on the unordered pair and
+would need the same treatment separately.
 
 ### 1.2 The selection re-encode is not debounced — *fixed*
 
@@ -181,8 +200,12 @@ status/progress area instead of five scattered ones).
   PDB `MODRES` path was checked against a real case (`U/PSU/OMC/G`: 2/4
   positions before, 4/4 after, and a free PSU 500 Å away correctly *not*
   absorbed). The mmCIF branch was only reasoned through.
-- **No test covers the memory ceiling in §1.1.** A regression test would take
-  ~50 s, too slow for CI as written.
+- **No test covers the memory ceiling in §1.1.** It was fixed against an
+  ad-hoc script, not a checked-in case: 6VXX is 2.2 MB and the encode is 14 s
+  in node, so neither the structure nor the runtime fits the existing suite as
+  written. A cheaper regression would be a direct assertion that no arena slot
+  or staged buffer exceeds a fixed multiple of `PAIR_CHUNK`, which needs no
+  large structure at all.
 - NA-MPNN scoring is not in the browser test, though the display↔parse
   round-trip was verified exact over all 97 residues of 4OQU.
 
@@ -204,4 +227,5 @@ status/progress area instead of five scattered ones).
   fixed and designed positions. The reference reassigns `S_t` inside its group
   loop so a fixed member leaks its native residue into the others; this engine
   samples one identity per group. Documented in `test/sampling.mjs`.
-- The task list in the session tooling mirrors §1 and §2.1 as tasks 10–12.
+- §1 is done. What is left of it is the memory *headroom* noted under §1.1, not
+  a defect: nothing crashes, but three buffers still grow with the pair count.
