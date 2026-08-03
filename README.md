@@ -68,8 +68,8 @@ way selecting text does. A box would have been the wrong shape for a wrapped
 grid.
 
 **A chain is not a contiguous run of model positions**, and the track says so,
-because the layout is a list of display *items* rather than a range of indices
--- again py2Dmol's shape.
+because it lays the sequence out as display *items* rather than a range of
+indices.
 
 - **Gaps.** A residue the file numbers but does not contain gets a dash. The
   model does not see a hole: the k-nearest graph simply joins the two sides, so
@@ -78,16 +78,16 @@ because the layout is a list of display *items* rather than a range of indices
   talk in. 4KT0's chain K has a 20-residue break in the middle that the old
   single-line track hid completely.
 - **Ligands.** One token per heteroatom residue rather than one cell per atom,
-  on its own `lig <chain>` row, labelled with the PDB chemical id and coloured
-  by the group's commonest *hetero* element -- so an Fe-S cluster is orange and
-  a chloride green rather than everything looking like carbon. 4KT0 comes back
-  as rows of CLA, BCR, PQN, SF4. Clicking one selects the residues within 6 Å
-  of *that* ligand, which is the "Near ligand" button narrowed to one of them.
-  Only shown for LigandMPNN, the only family whose encoder reads heteroatoms;
-  a token for something the model cannot see would misrepresent the input.
+  after its chain, labelled with the PDB chemical id -- 4KT0 comes back as runs
+  of CLA, BCR, PQN and SF4 instead of "6264 ligand/heteroatom atoms" in a
+  status line. Only shown for LigandMPNN, the only family whose encoder reads
+  heteroatoms; a token for something the model cannot see would misrepresent
+  the input.
+- **Chain buttons** in the track itself, which is why there is no longer a
+  separate row of them above it.
 
-The grouping itself is **vendored** in `app/ligandgroups.js`, not rewritten --
-see below.
+All of this is the vendored viewer's own work, not a reimplementation of it --
+see *What is vendored* below.
 
 The canvas is also why it is fast. The DOM version rebuilt every span on every
 selection change, about a second per click at L = 121 before any model work;
@@ -108,28 +108,45 @@ Under both, the native sequence is a colour-coded strip rather than plain text,
 and `CSV` writes the whole matrix out -- probabilities, bits, and which
 positions were designed -- so nobody has to reverse numbers out of pixels.
 
-### What is vendored and what is not
+### What is vendored
 
-`app/ligandgroups.js` is copied verbatim from py2Dmol's `web/utils.js` (two
-functions, byte-identical apart from `export`). It is a pure function over four
-parallel arrays, and its value is not the mechanics but the *priority order*:
-name + number, then number, then a fallback that lumps a chain's heteroatoms
-together when the file numbers them 1, 2, 3... or calls them all UNK. That last
-branch is the one a paraphrase drops and the file you meet in the wild needs.
+Both, in the end. `app/viewer-seq.js` is py2Dmol's sequence viewer copied
+byte-for-byte, and `app/ligandgroups.js` is the two ligand-grouping functions
+from its `web/utils.js`, likewise unmodified. `app/seqview.js` is the adapter,
+standing in the same relation to `viewer-seq.js` as `app/viewer.js` does to the
+vendored `trace3d.js`.
 
-`viewer-seq.js` itself is **not** vendored, and that is a considered call rather
-than a preference for writing code. Unlike `trace3d.js` -- coordinates and
-colours in, pixels out -- it is not a drawing function: 2257 lines that reach
-into sixteen properties of py2Dmol's renderer across eighty-five references
-(`visibilityMask`, `selectionModel`, `positionScreenPositions`, `coords`,
-`objectsData[name].frames`, `currentFrame`, `getAtomColor`, ...), take
-thirty-eight host callbacks, draw a highlight overlay onto the *molecular*
-canvas, and own their own virtual scrolling. Vendoring it means supplying
-py2Dmol's object/frame model, its screen-projection cache and its selection
-model from this page's typed arrays and design mask -- an adapter larger and
-more brittle than the 290-line track, for a viewer whose selection means
-"selected" where this one means "designed, and the encoder reads it". So: the
-pure part is copied, the coupled part is borrowed as design.
+There was a hand-written sequence track here first, and it was worse in the ways
+that only show up once you use it: no touch handling, no virtual scrolling or
+scrollbar, no live preview during a drag, chain buttons stranded outside the
+track, and a drag that stuttered whenever the pointer crossed a row gap. It was
+also written on the theory that vendoring was impractical, and the measurement
+behind that theory was the wrong one -- counting *references* to the host
+renderer (85) rather than the distinct things it actually needs, which is a
+frame of plain parallel arrays (`coords`, `chains`, `position_names`,
+`residue_numbers`, `position_types`), about fourteen renderer properties and
+nine callbacks. All of that this page already has.
+
+Two things the adapter genuinely has to translate:
+
+- **Selection means something different.** py2Dmol's `positions` set is "what
+  you have selected"; here the same set is "what you are designing", which is
+  also an encoder input under side-chain context. `getSelection` reads the
+  design mask, `setSelection` writes it and hands off to the page -- which is
+  where the encode debounce lives, so a drag still posts one encode.
+- **Heteroatoms are not model positions here.** LigandMPNN reads them as atom
+  context, not as things to design. The viewer wants ligands *as* positions with
+  type `L` so it can group them into tokens, so the adapter appends them after
+  the L real ones and ignores anything past L coming back. That is what makes
+  the upstream grouping and its BTN/CLA/SF4 tokens work untouched.
+
+One bug worth recording, because it was the adapter's and not upstream's: the
+position type must not come from `polytype`. That is the *model's*
+classification, and it calls a residue UNK when its backbone is incomplete --
+which every 5'-terminal nucleotide is, having no phosphate. Feeding it through
+typed the first base of each DNA strand as protein, and the viewer then
+correctly inserted its polymer-type-change spacer, producing a gap in the
+display where the numbering is contiguous (3HDD chains C and D).
 
 ## The renderer is vendored, not reimplemented
 
@@ -184,8 +201,9 @@ app/                UI
   sec.js              C-alpha secondary structure -- VENDORED from CIRPIN-web
   viewer.js           adapter: colours, ligand discs, residue picking
   logo.js             position profile: sequence logo and heatmap, on a canvas
-  seqtrack.js         the sequence as a wrapped, selectable grid
+  viewer-seq.js       the sequence track -- VENDORED from py2Dmol
   ligandgroups.js     heteroatoms -> ligands -- VENDORED from py2Dmol
+  seqview.js          adapter: structure, colours and selection for viewer-seq
   style.css
 mpnn/               the engine, usable on its own from Node or a browser
   constants.js        generated tables (see tools/gen_constants.py)

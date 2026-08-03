@@ -271,27 +271,17 @@ details > summary {
   z-index: 5;
 }
 
-.chain-toggles { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
-
-.chain-toggles button {
-  font-size: 12px;
-  padding: 4px 10px;
-  font-family: var(--mono);
-}
-
 /* --- sequence track ----------------------------------------------------- */
 
 .sequence-wrap {
   margin-top: 12px;
-  /* Tall enough to show a small protein whole, capped so a 20-chain complex
-     does not push everything below it off the page. */
-  max-height: 38vh;
-  overflow-y: auto;
+  /* No max-height and no overflow here on purpose: the vendored viewer caps its
+     own canvas and scrolls virtually inside it, and a second scroller wrapped
+     around that eats the wheel events it wants. */
 }
 
-#sequence-track {
-  display: block;
-  cursor: pointer;
+/* The vendored viewer builds its own canvas in here and sizes it to the box. */
+#sequenceView {
   /* A drag across residues must not start a text selection on the page. */
   user-select: none;
 }

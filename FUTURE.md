@@ -220,17 +220,21 @@ status/progress area instead of five scattered ones).
 The sequence track and the profile display were reworked after py2Dmol's; the
 README has what changed and why. Two things left in that area:
 
-- **A drag does not auto-scroll the track.** `.sequence-wrap` caps at 38vh, so
-  sweeping a selection past the visible rows on a large complex means scrolling
-  first. Everything else about the drag wraps across rows correctly.
-- **The polymer-type spacer is untested.** The track inserts a blank cell where
-  `polytype` changes inside one chain with no numbering gap. No structure to
-  hand does that — 3HDD keeps its protein and DNA in separate chains — so the
-  branch is written and only reasoned through.
-- **Gap dashes are uncapped.** One cell per missing residue, as py2Dmol does.
-  Fine for a disordered loop and fine for 4KT0's 20-residue break; a file whose
-  chain jumps from residue 100 to 5000 would draw 4900 dashes. Nothing in the
-  PDB does that, so this is a note, not a fix waiting to happen.
+- **The track is upstream's now**, so its gaps are upstream's: see
+  `app/viewer-seq.js` and the README. The one thing lost in the swap is this
+  page's lower-case convention for nucleotides — `naDisplaySequence` writes
+  `acgu`, and the vendored viewer upper-cases them from the residue name, so
+  the track and the FASTA now disagree in case. The letters are right and the
+  chains are separated and coloured, so nothing is ambiguous; it is a
+  consistency wart, and fixing it means either a local modification to a
+  vendored file or a change upstream.
+- **Nothing checks the adapter.** `app/seqview.js` is the only new logic and it
+  has no test. The bug it already had — taking the position type from
+  `polytype`, which calls a 5'-terminal nucleotide UNK, so the first base of
+  each DNA strand typed as protein and the viewer drew a polymer-change spacer
+  where the numbering is contiguous — was found by looking at 3HDD, not by
+  anything automatic. A test over the frame it builds (types, names, numbering,
+  ligand grouping) for 1STP/3HDD/4KT0 would be cheap and needs no weights.
 - **The heatmap has no scale.** Cell alpha is `sqrt(p)` and nothing says so, so
   it reads as ordering rather than magnitude. A short legend, or numbers in the
   tooltip, would fix it — the tooltip already reports the top few letters with

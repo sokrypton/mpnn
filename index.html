@@ -119,12 +119,11 @@
       <div class="viewer-hint">drag rotate &middot; wheel zoom &middot; click residue &middot; shift-drag box select &middot; double-click reset</div>
       <div id="tooltip" class="tooltip" hidden></div>
     </div>
-    <div id="chain-toggles" class="chain-toggles"></div>
     <div class="sequence-wrap">
-      <canvas id="sequence-track" hidden></canvas>
+      <div id="sequenceView"></div>
     </div>
-    <p class="hint seq-hint">Click a residue to keep or design it; drag to sweep a run.
-      Saturated is designed, faded is kept.</p>
+    <p class="hint seq-hint">Click a residue to keep or design it; drag to sweep a run;
+      click a chain to toggle it. Saturated is designed, faded is kept.</p>
   </section>
 
   <!-- ------------------------------------------------------------------ -->
@@ -277,6 +276,8 @@
   <p><a href="https://github.com/sokrypton/mpnn">source</a></p>
 </footer>
 
+<!-- VENDORED from py2Dmol; installs window.SEQ, so it must load first. -->
+<script src="app/viewer-seq.js"></script>
 <script type="module" src="app/main.js"></script>
 </body>
 </html>
