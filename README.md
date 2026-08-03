@@ -26,7 +26,8 @@ first load.
 - **Score a sequence** you paste in, per position and averaged, by
   pseudo-likelihood or true autoregressive likelihood (see *Conditioning*).
 - **Feed LigandMPNN the side chains** of the residues you are not designing,
-  as extra atom context.
+  as extra atom context. Heteroatoms are drawn only for LigandMPNN, because it
+  is the only family whose encoder reads them.
 - **Tie a homo-oligomer** with one checkbox, or tie arbitrary positions by hand.
 - **Read a position profile** as a sequence logo -- bits on the y axis, glyphs
   stretched to their share of the column, the native residue underneath -- in
@@ -73,7 +74,9 @@ that sets no `nucleic` renders exactly as before: verified byte-identical
 screenshots for ubiquitin and for streptavidin + biotin.
 
 Everything else lives in `app/viewer.js`, which is an adapter: it decides
-colours, draws the ligand, and hit-tests residues (the renderer has no picking,
+colours, draws the ligand as ball-and-stick (bonds inferred at py2Dmol's 2 Å
+heavy-atom cutoff, since CONECT records are usually absent for the ligands that
+matter) and hit-tests residues (the renderer has no picking,
 and the design UI needs it). Its projection is copied line for line from
 `drawTraces` -- it has to be, or clicks land somewhere other than where the
 ribbon was drawn.

@@ -208,6 +208,10 @@ function updateModelHint() {
   $("model-hint").textContent = `${MODEL_NOTES[type] ?? ""} `
     + `k=${model.k_neighbors} neighbours`
     + (model.atom_context_num ? `, ${model.atom_context_num} ligand atoms per residue` : "");
+  // Only LigandMPNN reads heteroatoms; every other family's encoder never
+  // looks at them, so showing a cofactor would imply context that is not there.
+  viewer.showLigand = type === "ligand_mpnn";
+  if (state.structure) redraw();
   $("atom-context-row").hidden = type !== "ligand_mpnn";
   $("side-chain-row").hidden = type !== "ligand_mpnn";
   $("membrane-global-row").hidden = type !== "global_label_membrane_mpnn";
