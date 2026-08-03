@@ -22,6 +22,7 @@ import {
   shade,
   spectrumRgb,
 } from "./trace3d.js";
+import { POLYTYPE } from "../mpnn/na.js";
 import { makeSec, smoothSec } from "./sec.js";
 
 export { hexToRgb, spectrumRgb, makeCamera, orbit };
@@ -72,7 +73,16 @@ export class Viewer {
       ca[i * 3 + 2] = structure.X[i * 12 + 5];
     }
     this.ca = ca;
-    this.sec = smoothSec(makeSec(ca, L));
+    // `makeSec` classifies helix/strand from C-alpha spacing, which means
+    // nothing on a C1' trace -- left to itself it invents helices in a duplex.
+    // Nucleotides are coil, and the renderer draws them as a fatter tube.
+    this.nucleic = structure.nucleicAsResidues
+      ? Uint8Array.from(structure.polytype, (p) => (p === POLYTYPE.PP ? 0 : 1))
+      : null;
+    const sec = smoothSec(makeSec(ca, L));
+    this.sec = this.nucleic
+      ? [...sec].map((c, i) => (this.nucleic[i] ? "C" : c)).join("")
+      : sec;
 
     // Fit over the ligand too, so a cofactor sticking out of the pocket is not
     // cropped. pct < 1 keeps a single stray residue from shrinking everything.
@@ -125,7 +135,12 @@ export class Viewer {
 
     drawTraces(
       this.canvas,
-      [{ coords: this.ca, sec: this.sec, colourAt: (i) => this.colourAt(i) }],
+      [{
+        coords: this.ca,
+        sec: this.sec,
+        nucleic: this.nucleic,
+        colourAt: (i) => this.colourAt(i),
+      }],
       { into: p, box, fit: this.fit, rot: this.camera.rot, zoom: this.camera.zoom, inset: INSET },
     );
 

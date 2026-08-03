@@ -54,12 +54,23 @@ the spot instead of TM-align's `make_sec`, which CIRPIN's parity suite already
 checks against the C++ to 5e-11. Every one of those is a comment in the vendored
 file explaining what the fix was for.
 
-The only modification is `setPaper()` at the bottom of `trace3d.js`, plus
+There are two modifications. `setPaper()` at the bottom of `trace3d.js`, plus
 `PAPER_CSS` becoming `let` so it can follow. `shade()` expresses depth by
 blending toward the page background and returning an *opaque* colour, which only
 works if it knows what that background is; CIRPIN-web is a light page with a
 fixed paper colour and this one has a dark mode. `diff` against upstream shows
 exactly that one line changed.
+
+And a nucleic-acid block, for NA-MPNN. A nucleotide trace steps along C1',
+which sits 5.5-6.5 Å from its neighbour where a C-alpha sits 3.8 Å — past the
+5 Å chain-break threshold, so a nucleic chain was split into one run per
+residue and drew *nothing*. Measured on 4oqu, 94 of 96 steps. A layer may now
+carry a `nucleic` flag array, which widens the break allowance to 8 Å for any
+step touching a nucleotide and thickens the tube from 0.27 Å — right for a
+protein loop, invisible beside a duplex — to 1.0 Å. `viewer.js` also forces
+those positions to coil, because `make_sec` reads C1' spacing as helix. A layer
+that sets no `nucleic` renders exactly as before: verified byte-identical
+screenshots for ubiquitin and for streptavidin + biotin.
 
 Everything else lives in `app/viewer.js`, which is an adapter: it decides
 colours, draws the ligand, and hit-tests residues (the renderer has no picking,
