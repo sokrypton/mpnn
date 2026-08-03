@@ -49,6 +49,9 @@ function reviveInputs(raw) {
     xyz37: raw.xyz37 ? new Float32Array(raw.xyz37) : undefined,
     xyz37Mask: raw.xyz37Mask ? new Float32Array(raw.xyz37Mask) : undefined,
     chainMask: raw.chainMask ? new Float32Array(raw.chainMask) : undefined,
+    X16: raw.X16 ? new Float32Array(raw.X16) : undefined,
+    X16Mask: raw.X16Mask ? new Float32Array(raw.X16Mask) : undefined,
+    polytype: raw.polytype ? new Int32Array(raw.polytype) : undefined,
   };
 }
 

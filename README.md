@@ -1,7 +1,7 @@
 # mpnn.web
 
-ProteinMPNN, SolubleMPNN, LigandMPNN and MembraneMPNN running entirely in a
-browser tab. No server, no upload, no build step — open `index.html` and the
+ProteinMPNN, SolubleMPNN, LigandMPNN, MembraneMPNN and NA-MPNN running entirely
+in a browser tab. No server, no upload, no build step — open `index.html` and the
 weights come down once, then every forward pass happens on the visitor's
 machine.
 
@@ -14,8 +14,9 @@ first load.
 
 - **Load a structure** by PDB ID, UniProt accession (AlphaFold DB), file drop,
   or drag-and-drop. PDB and mmCIF both parse.
-- **Pick any of 13 checkpoints** — the four ProteinMPNN and four SolubleMPNN
-  noise levels, four LigandMPNN variants, and the two membrane models.
+- **Pick any of 15 checkpoints** — the four ProteinMPNN and four SolubleMPNN
+  noise levels, four LigandMPNN variants, the two membrane models, and NA-MPNN
+  for RNA and protein–DNA.
 - **Choose what to design** by clicking residues in the 3D view or the sequence
   track, shift-dragging a box, toggling whole chains, or selecting everything
   within 6 Å of a ligand.
@@ -85,11 +86,12 @@ mpnn/               the engine, usable on its own from Node or a browser
   features.js         backbone frames, kNN graph, edge/ligand features
   layers.js           encoder and decoder message-passing blocks
   model.js            encode / score / profile / sample
+  na.js               NA-MPNN: 33 letters, 18 atom slots, all-pairs edges
   pdb.js              PDB + mmCIF parsing
   weights.js          .mpnn file reader
   accel.js            optional WebAssembly SIMD accelerator
 wasm/kernels.c      the SIMD kernels; build.sh rebuilds kernels.wasm
-weights/            13 converted checkpoints (~55 MB total, fp16)
+weights/            15 converted checkpoints (~60 MB total, fp16)
 tools/              checkpoint conversion, constant generation, golden tensors
 test/               parity against PyTorch, plus a browser smoke test
 ```
@@ -215,6 +217,53 @@ one of them has a gap. Unlike the reference, chains with no numbers in common
 but equal length fall back to tying end to end rather than raising a KeyError,
 and the panel says which of the two ran — they disagree precisely when it
 matters.
+
+## NA-MPNN
+
+[NA-MPNN](https://github.com/baker-laboratory/NA-MPNN) (MIT,
+[preprint](https://www.biorxiv.org/content/10.1101/2025.10.03.679414v2)) designs
+RNA and protein–DNA complexes. Selecting it re-parses the structure, because
+nucleic acids become model positions rather than ligand context — which changes
+the length, the selection and the alphabet.
+
+It is the same network: 3 encoder and 3 decoder layers at hidden 128, the same
+message scale, the same autoregressive decoder. `layers.js`, the whole decoding
+half of `model.js` and every WASM kernel are reused untouched. Three things
+differ, all in `mpnn/na.js`.
+
+**Eighteen atom slots, all pairs.** N/CA/C/O for protein and
+`OP1 OP2 P O5' C5' C4' O4' C3' O3' C2' O2' C1'` for a nucleotide, plus the
+familiar virtual C-beta and a nucleic-acid pseudo-N placed from O4'/C1'/C2' by
+the same construction with its own coefficients. Edge features are all 324
+ordered pairs, so the edge embedding takes 5200 inputs against 416. Each block
+is masked by both endpoints, though, so a protein–protein edge fills 25 of the
+324 and a nucleotide–nucleotide edge 169; only the live blocks are written.
+Neighbours are found on `CA + C1'`, which works because the two are disjoint.
+
+**Polymer-type nodes**, a 6-class one-hot — the same shape as the membrane
+models' per-residue label.
+
+**Thirty-three letters.** Note the amino acids are in three-letter alphabetical
+order (`ARNDCQEGHILKMFPSTWYV`), *not* MPNN's `ACDEFGHIKLMNPQRSTVWY`, so `W_s`
+and `W_out` rows do not line up with the other models'. Lower case is
+nucleotide. By default `--na_shared_tokens` stores an RNA base as the
+corresponding DNA token and omits the legacy RNA letters, so a uracil is held
+as DT and converted back for display using the presence of an O2'.
+
+`test/na.mjs` checks it against the real PyTorch model in two halves — the model
+maths from dumped tensors, and separately that the JS parser reproduces those
+tensors from the same PDB — on a pure-RNA structure (4oqu, 97 nt) and a
+protein–DNA complex (1am9, 313 aa + 72 nt + 4 unknown). Both match; the parser
+agrees with ProDy on residue count, polymer type, sequence, numbering and
+coordinates exactly.
+
+Two notes. Encoding costs about 2x ProteinMPNN at the same length (2.5 s at
+L = 389), because of the wider edge features; grouping edges by polymer-type
+pair would compact the matmul back to 416 columns for protein–protein edges and
+is the obvious next step. And 1am9 has four residues with no complete backbone
+of any kind, whose `D_adjust` row is all zeros — the reference's `topk` breaks
+that tie arbitrarily, so the neighbour-graph assertion covers unmasked rows and
+reports the rest.
 
 ## Correctness
 

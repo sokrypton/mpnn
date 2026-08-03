@@ -5,6 +5,10 @@
 // (ligands, cofactors, ions, nucleic acids) collected as ligand context.
 
 import { ATOM37, ELEMENT_TO_INT, THREE_TO_ONE } from "./constants.js";
+import {
+  DNA_BACKBONE, naDisplaySequence, NA_ATOMS, NA_RESTYPE_TO_INT, NA_UNKNOWN,
+  POLYTYPE, PROTEIN_BACKBONE, RNA_BACKBONE,
+} from "./na.js";
 
 /** Residues treated as protein even though they carry a non-standard name. */
 const EXTRA_PROTEIN = new Set([
@@ -15,6 +19,21 @@ const WATER = new Set(["HOH", "DOD", "WAT", "H2O", "TIP", "TIP3", "SOL"]);
 const PROTEIN = new Set([...Object.keys(THREE_TO_ONE), ...EXTRA_PROTEIN]);
 
 const BACKBONE = ["N", "CA", "C", "O"];
+
+/**
+ * Nucleic-acid residue names, as ProDy's `nucleic` selection understands them.
+ *
+ * These only matter under `nucleicAsResidues`; every other model still sees
+ * them as ligand context, which is what LigandMPNN expects.
+ */
+const NUCLEIC = new Set([
+  "DA", "DC", "DG", "DT", "DI", "DU",
+  "A", "C", "G", "U", "I", "T",
+  "ADE", "CYT", "GUA", "THY", "URA",
+  "RA", "RC", "RG", "RU",
+  "DA3", "DA5", "DC3", "DC5", "DG3", "DG5", "DT3", "DT5",
+  "A3", "A5", "C3", "C5", "G3", "G5", "U3", "U5",
+]);
 
 /** Guess an element symbol from a PDB atom name when the column is blank. */
 function elementFromAtomName(name) {
@@ -156,6 +175,8 @@ export function parseAtoms(text) {
  */
 export function structureFromText(text, opts = {}) {
   const wantLigands = opts.ligands !== false;
+  // NA-MPNN only: nucleic acids become model positions instead of ligand atoms.
+  const nucleicAsResidues = opts.nucleicAsResidues === true;
   const atoms = parseAtoms(text).filter((a) => a.occupancy > 0 && Number.isFinite(a.x));
   const chainFilter = opts.chains ? new Set(opts.chains) : null;
 
@@ -168,11 +189,12 @@ export function structureFromText(text, opts = {}) {
     if (chainFilter && !chainFilter.has(atom.chain)) continue;
     if (WATER.has(atom.resName)) continue;
 
-    if (PROTEIN.has(atom.resName) && !atom.name.startsWith("H")) {
+    const isNucleic = nucleicAsResidues && NUCLEIC.has(atom.resName);
+    if ((PROTEIN.has(atom.resName) || isNucleic) && !atom.name.startsWith("H")) {
       const key = `${atom.chain}|${atom.resSeq}|${atom.iCode}`;
       let res = residues.get(key);
       if (res === undefined) {
-        res = { atoms: new Map(), meta: atom };
+        res = { atoms: new Map(), meta: atom, nucleic: isNucleic };
         residues.set(key, res);
         residueOrder.push(key);
       }
@@ -185,8 +207,12 @@ export function structureFromText(text, opts = {}) {
     }
   }
 
-  // Only residues with a C-alpha become model positions.
-  const kept = residueOrder.filter((k) => residues.get(k).atoms.has("CA"));
+  // A residue becomes a model position if it has its reference atom: C-alpha
+  // for protein, C1' for a nucleotide. That is `macromolecule_reference_atoms`.
+  const kept = residueOrder.filter((k) => {
+    const res = residues.get(k);
+    return res.atoms.has(res.nucleic ? "C1'" : "CA");
+  });
   const L = kept.length;
 
   const X = new Float32Array(L * 12);
@@ -194,6 +220,11 @@ export function structureFromText(text, opts = {}) {
   // Missing atoms stay at the origin with mask 0, as `parse_PDB` leaves them.
   const xyz37 = new Float32Array(L * 37 * 3);
   const xyz37Mask = new Float32Array(L * 37);
+  // NA-MPNN's 16 shared backbone slots, and which polymer each residue is.
+  const X16 = new Float32Array(L * NA_ATOMS.length * 3);
+  const X16Mask = new Float32Array(L * NA_ATOMS.length);
+  const polytype = new Int32Array(L);
+  const isRNA = new Uint8Array(L);
   const mask = new Float32Array(L);
   const S = new Int32Array(L);
   const resSeq = new Int32Array(L);
@@ -237,6 +268,52 @@ export function structureFromText(text, opts = {}) {
     });
     const letter = THREE_TO_ONE[res.meta.resName] ?? "X";
     S[i] = "ACDEFGHIKLMNPQRSTVWYX".indexOf(letter);
+
+    if (nucleicAsResidues && res.nucleic) {
+      // The model reads X16, never X -- but the cartoon renderer traces X's
+      // C-alpha slot, so give a nucleotide the nearest equivalents and it draws
+      // like anything else. Purely cosmetic; nothing downstream of the model
+      // sees these.
+      ["P", "C1'", "C3'", "O4'"].forEach((name, slot) => {
+        const atom = res.atoms.get(name);
+        if (atom === undefined) return;
+        X[i * 12 + slot * 3] = atom.x;
+        X[i * 12 + slot * 3 + 1] = atom.y;
+        X[i * 12 + slot * 3 + 2] = atom.z;
+      });
+    }
+
+    if (nucleicAsResidues) {
+      NA_ATOMS.forEach((name, slot) => {
+        const atom = res.atoms.get(name);
+        if (atom === undefined) return;
+        const off = (i * NA_ATOMS.length + slot) * 3;
+        X16[off] = atom.x;
+        X16[off + 1] = atom.y;
+        X16[off + 2] = atom.z;
+        X16Mask[i * NA_ATOMS.length + slot] = 1;
+      });
+      // Polymer type is decided by which backbone is complete, not by the
+      // residue name -- `parse_PDB`'s default branch. RNA is subtracted out of
+      // the DNA test because RNA carries every DNA backbone atom as well.
+      const has = (names) => names.every((n) => res.atoms.has(n));
+      const rna = has(RNA_BACKBONE);
+      const dna = !rna && has(DNA_BACKBONE);
+      const pp = has(PROTEIN_BACKBONE);
+      polytype[i] = pp ? POLYTYPE.PP : rna ? POLYTYPE.RNA : dna ? POLYTYPE.DNA : POLYTYPE.UNK;
+      isRNA[i] = res.atoms.has("O2'") ? 1 : 0;
+      // `mask = protein_mask + dna_mask + rna_mask`: a residue with no complete
+      // backbone of any kind is masked out entirely.
+      mask[i] = polytype[i] === POLYTYPE.UNK ? 0 : 1;
+      // NA-MPNN indexes residues in its own order, and with the default shared
+      // tokens an RNA base is stored as the corresponding DNA one.
+      const unknown = polytype[i] === POLYTYPE.DNA ? NA_UNKNOWN.DNA
+        : polytype[i] === POLYTYPE.RNA ? NA_UNKNOWN.RNA : NA_UNKNOWN.PP;
+      const shared = { A: "DA", C: "DC", G: "DG", U: "DT", RX: "DX" };
+      const name = res.meta.resName;
+      S[i] = NA_RESTYPE_TO_INT[shared[name] ?? name] ?? unknown;
+    }
+
     resSeq[i] = res.meta.resSeq;
     chainIds.push(res.meta.chain);
     chainLabels[i] = chainIndex.get(res.meta.chain);
@@ -256,13 +333,19 @@ export function structureFromText(text, opts = {}) {
 
   return {
     X, mask, S, L, xyz37, xyz37Mask,
+    // Only populated under `nucleicAsResidues`, where `S` and `sequence` also
+    // switch to NA-MPNN's 33-letter alphabet -- the structure object belongs to
+    // one model family at a time, so the caller re-parses when it switches.
+    X16, X16Mask, polytype, isRNA, nucleicAsResidues,
     residueIdx: renumber(resSeq),
     chainLabels, chainIds, resSeq, iCodes, resNames, chainList,
     ligandXyz, ligandType, ligandMask,
     ligandNames: ligandAtoms.map((a) => a.name),
     ligandElements: ligandAtoms.map((a) => a.element),
     ligandResidues: ligandAtoms.map((a) => `${a.resName} ${a.chain}${a.resSeq}`),
-    sequence: [...S].map((v) => "ACDEFGHIKLMNPQRSTVWYX"[v]).join(""),
+    sequence: nucleicAsResidues
+      ? naDisplaySequence(S, isRNA)
+      : [...S].map((v) => "ACDEFGHIKLMNPQRSTVWYX"[v]).join(""),
   };
 }
 
